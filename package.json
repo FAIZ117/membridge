@@ -7,9 +7,41 @@
   "private": true,
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   },
+  "main": "dist/index.js",
+  "typings": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./esm/index.mjs",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./sync": {
+      "types": "./dist/sync.d.ts",
+      "import": "./esm/sync.mjs",
+      "require": "./dist/sync.js",
+      "default": "./dist/sync.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "esm/",
+    "prebuilds/",
+    "cc/",
+    "binding.gyp"
+  ],
   "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FAIZ117/membridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FAIZ117/membridge/issues"
+  },
+  "homepage": "https://github.com/FAIZ117/membridge#readme",
   "keywords": [
     "shared-memory",
     "shm",

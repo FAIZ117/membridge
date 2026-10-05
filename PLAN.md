@@ -1,142 +1,551 @@
-# membridge — Implementation Plan
+# membridge — Implementation Plan (rev 2)
 
-> **Status: planning — awaiting review.** Nothing is implemented yet; this repo is a skeleton.
+> **Status: planning — rev 2, revised after review (2026-10-05).** Nothing is implemented yet; this repo is a skeleton.
 > Name `membridge` verified free on npm (registry 404, checked 2026-10-05).
+> Every design decision below carries a **Why** so it can be challenged on its merits.
+> §11 lists what changed from rev 1 and the evidence behind each change.
 
 A new npm package with complete ownership that keeps the good parts of
-[`shmbuf`](https://www.npmjs.com/package/shmbuf) (MIT, by kedemd) — the hardened
-starting point — while fixing its bugs, optimizing, and adding features.
-membridge supersedes shmbuf for our use.
+[`shmbuf`](https://www.npmjs.com/package/shmbuf) (MIT, by kedemd) while fixing its
+bugs and adding real cross-process synchronization. membridge supersedes shmbuf for our use.
 
-**Scope decisions (locked):** TypeScript · crash-safe Mutex · zero-copy RingBuffer ·
-ops utilities.
+**Scope (locked):** TypeScript · crash-safe Mutex · zero-copy RingBuffer · ops utilities.
+**Platforms:** Linux (primary), macOS and Windows (first-class, fully tested in CI — not "smoke").
+
+---
 
 ## 1. Location & ownership
 
 - Standalone git repo at `/home/faiz/work/membridge/` (this repo).
 - MIT LICENSE, author "Faiz" (placeholder — edit before publishing).
-- README credits shmbuf (MIT) as the hardened starting point: honest attribution,
-  full ownership of the new code.
-- Publishing to npm is done by the owner, not by the agent. `package.json` starts
-  `"private": true` to block accidental publishes.
+- README credits shmbuf (MIT) as the starting point.
+- Publishing to npm is done by the owner, not by the agent. `package.json` keeps
+  `"private": true` until then.
 
 ## 2. Verified facts driving the design
 
-- **No N-API SAB-creation API exists** (grepped Node 18–24 headers): wrapping
-  mmap'd memory as a `SharedArrayBuffer` requires the direct-V8 backing-store
-  technique (`v8::SharedArrayBuffer::NewBackingStore` + GC finalizer). shmbuf's
-  core trick is the right one — verified working (all tests pass, and the returned
-  SAB transfers to `worker_threads` sharing the same physical memory, on Node 24).
-- **Real limits:** `/dev/shm` capacity (7.6 GB on the dev machine; default mount =
-  50% of RAM; tmpfs charges pages lazily on touch, and a fill-up mid-life
-  manifests as SIGBUS, not a JS error). shmbuf's 64 MB cap is an arbitrary addon
-  guardrail, not an OS limit. On Windows the parallel is pagefile-backed sections
-  (ceiling ≈ RAM + pagefile).
-- **Toolchain present:** gcc/g++/make/python3, node-addon-api 8.9.2, node-gyp
-  header caches for Node 18/20/22/24.
+Each fact was checked on the dev machine (Node 24.18.0, Linux 7.2.8, glibc 2.42,
+page size 4096) against shmbuf 0.1.0 at
+`~/work/trial-node-memory/node_modules/shmbuf`.
 
-## 3. Kept from shmbuf (already good)
+| # | Fact | Evidence |
+|---|------|----------|
+| F1 | **`Atomics.notify` does not wake waiters in another process.** V8 keeps waiters in a per-process list; it does not use a shared kernel futex. | Probe: child `Atomics.wait(v,0,0,3000)` on a shmbuf segment, parent stores + `Atomics.notify` after 200 ms → `notify()` returned **0**, child returned `'timed-out'` after **3001 ms**. |
+| F2 | Wrapping mmap'd memory as a `SharedArrayBuffer` requires direct V8 (`v8::SharedArrayBuffer::NewBackingStore` + deleter); N-API has no API for it. | shmbuf `src/shmbuf.cpp:51-55`; N-API headers for Node 18–24. |
+| F3 | shmbuf mixes N-API and raw V8 by casting `v8::Value*` to `napi_value` — this relies on Node internals, not a public contract. | `src/shmbuf.cpp:58-59`. |
+| F4 | shmbuf returns a handle created inside a plain `v8::HandleScope` after that scope is destroyed (dangling handle; works by luck). | `src/shmbuf.cpp:49-59`. |
+| F5 | shmbuf converts size with `Uint32Value()`, silently wrapping. | Probe: `open(n, 2**32+16).byteLength === 16`; `open(n, 1.9).byteLength === 1`. |
+| F6 | Re-joining an existing segment with a larger size succeeds and maps past EOF (touching pages beyond EOF → SIGBUS). | Probe: `open(n,64)` then `open(n,128).byteLength === 128`, no error. |
+| F7 | `fallocate` on tmpfs charges pages up front (so we can get `ENOSPC` at create time instead of a later SIGBUS). | `fallocate -l 8M /dev/shm/x` → `blocks=16384` (8 MiB charged). |
+| F8 | `/dev/shm` = 7.6 GB tmpfs here (default 50% of RAM, lazily charged). shmbuf's 64 MB cap is arbitrary (`src/shmbuf.cpp:71`). | `df -h /dev/shm`. |
+| F9 | Liveness primitives exist on Linux: `/proc/<pid>/stat` field 22 (start time), `/proc/self/ns/pid` (pid-namespace inode). | Read both on dev machine. |
+| F10 | shmbuf's perf test times a ~61 ms run with a 10 ms poll and prints the same rate for both phases; it is not a usable regression gate. | `test/test-shmbuf.js:168-192`; local run: 61 ms elapsed. |
+| F11 | shmbuf is **not** zero-dependency: it depends on `node-addon-api` and `prebuild-install`, and its install script uses `prebuild-install --runtime napi` — wrong for a V8-ABI-bound addon. Its loader only tries `build/Release`. | shmbuf `package.json`, `lib/index.js:5`. |
+| F12 | Toolchain present: gcc/g++/make/python3; node-gyp header caches for 18.20.8, 20.19/20.20, 22.21/22.22, 24.15/24.18. **No Node 26 headers yet.** | `ls ~/.cache/node-gyp`. |
+| F13 | Official Node builds do not enable the V8 sandbox, so external backing stores work. Electron does enable it → Electron is unsupported (README compatibility note, not a plan risk). | `node -p process.config.variables.v8_enable_sandbox` → `0` on 24.18.0; shmbuf's tests pass on it. |
+| F14 | `futex_waitv` (Linux ≥ 5.16) has **no glibc wrapper**: glibc 2.42 exports no futex symbols at all. It is reachable only as a raw syscall (`__NR_futex_waitv` = 449 in `asm-generic/unistd.h`; `struct futex_waitv` in `linux/futex.h`). | `nm -D /lib64/libc.so.6 \| grep futex` → nothing; `grep -rn futex_waitv /usr/include`. |
+| F15 | A SAB's `byteLength` always equals its BackingStore's length — a SAB cannot be a window onto a larger store. | `v8::SharedArrayBuffer::New(isolate, std::shared_ptr<BackingStore>)` takes the length from the store. |
 
-- `shm_open` + `ftruncate` + `mmap` → `v8::SharedArrayBuffer::NewBackingStore`
-  with GC finalizer; POSIX EEXIST-rejoin path; Windows `CreateFileMapping` path.
-- API shape `open(name, size) / close(name) / unlink(name)`.
-- Zero-runtime-dependency design; graceful fallback mode with warning.
-- `get-include-dir.js` + `binding.gyp` skeleton.
-- Test structure: fork-based cross-process test, 8-process high-contention perf
-  test (~11M ops/s combined baseline as a regression gate).
+Facts still **unverified** (the spike in M1 must confirm or refute them; the design
+has a fallback for each):
 
-## 4. Bugs & design flaws fixed
+- U1 macOS: `os_sync_wait_on_address` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED` (macOS 14.4+) wakes across processes.
+- U2 macOS: POSIX shm names are limited to 31 chars (`PSHMNAMLEN`), and an shm object cannot be `ftruncate`d again once sized.
+- U3 Windows: `WaitOnAddress` is process-private (per Microsoft docs), so cross-process waits need named kernel objects.
+- U4 Node 26 is the current release (per Node's schedule, LTS from Oct 2026) and `NewBackingStore(ptr,len,deleter,data)` is unchanged in its V8.
+- U5 In-process `Atomics.wait`/`Atomics.notify` between two SABs whose *distinct* BackingStores cover the same memory (§5.4) still pair up — i.e. V8 keys waiters by address, not by BackingStore. If not, the registry shares one BackingStore per (name, length) instead.
 
-1. **SIGBUS class (the killer).** On join, `fstat` the existing segment and
-   compare with the requested size. Default policy **strict**: throw
-   `E_SIZE_MISMATCH` naming both sizes. Opt-in `grow: true` extends the segment
-   via `ftruncate` (grow-only). This also closes the create/join race where a
-   joiner maps the segment before the creator's `ftruncate` lands.
-2. **Lifecycle.** Refcounted registry per name: same-name re-open returns the
-   *same* SAB (optimization — no re-mmap); the mapping is released when the
-   refcount hits zero AND all SABs have been GC'd. `close()`/`unlink()` become
-   meaningful and their semantics documented; shmbuf's vestigial `g_regions`
-   map is dropped.
-3. **Typed errors.** `MembridgeError` with machine-readable codes:
-   `E_SIZE_MISMATCH`, `E_EXISTS`, `E_NOT_FOUND`, `E_NAME_INVALID`,
-   `E_SIZE_INVALID`, `E_NOT_OWNER`.
-4. **Validation.** Name must start with `/` and be ≤ 250 chars; size between
-   1 and the configured max.
-5. **Configurable size cap.** Default 256 MiB (raised from shmbuf's hardcoded
-   64 MB), overridable via env `MEMBRIDGE_MAX_SEGMENT_BYTES`. Docs cover tmpfs
-   lazy charging and the SIGBUS-on-fill hazard.
-6. **Honest documentation.** `close()` does not synchronously unmap (GC-deferred
-   by design — unmapping under a live SAB would be use-after-free); processes
-   opening the same name must agree on size or use the explicit policies;
-   segments persist in `/dev/shm` after a crash until `unlink()`/cleanup.
+## 3. Architecture overview
 
-## 5. New features (v1.0.0)
+```
+ JS (TypeScript)                                   Native (C++, plain V8 / node.h addon)
+ ─────────────────                                  ─────────────────────────────────────
+ open/close/unlink  ──► core.ts ──────────────────► segment.cc   shm_open/ftruncate/fallocate/mmap
+                                                                 CreateFileMapping/MapViewOfFile
+                                                    registry.cc  process-wide name → weak_ptr<Mapping>
+ Mutex   ──► mutex.ts ─┐                            header.cc    segment header + attach table
+ RingBuffer ► ring.ts ─┼─► sync.ts (wait/notify) ─► wait.cc      futex (Linux) / os_sync (macOS) /
+ list/stat/reap ► ops.ts                                         named semaphores (Windows)
+                                                    liveness.cc  pid + start time + pid-ns identity
+```
 
-### Crash-safe Mutex
-Own 32-byte segment; layout `[0]=state [1]=ownerPid [2]=heartbeat [3]=ownerGen`.
-- Lock: CAS 0→1; on contention, `Atomics.wait(state, 1, 50ms)` loop.
-- Dead-owner recovery: heartbeat timeout + `process.kill(pid, 0)` ESRCH check →
-  steal the lock by generation CAS. A crashed process cannot deadlock everyone.
-- `unlock` verifies ownership, then `Atomics.notify`; `withLock(fn)` wrapper.
-- Sync/blocking semantics documented (Atomics.wait blocks the event loop).
-- Step-0 spike validates cross-process futex wake on Linux; a spin fallback
-  flag exists if wake/notify ever fails to fire cross-process.
+Every membridge segment is **header page + data region**. The SAB handed to the
+user covers only the data region, so user offsets start at 0 and stay page-aligned.
 
-### Zero-copy RingBuffer (SPSC)
-Segment = magic + version + capacity + head/tail u32 (Lamport: one empty slot)
-+ data region. `write(view) / read()`. Cross-process tested. Capacity up to ~2 GB.
+**Mapping vs. BackingStore (explicit, to avoid an M2 mistake):** because a SAB's length
+always equals its BackingStore's length (F15), the window is made at the BackingStore level:
+- A native `Mapping` object owns the OS mapping: `base` (what `mmap`/`MapViewOfFile` returned)
+  and `mappingBytes = headerBytes + dataBytes`.
+- Each BackingStore is created as `NewBackingStore(base + headerBytes, sabBytes, deleter, ref)`,
+  where `ref` is a heap-allocated `shared_ptr<Mapping>`. The deleter only drops that reference.
+- `~Mapping()` calls `munmap(base, mappingBytes)` / `UnmapViewOfFile(base)` + `CloseHandle`
+  — always on **`base`**, never on the pointer the BackingStore was given.
 
-### Ops utilities
-- `capacity()` — `fs.statfs` on `/dev/shm` (free/total).
-- `stat(name)` — per-segment info.
-- `list()` — readdir `/dev/shm` filtered by our prefix.
-- `cleanupOnExit()` / `clearExitCleanup()` — unlink still-registered segments on
-  process exit (protects against crash-leaked segments).
+This also means several windows (e.g. an `at-least` prefix and a full view) can share one mapping.
 
-## 6. Layout
+## 4. Native addon: plain V8 addon, not N-API
+
+**Decision:** write the addon against `node.h`/`v8.h` (`NODE_MODULE_INIT`, context-aware),
+and drop `node-addon-api`.
+
+**Why:** the core technique needs raw V8 (F2), which ties the binary to one Node ABI
+anyway. Keeping N-API on top gives none of its ABI stability, but still needs the
+undocumented `v8::Value*`→`napi_value` cast (F3) and a dependency. A plain V8 addon
+returns `v8::Local` directly, so the cast and the handle-scope bug (F4) disappear
+by construction. Context-aware init (`NODE_MODULE_INIT`) is required for `worker_threads`.
+
+## 5. Core segments
+
+### 5.1 API
+
+```ts
+open(name: string, size: number, opts?: OpenOptions): SharedArrayBuffer
+open(name: string, opts: OpenOptions & { size?: undefined }): SharedArrayBuffer // join at existing size
+
+interface OpenOptions {
+  mode?: 'create-or-join' | 'create' | 'join';   // default 'create-or-join'
+  sizePolicy?: 'exact' | 'at-least' | 'grow';    // default 'exact'
+  reserve?: boolean;        // Linux: fallocate the data region at create. default true
+  permissions?: number;     // POSIX mode bits at create. default 0o600
+  initTimeoutMs?: number;   // how long a joiner waits for the creator to finish. default 5000
+  raw?: boolean;            // no header: foreign-process interop, loses all header features. default false
+}
+close(name: string): void   // compatibility no-op, see §5.4
+unlink(name: string): void
+isNative(): boolean
+```
+
+`mode: 'create'` throws `E_EXISTS` if present; `'join'` throws `E_NOT_FOUND` if absent.
+
+### 5.2 Segment header (one page, at offset 0)
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
+| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. Joiners wait on it with native wait (§6). |
+| headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
+| flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
+| attach table | N × 32 B | One slot per attached process: identity (§7.1) + local refcount. ~120 slots with a 4 KiB page. |
+
+**Why a header:** it fixes, in one mechanism, four problems rev 1 handled badly or
+not at all:
+1. **Create/join race:** a joiner that arrives before the creator finishes waits for
+   `initState == 2` instead of reading `st_size == 0` and failing.
+2. **Windows size check:** the size is read from the header (rev 1's `fstat` fix was POSIX-only).
+3. **Reliable `list/stat/reap`:** we know who is attached without guessing.
+4. **Crash recovery of a half-initialized segment:** if `initState == 1` and the
+   initializer is dead (§7.1), a joiner takes over initialization.
+
+**Cost:** segments are not byte-compatible with shmbuf or foreign tools. `raw: true`
+exists for that case (no header, so no size check beyond `fstat`, no attach table).
+
+**Header size:** `max(4096, system page size)` so the data region stays page-aligned
+(every TypedArray alignment works, and 16 KiB pages on Apple Silicon are respected).
+
+### 5.3 Size handling
+
+- **Validation first, in JS and native:** `Number.isSafeInteger(size) && size >= 1 && size <= maxSegmentBytes`.
+  Native reads the size as `double`/`int64`, never `Uint32Value()` (F5).
+- **Policies on join** (compared against `header.dataBytes`):
+  - `exact` (default): mismatch → `E_SIZE_MISMATCH` naming both sizes.
+  - `at-least`: requested ≤ existing → map the requested prefix; larger → `E_SIZE_MISMATCH`. **Why:** mapping a prefix can never SIGBUS, and lets a reader map only a known header.
+  - `grow`: requested > existing → `ftruncate` up (grow-only) under the header's init lock, update `dataBytes`. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS, if U2 holds, → `E_GROW_UNSUPPORTED`. **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
+- **Reserve (Linux):** `posix_fallocate` on the data region at create; failure → `E_NO_SPACE`.
+  **Why:** tmpfs charges lazily, so a full `/dev/shm` shows up as SIGBUS on first touch,
+  possibly hours later. Reserving turns that into a create-time error (F7).
+  **Cost:** memory is committed up front; set `reserve: false` for sparse use.
+- **Windows:** pass the high DWORD to `CreateFileMappingW` (shmbuf hard-codes 0 → 4 GiB ceiling),
+  check `ERROR_ALREADY_EXISTS` to tell create from join.
+- **Size cap:** default 256 MiB, overridable via `MEMBRIDGE_MAX_SEGMENT_BYTES`.
+  **Why** a cap at all: a typo (e.g. bytes vs. KB) should not silently commit gigabytes when `reserve` is on.
+
+### 5.4 Lifecycle and registry
+
+- Native, process-wide `std::mutex`-guarded map `name → weak_ptr<Mapping>` (§3).
+  `open()` in any isolate (main or worker) reuses a live `Mapping` and creates a **new
+  BackingStore + SAB over it**, so there is no re-mmap.
+  **Why not "return the same SAB" (rev 1):** JS objects cannot cross isolates, and holding a
+  strong JS reference to return later would stop the SAB from ever being GC'd.
+  `shared_ptr<Mapping>` gives the correct lifetime for free: the mapping lives while any SAB
+  in any isolate holds it.
+- **Registry lookup with sizes:** a cached `Mapping` is reused only if its `dataBytes` covers
+  the requested size under the active policy. If the segment was grown (by this or another
+  process) and a larger size is requested, a **new** `Mapping` is made and replaces the
+  registry entry; SABs over the old mapping stay valid, because they hold their own reference.
+  **Why:** otherwise `grow` would silently hand back the stale, smaller mapping inside one process.
+- `~Mapping()` (unmap + release this process's attach slot) can run on **any thread**,
+  because V8 may call BackingStore deleters off the main thread. Registry and header updates
+  in it are therefore lock-protected / atomic.
+- **`close(name)` is a documented compatibility no-op** (it only validates the name, so shmbuf
+  call sites keep working). **Why:** it cannot unmap (that would be use-after-free under a live
+  SAB); the registry is process-wide and holds only weak references, so there is no
+  per-isolate state for it to release; and the size-aware lookup above removes the one
+  reason to force a fresh mapping. Memory is released when the last SAB is GC'd; the name is
+  removed by `unlink()` or `unlinkWhenUnused`. Rev 1's "close becomes meaningful" is withdrawn.
+- `unlink(name)` removes the name (POSIX `shm_unlink`). On Windows the section
+  disappears when the last handle closes; `unlink` there only prevents new joins
+  via membridge (marks the header `UNLINKED`).
+
+### 5.5 Names
+
+- Validation per platform: POSIX names start with `/`, have no other `/`, and are
+  ≤ 250 bytes on Linux. On macOS the limit is `PSHMNAMLEN` (31 if U2 holds).
+  On Windows the name is mapped to `Local\membridge<escaped-name>`, where each `/`
+  becomes `%2F` and a literal `%` becomes `%25` (percent-encoding — a plain `_`
+  replacement would collide `/a_b` with `/a/b`); a result exceeding the kernel's
+  object-name limit is `E_NAME_INVALID`, not silently truncated. An opt-in `Global\`
+  prefix is available (needs `SeCreateGlobalPrivilege`).
+- **Why per-platform:** a name accepted on Linux but rejected on macOS should fail with
+  `E_NAME_INVALID` at the call site, not with a raw `ENAMETOOLONG` from deep inside.
+
+### 5.6 Fallback (no native addon)
+
+- Opt-in only: `MEMBRIDGE_ALLOW_FALLBACK=1` or `open(..., { allowFallback: true })`.
+  Otherwise, a missing addon → `E_NATIVE_UNAVAILABLE`.
+- In fallback, `Mutex` and `RingBuffer` throw `E_NATIVE_UNAVAILABLE` unless explicitly opted in.
+  Fallback still checks sizes (shmbuf ignored size on re-open).
+- **Why:** a fallback that silently "works" inside one process turns a missing build
+  into a cross-process correctness bug that only appears in production.
+
+## 6. Cross-process wait/notify (new native primitive)
+
+```ts
+sync.wait(view: Int32Array, index: number, expected: number, timeoutMs?: number): 'ok' | 'not-equal' | 'timed-out'
+sync.waitAsync(view, index, expected, timeoutMs?): Promise<'ok' | 'not-equal' | 'timed-out'>
+sync.notify(view: Int32Array, index: number, count?: number): void
+```
+
+**Why:** F1 — `Atomics.notify` cannot wake another process, so a Mutex or RingBuffer
+built on `Atomics.wait` degrades to polling at its timeout interval (rev 1's 50 ms
+loop = up to 50 ms per contended handoff). This is the foundation for everything in §7–§8.
+
+| OS | Mechanism | Notes |
+|----|-----------|-------|
+| Linux | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG` on the mapped address | Shared futexes are keyed by the underlying page, so they work across processes. 32-bit words only → every waitable word in our layouts is `i32`. |
+| macOS | `os_sync_wait_on_address` / `os_sync_wake_by_address_*` with the SHARED flag (14.4+) | U1. If the spike fails or the OS is older: bounded exponential back-off polling (50 µs → 2 ms), documented as higher latency. |
+| Windows | Per-word named semaphore `Local\membridge-<seg>-w<offset>` + waiter count in shm | U3. Notify releases `min(count, waiters)`. Spurious wakeups allowed; callers re-check the word. |
+
+- **Sync waits** block the calling JS thread (same as `Atomics.wait`) — documented;
+  use `waitAsync` on a server main thread.
+- **Async waits** run on a membridge-owned native waiter thread, **not the libuv
+  threadpool**. **Why:** the default pool has 4 threads; a few pending lock waits would
+  starve `fs`/`dns`/`crypto`. On Linux ≥ 5.16 one thread can multiplex up to 128
+  waits via `futex_waitv`; elsewhere one thread per pending wait, capped
+  (`E_TOO_MANY_WAITERS`). Results are delivered with a threadsafe callback.
+- **Wait lifecycle pins memory and ends with the isolate.** A pending wait holds a
+  strong reference to the `Mapping` (§3) for its duration, so GC cannot `munmap`
+  the page under a sleeping futex. Isolate teardown (worker exit or `.terminate()`)
+  cancels that isolate's pending waits, wakes the native waiter, and resolves each
+  promise as `'timed-out'`; the §7.1 env-cleanup hook covers waits as well as
+  locks. **Why:** a waiter sleeping on a page a finalizer unmaps is a
+  use-after-free, and a promise that never settles leaks an uncollectable handle.
+- **Windows wakeups are best-effort; correctness never depends on one.** A waiter
+  that increments the shm waiter-count after `notify()` has read it misses the wake
+  until its bounded timeout. Every loop in §7–§8 therefore re-checks the word on
+  each wake *and* on timeout — a missed wake costs latency (≤ the bounded
+  timeout), never correctness.
+- **`futex_waitv` has no glibc wrapper (F14):** M3 calls it as
+  `syscall(__NR_futex_waitv, waiters, n, 0, &abs_timeout, CLOCK_MONOTONIC)`, with each
+  `struct futex_waitv` entry using `FUTEX2_SIZE_U32` and **without** `FUTEX2_PRIVATE`
+  (the waits must be shared). The same goes for plain `futex` (raw `syscall(SYS_futex, …)`;
+  glibc has no wrapper for that either). If the build headers lack `__NR_futex_waitv`, define
+  it as 449 (same value on x86_64 and asm-generic arches such as arm64). `ENOSYS` at runtime
+  (kernel < 5.16) → one thread per wait. musl builds use the same raw-syscall path.
+  The multiplexer is woken to change its wait set by a private control futex in its own wait vector.
+- Exposed publicly (`membridge/sync`) because users building their own lock-free
+  structures on a membridge SAB hit F1 just the same.
+
+## 7. Crash-safe Mutex
+
+### 7.1 Participant identity (shared with RingBuffer and reap)
+
+An identity is `{ pid, startTime, pidNsInode, threadId }`:
+- **startTime** (Linux `/proc/<pid>/stat` field 22; macOS `proc_pidinfo`; Windows
+  `GetProcessTimes`). **Why:** PIDs get reused; pid alone would let a recycled PID
+  look like a live owner, or a new process look like the dead one.
+- **pidNsInode** (Linux `/proc/self/ns/pid`, F9). **Why:** containers that share
+  `/dev/shm` (`--ipc=...`) see different PIDs for the same process. If the namespace
+  differs from ours, liveness is **unknowable → treat as alive, never steal**, and
+  document that recovery across PID namespaces needs a process in the owner's namespace.
+- **threadId** (Node `worker_threads.threadId`). **Why:** all workers share one PID,
+  so pid alone cannot tell which thread holds a lock or distinguish a dead worker from a live sibling.
+
+Liveness check: process exists (`kill(pid,0)`: success or **`EPERM` = alive**, `ESRCH` = dead;
+Windows `OpenProcess`+`GetExitCodeProcess`) **and** its start time matches.
+
+**Worker death inside a live process:** the addon registers an env-cleanup hook per
+isolate. When a worker exits or is terminated, the hook marks every lock that thread
+holds as `OWNER_DIED` and wakes waiters. **Why:** a process-liveness check cannot detect
+a dead thread in a live process.
+
+### 7.2 Layout
+
+Segment `kind = mutex`, data region:
+
+```
+i32 lockWord     0 = free; otherwise token = (slotIndex << 16) | gen15,  bit 31 = HAS_WAITERS
+i32 ownerDied    set when a steal happens; reported to the next holder
+i32 seq          incremented per acquisition (diagnostics)
+slots[64]        { identity (24 B), gen: i32, state: i32 } — one per participant thread
+```
+
+**Why a single 32-bit token word:** acquisition, release and **stealing are all a single CAS
+on one futex-compatible word**. Rev 1 kept state/owner/generation in separate words, so a
+steal could not be atomic. The token points at a participant slot whose identity was
+written **before** the CAS, so a holder that crashes between "acquire" and "record owner"
+cannot exist.
+
+**Slot reclamation:** the env-cleanup hook (§7.1) frees a thread's slot on graceful
+exit, but a SIGKILLed process's slot would linger and exhaust the 64-slot table
+under churn. A thread that finds no free slot scans for one whose identity fails
+the §7.1 liveness check **and whose token is not the current `lockWord` value** —
+a dead *holder's* slot is freed by the steal path first (the contender steals the
+lock into its own already-claimed slot, after which the dead slot is unreferenced)
+— and claims it with a single CAS on `slot.gen`, bumping gen. **Why CAS on gen:**
+bumping gen instantly invalidates every outstanding token pointing there (the same
+mechanism that makes stealing safe); a live owner's slot always passes the liveness
+check so it is never evicted; and a stale token can never win a CAS again.
+
+### 7.3 Protocol
+
+- **Lock:** CAS `0 → myToken`. On failure: set `HAS_WAITERS`, `sync.wait(lockWord, observed)`,
+  loop. Every wait has a bounded timeout (default 250 ms) after which the owner's liveness
+  is checked. **Why a timeout at all:** a dead owner never calls `notify`.
+- **Steal:** owner token → slot → identity is dead (§7.1) and slot gen matches the token
+  → CAS `deadToken → myToken`, set `ownerDied = 1`. Losing the CAS just means retry.
+- **No heartbeat.** **Why:** the owner cannot update a heartbeat while inside a synchronous
+  critical section (the event loop is blocked), so a heartbeat timeout would steal from a
+  live, busy owner. Stealing on liveness alone is both safe and sufficient.
+- **Unlock:** verify `lockWord` holds my token (else `E_NOT_OWNER`), store `0`, notify one if `HAS_WAITERS`.
+- **Owner-died is reported, not hidden** (the equivalent of pthread `EOWNERDEAD`):
+  `lock()` returns `{ ownerDied: boolean }`; `withLock(fn)` passes it to `fn`.
+  **Why:** the protected data may be half-updated; only the caller can repair it.
+- **Re-entrancy:** locking twice from the same thread → `E_DEADLOCK` (not a silent hang).
+- **No priority inheritance, no fairness guarantee:** a waiter woken by `notify` competes
+  with newcomers for the CAS, and a low-priority holder is never boosted. Fine for v1;
+  the README says so explicitly so nobody uses it for latency-critical control loops.
+  (Linux `FUTEX_LOCK_PI` would require the kernel's TID-based word format, which conflicts
+  with the token design and does not exist on macOS/Windows.)
+- **API:** `Mutex.open(name)`, `lock({timeoutMs})`, `tryLock()`, `lockAsync({timeoutMs, signal})`,
+  `unlock()`, `withLock(fn)`, `withLockAsync(fn)`. Timeout → `E_TIMEOUT`.
+
+**Alternative considered: OS robust mutexes** (Linux `PTHREAD_MUTEX_ROBUST`, Windows named
+mutex `WAIT_ABANDONED`). Rejected as the primary mechanism: macOS has no robust mutexes
+(no single design across platforms), an OS mutex must be released by the thread that
+locked it (incompatible with `lockAsync`, whose wait runs on another thread), and glibc
+owns the per-thread kernel robust list, so we cannot register our own futex words with it.
+The liveness-based design above gives the same guarantees (detects a dead owner, reports
+it, never deadlocks) on all three OSes.
+
+## 8. Zero-copy RingBuffer (SPSC, variable-length messages)
+
+### 8.1 Layout
+
+Segment `kind = ring`, data region:
+
+```
+i32 head        producer's committed byte count (free-running, wraps mod 2^32)
+i32 tail        consumer's released byte count (free-running)
+i32 producer    participant token (role claim)
+i32 consumer    participant token (role claim)
+u32 capacity    power of two, 4 KiB … 1 GiB
+u32 maxMessage  ≤ capacity/2 - 8
+… padding to 64 B (head and tail on separate cache lines)
+data[capacity]
+```
+
+- **Free-running 32-bit counters with power-of-two capacity**: `used = (head - tail) >>> 0`.
+  **Why:** no "one empty slot" waste (Lamport), and the counters stay `i32`, so they are
+  waitable (§6). That caps capacity at 1 GiB — rev 1's "~2 GB" needed `Uint32Array`, which
+  `Atomics.wait` and futex helpers do not accept, and contradicted the 256 MiB segment cap anyway.
+- **Capacity vs. the segment cap:** a ring needs `headerBytes + capacity`, so any
+  capacity above the current `MEMBRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB)
+  throws `E_SIZE_INVALID` until the env override is raised. **Why not clamp
+  silently:** a producer configured for 512 MiB that silently gets 256 MiB has
+  its backpressure behavior changed under it; refusing is honest.
+- **Framing:** each message = `u32 length` + payload, padded to 8 bytes. If a message does not
+  fit before the end of the buffer, the producer writes a `SKIP` marker and the message
+  starts at offset 0. **Why `maxMessage ≤ capacity/2`:** guarantees that a message always
+  fits contiguously once the buffer drains, so a skip can never deadlock.
+
+### 8.2 API (zero-copy two-phase, plus copying conveniences)
+
+```ts
+const p = RingBuffer.producer(name, { capacity, maxMessage });
+const view = p.reserve(n, { timeoutMs }); // Uint8Array straight into shared memory
+view.set(...); p.commit();                // publishes with a release store on head + notify
+p.write(bytes)                            // convenience = reserve + copy + commit (one copy)
+
+const c = RingBuffer.consumer(name);
+const msg = c.peek({ timeoutMs });        // Uint8Array view into shared memory, or null
+use(msg); c.release();                    // only now does tail advance
+c.read()                                  // convenience = peek + copy + release
+// async variants: reserveAsync / peekAsync (via sync.waitAsync)
+```
+
+- **Why two-phase:** rev 1's `write(view)` copied, and a `read()` returning a view was unsafe
+  because the producer may overwrite those bytes as soon as `tail` advances. With
+  `peek/release` the bytes stay valid until the consumer says so. Calling `peek`/`reserve`
+  again before `release`/`commit` → `E_RING_STATE`.
+- **Blocking:** producer waits on `tail` when full; consumer waits on `head` when empty (§6).
+- **SPSC enforced:** `producer()`/`consumer()` claim the role with a CAS on the role word.
+  A live holder → `E_ROLE_TAKEN`; a dead holder (§7.1) is replaced.
+- **Crash safety by construction:** data becomes visible only through `commit()`'s store
+  to `head`. A producer that dies mid-`reserve` leaves nothing visible; a consumer that dies
+  mid-`peek` leaves the message unreleased, so the next consumer sees it again
+  (**at-least-once** — documented).
+- **Init:** via the segment header's `initState` (§5.2); `capacity`/`maxMessage` given by a
+  joiner must match the header or → `E_SIZE_MISMATCH`.
+
+## 9. Ops utilities
+
+| API | Behavior | Platforms |
+|-----|----------|-----------|
+| `capacity()` | free/total of the shm backing store (`fs.statfs('/dev/shm')`) | Linux. macOS/Windows: `E_UNSUPPORTED` (no bounded shm filesystem). |
+| `stat(name)` | header contents: kind, sizes, creator, attached identities + liveness, owner of mutex/ring roles | all |
+| `list()` | Linux: readdir `/dev/shm`, keep entries whose header has membridge magic (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
+| `reap({ dryRun })` | unlink segments whose every attach slot is dead and that have no `ATTACH_OVERFLOW` flag. Unknown liveness (foreign pid namespace) counts as alive. | Linux (needs `list`); `reap(name)` for a single segment on all OSes |
+| `open(..., { unlinkWhenUnused: true })` | the last process to detach (attach table becomes empty) unlinks the name | all |
+
+**Why this replaces rev 1's `cleanupOnExit`:** exit handlers do not run on SIGKILL, SIGBUS
+or OOM-kill (nor on SIGINT/SIGTERM without handlers), so they cannot clean up after
+crashes. And unlinking on the *first* exit while others still use the segment makes later
+joiners create a separate segment with the same name — two processes silently using
+different memory. Ref-counting in the attach table plus `reap()` covers both cases correctly.
+
+## 10. Errors
+
+`MembridgeError extends Error` with `code`, plus structured fields (`name`, `requested`, `existing`, …):
+
+`E_NAME_INVALID` · `E_SIZE_INVALID` · `E_SIZE_MISMATCH` · `E_EXISTS` · `E_NOT_FOUND` ·
+`E_INCOMPATIBLE` · `E_INIT_TIMEOUT` · `E_NO_SPACE` · `E_GROW_UNSUPPORTED` · `E_NOT_OWNER` ·
+`E_DEADLOCK` · `E_TIMEOUT` · `E_ROLE_TAKEN` · `E_RING_STATE` · `E_MESSAGE_TOO_LARGE` ·
+`E_TOO_MANY_WAITERS` · `E_NATIVE_UNAVAILABLE` · `E_UNSUPPORTED` · `E_SYSTEM` (wraps errno/GetLastError with the syscall name).
+
+## 11. Changes from rev 1 and why
+
+| Rev 1 | Rev 2 | Reason |
+|-------|-------|--------|
+| Mutex waits with `Atomics.wait` + 50 ms loop | Native cross-process wait/notify (§6) | F1: cross-process notify does not work; rev 1 was polling |
+| Heartbeat + pid check, steal via separate gen word | Identity = pid + start time + pid-ns + threadId; single-word token CAS; no heartbeat | Heartbeat steals from live owners stuck in sync code; PID reuse/containers/workers; separate words made stealing non-atomic |
+| Steal silently | `ownerDied` reported to the next holder | Protected data may be inconsistent |
+| `write(view)` / `read()` ring, bytes unspecified | Two-phase `reserve/commit`, `peek/release`, length-prefixed framing, role claims | Rev 1 was neither zero-copy nor safe; framing/blocking/SPSC/crash handling were unspecified |
+| Ring capacity ~2 GB with u32 head/tail | Power-of-two ≤ 1 GiB, free-running i32 counters | Waitable words must be i32; contradicted the 256 MiB cap |
+| `fstat` size check (POSIX only) | Size in segment header + init state | Works on Windows; fixes create/join race instead of making it a spurious error |
+| "Document" SIGBUS on full tmpfs | `posix_fallocate` reserve → `E_NO_SPACE` | F7: fixes the hazard rather than describing it |
+| Same SAB returned for same name | Weak registry of `Mapping`s; new BackingStore + SAB per open | SABs cannot cross isolates; strong refs block GC; SAB length = store length (F15) |
+| `close()` "becomes meaningful" | Documented compatibility no-op | It cannot unmap safely and has no per-isolate state to release |
+| N-API + raw V8 cast | Plain V8 addon | F3/F4: removes undocumented cast and dangling handle; N-API gave no ABI benefit here |
+| `cleanupOnExit` | Attach-table refcount + `reap()` + `unlinkWhenUnused` | Exit hooks miss crashes; first-exit unlink splits processes onto different memory |
+| `list()` by undefined "our prefix", Linux-only paths assumed everywhere | Magic-based `list`, explicit per-platform support matrix | Names are user-chosen; macOS/Windows have no `/dev/shm` |
+| Fallback on by default, with warning | Fallback opt-in; Mutex/Ring refuse it | Silent single-process "success" is a production bug |
+| "Zero runtime dependencies" | One runtime dep: `node-gyp-build` (no transitive deps) | F11: shmbuf was not dependency-free; the claim was false |
+| Perf gate ≥ 5M / ~11M ops/s in tests | Benchmarks separate from tests; no throughput pass/fail in CI | F10: measurement too coarse, and shared CI runners are noisy |
+| Node 18/20/22/24, win/mac smoke | Node 22/24/26, all three OSes fully tested | 18 and 20 are EOL; 26 is current (U4); win/mac behave most differently |
+| Valgrind + ASAN | ASAN/UBSan only (LD_PRELOAD libasan into node) | Valgrind on V8's JIT is impractically slow and noisy |
+| `tsc` dual CJS + ESM builds | CJS build + thin ESM wrapper | Two module copies would mean two JS-side registries in one process |
+
+## 12. Layout & build
 
 ```
 membridge/
   package.json  tsconfig.json  LICENSE  README.md  .gitignore  PLAN.md
-  .github/workflows/ci.yml
-  src/    index.ts core.ts mutex.ts ringbuffer.ts ops.ts errors.ts fallback.ts
-  cc/     segment.cc segment.h binding.gyp get-include-dir.js
-  test/   *.test.ts   (node:test runner — zero test dependencies)
-  bench/  bench.js    (contention + mutex + ringbuffer benches)
+  .github/workflows/ci.yml  .github/workflows/prebuild.yml
+  src/    index.ts core.ts sync.ts mutex.ts ringbuffer.ts ops.ts errors.ts fallback.ts native.ts
+  esm/    index.mjs  (re-exports the CJS build)
+  cc/     addon.cc segment.cc registry.cc header.cc wait.cc liveness.cc *.h binding.gyp
+  test/   *.test.ts + helpers.ts   (node:test — no test dependencies)
+  bench/  contention.js mutex.js ring.js
 ```
 
-- CJS + ESM builds via tsc (`exports` map); `engines >= 18`.
-- Install strategy: per-ABI prebuilds via prebuildify + node-gyp-build resolver
-  (the addon is V8-ABI-bound, not NAPI-generic — prebuilds must be per-ABI),
-  with node-gyp source-build fallback.
+- `engines: ">=22"`. **Why:** prebuilds are per ABI, so every supported major multiplies the build
+  matrix; 18 and 20 are past EOL. Node 22 leaves maintenance in April 2027 (per Node's
+  schedule), so within a year the matrix drops to two majors (24/26). Dropping 22 is a
+  semver-major change: bump `engines` in a major release, not a minor.
+- **README compatibility matrix** (written in M7): OS × arch × libc × Node major, plus runtime
+  notes: official Node builds ✓ (no V8 sandbox, F13); **Electron ✗** (V8 sandbox rejects
+  external backing stores); Bun/Deno untested; macOS wait latency depends on the U1 outcome;
+  `list/capacity/reap()` Linux-only; Mutex has no priority inheritance (§7.3).
+- Prebuilds (prebuildify, **per-ABI, not `--napi`**): linux-x64-glibc, linux-arm64-glibc,
+  linux-x64-musl, darwin-arm64, darwin-x64, win32-x64 × Node 22/24/26.
+  Loader: `node-gyp-build`. Source-build fallback via `node-gyp` (ships with npm; no `node-addon-api` needed).
+- A new Node major needs a new release with fresh prebuilds — documented in README.
 
-## 7. Tests (node:test; ported + new)
+## 13. Tests (node:test)
 
-Ported from shmbuf: the 20 behaviors, fork cross-process handshake, 8-process
-contention/perf gate (no lost updates; ≥ 5M ops/s combined floor).
+**Runner contract:** tests are written as `*.test.ts`, compiled by the same
+`tsconfig` into `dist/test/`, and run as `node --test dist/test/` — `npm test`
+is `build` + that command. Source maps stay enabled so a failing crash test
+reports TypeScript line numbers, not transpiled ones. No test dependencies
+beyond the built-in `node:test`.
 
-New: strict/grow size policies, join-race (N processes racing the same name),
-create modes, error codes, refcount/close semantics, cleanupOnExit, Mutex
-(same-process, cross-process, dead-owner steal), RingBuffer cross-process,
-fallback mode, `worker_threads` sharing. ASAN/valgrind job in CI; matrix
-Node 18/20/22/24 × linux (+ win/mac smoke).
+**`test/helpers.ts`** carries the machinery every crash test needs, so no suite
+grows its own copy: the segment-name generator (`/membridge-test-<unique>`,
+AGENTS.md guardrail 3), a cleanup harness that unlinks in `finally` even when a
+test fails mid-way, a per-OS kill helper (POSIX `SIGKILL`; Windows `taskkill /F`
+— timing differs, so kill-based assertions are state-based, never timing-based),
+and an error-code assert (`assertThrowsCode(fn, 'E_SIZE_MISMATCH')`).
 
-## 8. Milestones (agentic rounds)
+**Ported from shmbuf:** its 20 behaviors (SAB type, length, zero-init, all Atomics ops,
+same-process re-open, isolation between names, lifecycle no-ops, fork handshake), and the
+8-process lost-update check as a **correctness** test (no throughput threshold).
 
-| # | Milestone | Size |
-|---|-----------|------|
-| 1 | Spike: cross-process `Atomics.wait`/`notify` + v8 SAB behavior on Node 24 | short round |
-| 2 | Hardened native core + TS layer + typed errors | 1–2 rounds |
-| 3 | Mutex (1 round) → RingBuffer (1 round) → ops utils + fallback polish (short) | ~2 rounds |
-| 4 | Tests, CI, prebuild pipeline, docs | 1–2 rounds |
-| 5 | Full verification: multi-process suites on Node 18/22/24, `npm pack` dry-run | short round |
+**New — core:** size validation (2^32+16, 1.9, −1, NaN, > cap); every create mode × size
+policy; N-process join race on one name; creator SIGKILLed mid-init → joiner takes over;
+`E_NO_SPACE` on a small dedicated tmpfs (CI mounts one); header magic/version mismatch;
+worker_threads share one mapping; registry/GC lifecycle (with `--expose-gc`): mapping unmapped only
+after the last SAB in every isolate is GC'd; `at-least` prefix + full view over one mapping;
+after `grow`, a larger `open()` in the same process gets a new, larger SAB while old SABs stay valid;
+`close()` is a no-op (SAB still usable after it, invalid name still throws).
 
-Estimated total: **~6–9 agent rounds**.
+**New — sync:** cross-process `wait`/`notify` wake latency (asserts a wake happens well before the
+timeout — the F1 regression test), `waitAsync` does not consume libuv pool threads, and a
+worker `.terminate()`d with a pending `waitAsync` has its promise resolved (`'timed-out'`)
+and its `Mapping` reference dropped (no memory or `/dev/shm` leak).
 
-## 9. Decisions you may want to override
+**New — Mutex:** mutual exclusion across 8 processes + workers; holder SIGKILLed →
+steal + `ownerDied`; worker terminated while holding → recovered via cleanup hook;
+`E_NOT_OWNER`, `E_DEADLOCK`, timeouts, `lockAsync` with `AbortSignal`; PID-reuse simulation
+(fake identity with wrong start time); slot-table exhaustion — 64 dead participants' slots
+are reclaimed and a 65th thread can lock.
+
+**New — RingBuffer:** cross-process stream with checksums across wrap/SKIP boundaries; full/empty
+blocking; `E_MESSAGE_TOO_LARGE`; producer killed mid-reserve (nothing visible);
+consumer killed mid-peek (message redelivered); role takeover after death; `E_ROLE_TAKEN`.
+
+**New — ops:** `list/stat/reap` with live, dead and mixed attachers; `unlinkWhenUnused`.
+
+**Platform rules:** the `E_NO_SPACE` tmpfs test runs only when `MEMBRIDGE_TEST_TMPFS`
+points at a prepared small tmpfs and otherwise skips with that reason (the ubuntu CI
+job mounts one); ring capacities above the default cap assert `E_SIZE_INVALID`
+until the env override is raised.
+
+**CI matrix:** {ubuntu, macos, windows} × Node {22, 24, 26}, full suite everywhere
+(platform-specific tests skip with an explicit reason). Separate Linux ASAN/UBSan job.
+
+## 14. Milestones (agentic rounds)
+
+| # | Milestone | Exit criteria | Size |
+|---|-----------|---------------|------|
+| 1 | **Spike** | Plain V8 addon builds and wraps mmap (offset window, deleter unmaps base) on Node 22/24/26 (U4); in-process Atomics pairing across distinct BackingStores (U5); shared futex wakes across processes on Linux; macOS `os_sync` SHARED (U1) and shm name/grow limits (U2) and Windows named-semaphore wait (U3) checked on CI runners. Results written into §2. | 1–2 rounds |
+| 2 | Native core | header, registry, size policies, reserve, names, errors, fallback; core tests green on all 3 OSes | 2 rounds |
+| 3 | Sync primitive | `sync.wait/notify/waitAsync` on 3 OSes; waiter thread; F1 regression test | 1–2 rounds |
+| 4 | Mutex | §7 complete with crash tests | 1–2 rounds |
+| 5 | RingBuffer | §8 complete with crash tests | 1–2 rounds |
+| 6 | Ops | `capacity/stat/list/reap/unlinkWhenUnused` | 1 round |
+| 7 | Build & release pipeline | prebuild workflow, ESM wrapper, README/API docs, sanitizer job | 1–2 rounds |
+| 8 | Full verification | full matrix green, benches recorded, `npm pack --dry-run` contents reviewed | 1 round |
+
+Estimated total: **~10–14 agent rounds** (rev 1 said 6–9; the increase is the native wait
+primitive, the header/attach table and real crash recovery — work rev 1 had left implicit).
+
+## 15. Decisions you may want to override
 
 - Author name in `package.json` / `LICENSE` is a placeholder ("Faiz").
-- Default max segment size 256 MiB (vs shmbuf's 64 MB) — adjustable.
-- Size-mismatch default policy is **strict** (error) rather than auto-grow —
-  safer for production; flip to grow-first if you prefer shmbuf's implicit behavior.
+- `engines >=22` (drops Node 18/20). Supporting them adds 2 ABIs × 6 targets of prebuilds.
+- `reserve: true` by default (safety over lazy memory). Flip if sparse segments are the main use.
+- Default size policy `exact`; max segment 256 MiB.
+- Header page in every segment (breaks byte-compatibility with shmbuf; `raw: true` opts out).
+- Steal never happens across PID namespaces (safe, but a crash there needs manual `reap`).
+- RingBuffer delivery is at-least-once when a consumer crashes mid-message.
 - GitHub repo URL / CI badges are left out until you create the remote.

@@ -1,0 +1,25 @@
+{
+  "name": "membridge",
+  "version": "0.0.0",
+  "description": "Cross-process shared memory for Node.js — SharedArrayBuffer over OS shared memory, plus a crash-safe Mutex, zero-copy RingBuffer, and ops utilities",
+  "license": "MIT",
+  "author": "Faiz",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {},
+  "keywords": [
+    "shared-memory",
+    "shm",
+    "mmap",
+    "ipc",
+    "cross-process",
+    "native",
+    "atomics",
+    "SharedArrayBuffer",
+    "mutex",
+    "ringbuffer"
+  ]
+}

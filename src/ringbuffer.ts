@@ -308,7 +308,7 @@ export class RingConsumer {
         continue;
       }
       const framed = align8(4 + lenWord);
-      if (head - tail < framed) {
+      if (((head - tail) >>> 0) < framed) {  // unsigned: survives the 2^31 sign flip (review F1)
         // length visible but payload not fully committed yet
         if (opts?.timeoutMs !== undefined && Date.now() >= deadline) return null;
         this.b.syncWait(this.view, HEAD, head, sleepSliceMs);

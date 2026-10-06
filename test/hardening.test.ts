@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import fs from 'node:fs';
 import { fork } from 'node:child_process';
 import { open, unlink } from '../src/core';
-import { RingConsumer } from '../src/ringbuffer';
+import { RingProducer, RingConsumer } from '../src/ringbuffer';
 import { assert, uniqueName, unlinkQuietly, buildHeader, shmPath } from './helpers';
 
 const POSIX = process.platform === 'linux' || process.platform === 'darwin';
@@ -147,4 +147,135 @@ test('Corr F16: registry refuses a stale mapping after unlink+recreate', (t) => 
   // Our re-open must see the NEW object (42), not the stale mapping (1).
   const b = open(name, 256);
   assert.strictEqual(new Int32Array(b)[0], 42, 'reuse validated by object identity');
+});
+
+test('Corr F1: ring consumer survives the 2^31 head/tail sign flip', () => {
+  const name = uniqueName();
+  try {
+    const p = RingProducer.open(name, { capacity: 4096 });
+    const c = RingConsumer.open(name);
+    const v = (p as unknown as { view: Int32Array }).view;
+    Atomics.store(v, 0, 2147483632);  // head
+    Atomics.store(v, 16, 2147483632); // tail
+    p.write(Buffer.from([1, 2, 3, 4, 5]));             // head -> ...640
+    p.write(Buffer.from([6, 7, 8, 9, 10]));            // head wraps negative
+    const m1 = c.read({ timeoutMs: 600 });
+    const m2 = c.read({ timeoutMs: 600 });
+    assert.notStrictEqual(m1, null, 'first message delivered across the flip');
+    assert.notStrictEqual(m2, null, 'second message delivered after the flip');
+    assert.deepStrictEqual([...m2!], [6, 7, 8, 9, 10]);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F4: a SIGKILLed-but-unreaped (zombie) holder is stolen from', async () => {
+  const name = uniqueName();
+  const { spawn } = require('node:child_process') as typeof import('node:child_process');
+  const child = spawn(process.execPath, ['-e', `
+    const { Mutex } = require(${JSON.stringify(require.resolve('../src/mutex'))});
+    const m = Mutex.open(process.env.MX_NAME);
+    m.lock();
+    process.send('locked');
+    setInterval(() => {}, 1 << 30);
+  `], { env: { ...process.env, MX_NAME: name }, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+  try {
+    await new Promise<void>((resolve) =>
+      child.on('message', (m: string) => m === 'locked' && resolve()));
+    child.kill('SIGKILL');
+    // deliberately DO NOT wait for exit: the corpse stays a zombie while we
+    // block in the synchronous lock() below (our event loop is parked, so we
+    // cannot reap it) — this used to deadlock forever.
+    const { Mutex } = await import('../src/mutex');
+    const m = Mutex.open(name);
+    const res = m.lock({ timeoutMs: 5000 });
+    assert.strictEqual(res.ownerDied, true, 'zombie holder stolen from');
+    m.unlock();
+  } finally {
+    child.kill('SIGKILL');
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F2: exited workers do not exhaust the 64-slot table', async () => {
+  const { Mutex } = await import('../src/mutex');
+  const name = uniqueName();
+  try {
+    Mutex.open(name); // parent creates
+    for (let i = 0; i < 70; i++) {
+      // each worker claims a slot, locks+unlocks, and exits gracefully
+      const r = await new Promise<number>((resolve, reject) => {
+        const w = new (require('node:worker_threads').Worker)(
+          `const { parentPort, workerData } = require('worker_threads');
+           const { Mutex } = require(workerData.pkg);
+           const m = Mutex.open(workerData.name);
+           m.lock();
+           m.unlock();
+           parentPort.postMessage('ok');`,
+          { eval: true, workerData: { name, pkg: require.resolve('../src/mutex') } },
+        );
+        w.on('message', () => resolve(0));
+        w.on('error', reject);
+      });
+      assert.strictEqual(r, 0);
+    }
+    // the 71st participant (this thread) must still be able to lock
+    const m = Mutex.open(name);
+    m.lock();
+    m.unlock();
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F3: sequential workers with waitAsync all settle (no stale hub reuse)', async () => {
+  const name = uniqueName();
+  try {
+    open(name, 4096);
+    for (let i = 0; i < 8; i++) {
+      const r = await new Promise<{ resolvedAs: string }>((resolve, reject) => {
+        const w = new (require('node:worker_threads').Worker)(
+          `const { parentPort, workerData } = require('worker_threads');
+           const { open } = require(workerData.pkg);
+           const { waitAsync } = require(workerData.pkg.replace(/core\\.js$/, 'sync.js'));
+           const i32 = new Int32Array(open(workerData.name, 4096));
+           waitAsync(i32, 0, 0, 80).then((r) => parentPort.postMessage({ resolvedAs: r }));`,
+          { eval: true, workerData: { name, pkg: require.resolve('../src/core') } },
+        );
+        w.on('message', resolve);
+        w.on('error', reject);
+      });
+      assert.strictEqual(r.resolvedAs, 'timed-out', `worker ${i} settled`);
+    }
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F22: ownerDied is reported exactly once per death', async () => {
+  const { Mutex } = await import('../src/mutex');
+  const name = uniqueName();
+  const { spawn } = require('node:child_process') as typeof import('node:child_process');
+  const child = spawn(process.execPath, ['-e', `
+    const { Mutex } = require(${JSON.stringify(require.resolve('../src/mutex'))});
+    const m = Mutex.open(process.env.MX_NAME);
+    m.lock();
+    process.send('locked');
+    setInterval(() => {}, 1 << 30);
+  `], { env: { ...process.env, MX_NAME: name }, stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+  try {
+    await new Promise<void>((resolve) =>
+      child.on('message', (m: string) => m === 'locked' && resolve()));
+    child.kill('SIGKILL');
+    await new Promise<void>((r) => child.on('exit', () => r()));
+    const m = Mutex.open(name);
+    assert.strictEqual(m.lock({ timeoutMs: 5000 }).ownerDied, true, 'stealer sees ownerDied');
+    m.unlock();
+    const second = Mutex.open(name);
+    assert.strictEqual(second.lock({ timeoutMs: 1000 }).ownerDied, false, 'next holder does not');
+    second.unlock();
+  } finally {
+    child.kill('SIGKILL');
+    unlinkQuietly(name);
+  }
 });

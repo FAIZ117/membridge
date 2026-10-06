@@ -15,6 +15,7 @@
 namespace membridge {
 
 void MutexCleanupIsolate(v8::Isolate* isolate);
+void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot);
 void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
                     uint32_t roleWordOffset);
 
@@ -65,59 +66,96 @@ bool CasSlotState(int32_t* data, uint32_t slotsBase, uint32_t slot, uint32_t exp
 
 }  // namespace
 
+void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
+                    uint32_t roleWordOffset);
+
+// Publish `self` into slot `s` under an already-won RESERVATION and return
+// the token. Gen bumps skip values that would make the token 0 (slot 0, gen
+// 0): token 0 IS the free word — a claim producing it would break mutual
+// exclusion (review F12).
+namespace {
+uint32_t PublishClaimedSlot(int32_t* data, uint32_t slotsBase, uint32_t s,
+                            const Identity& self) {
+  uint32_t g = SlotGen(data, slotsBase, s);
+  int32_t gExpected = static_cast<int32_t>(g);
+  uint32_t next = g + 1;
+  if (s == 0 && (next & kMutexGenMask) == 0) next++;  // never token 0
+  while (!AtomicWord(SlotPtr(data, slotsBase, s, kSlotGen))
+              ->compare_exchange_strong(gExpected, static_cast<int32_t>(next),
+                                        std::memory_order_acq_rel)) {
+    g = static_cast<uint32_t>(gExpected);
+    next = g + 1;
+    if (s == 0 && (next & kMutexGenMask) == 0) next++;
+  }
+  int32_t* idw = SlotPtr(data, slotsBase, s, 0);
+  AtomicWord(idw + kSlotPid)->store(self.pid, std::memory_order_release);
+  AtomicWord(idw + kSlotTid)->store(self.threadId, std::memory_order_release);
+  AtomicWord(idw + kSlotStartLo)
+      ->store(static_cast<int32_t>(static_cast<uint64_t>(self.startTime) & 0xFFFFFFFFu));
+  AtomicWord(idw + kSlotStartHi)
+      ->store(static_cast<int32_t>(static_cast<uint64_t>(self.startTime) >> 32));
+  AtomicWord(idw + kSlotNsLo)
+      ->store(static_cast<int32_t>(static_cast<uint64_t>(self.pidNsInode) & 0xFFFFFFFFu));
+  AtomicWord(idw + kSlotNsHi)
+      ->store(static_cast<int32_t>(static_cast<uint64_t>(self.pidNsInode) >> 32));
+  AtomicWord(SlotPtr(data, slotsBase, s, kSlotState))
+      ->store(static_cast<int32_t>(kMutexStateActive), std::memory_order_release);
+  return (s << 16) | (next & kMutexGenMask);
+}
+}  // namespace
+
 uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& name) {
   const uint32_t slotsBase = kMutexHeaderWords;
   const Identity self = SelfIdentity();
+  if (self.startTime < 0) {
+    // Refuse to claim with an unrecordable identity (review F25): a slot
+    // stamped startTime=-1 would let a later check judge its LIVE owner dead.
+    ThrowError(isolate, "E_SYSTEM",
+               "cannot establish thread identity (/proc unavailable); refusing to claim a mutex slot",
+               name);
+  }
 
-  // 1) Reuse this thread's existing slot (per-thread participant slot, §7.2).
+  // Pass 1 (review P8): reuse this thread's slot or take a FREE slot — no
+  // liveness checks on the way.
   for (uint32_t s = 0; s < kMutexSlotCount; s++) {
     if (SlotState(data, slotsBase, s) == kMutexStateActive &&
         AtomicWord(SlotPtr(data, slotsBase, s, kSlotPid))->load() == self.pid &&
         AtomicWord(SlotPtr(data, slotsBase, s, kSlotTid))->load() == self.threadId &&
         SlotIdentity(data, slotsBase, s).startTime == self.startTime) {
-      return (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
+      uint32_t token = (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
+      if (token == 0) {
+        if (!CasSlotState(data, slotsBase, s, kMutexStateActive, kMutexStateReserved)) continue;
+        token = PublishClaimedSlot(data, slotsBase, s, self);  // bumps off 0
+      }
+      MutexRegisterClaim(isolate, data, token, static_cast<int>(s));
+      return token;
     }
+  }
+  for (uint32_t s = 0; s < kMutexSlotCount; s++) {
+    if (SlotState(data, slotsBase, s) != kMutexStateFree) continue;
+    if (!CasSlotState(data, slotsBase, s, kMutexStateFree, kMutexStateReserved)) continue;
+    const uint32_t token = PublishClaimedSlot(data, slotsBase, s, self);
+    MutexRegisterClaim(isolate, data, token, static_cast<int>(s));
+    return token;
   }
 
-  // 2) Free slot, or reclaim one whose identity is provably dead and whose
-  //    token is not the current lockWord value (§7.2).
-  const uint32_t currentLock = static_cast<uint32_t>(
-      AtomicWord(data)->load(std::memory_order_acquire) & static_cast<int32_t>(kMutexTokenMask));
-  for (uint32_t pass = 0; pass < 2; pass++) {
-    for (uint32_t s = 0; s < kMutexSlotCount; s++) {
-      const uint32_t st = SlotState(data, slotsBase, s);
-      if (st == kMutexStateReserved) continue;
-      if (st == kMutexStateActive) {
-        // candidate only when provably dead AND unreferenced by the lock word
-        const uint32_t staleToken = (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
-        if (staleToken == currentLock) continue;
-        if (CheckLiveness(SlotIdentity(data, slotsBase, s)) != Liveness::kDead) continue;
-      } else if (st != kMutexStateFree) {
-        continue;
-      }
-      // Reserve, then bump gen (invalidates every outstanding token), then
-      // publish identity + ACTIVE. The gen CAS cannot fail while we hold the
-      // reservation: gen changes only under it.
-      if (!CasSlotState(data, slotsBase, s, st, kMutexStateReserved)) continue;
-      uint32_t g = SlotGen(data, slotsBase, s);
-      int32_t gExpected = static_cast<int32_t>(g);
-      while (!AtomicWord(SlotPtr(data, slotsBase, s, kSlotGen))
-                  ->compare_exchange_strong(gExpected, static_cast<int32_t>(g + 1),
-                                            std::memory_order_acq_rel)) {
-        g = static_cast<uint32_t>(gExpected);
-      }
-      int32_t* idw = SlotPtr(data, slotsBase, s, 0);
-      AtomicWord(idw + kSlotPid)->store(self.pid, std::memory_order_release);
-      AtomicWord(idw + kSlotTid)->store(self.threadId, std::memory_order_release);
-      AtomicWord(idw + kSlotStartLo)->store(static_cast<int32_t>(static_cast<uint64_t>(self.startTime) & 0xFFFFFFFFu));
-      AtomicWord(idw + kSlotStartHi)->store(static_cast<int32_t>(static_cast<uint64_t>(self.startTime) >> 32));
-      AtomicWord(idw + kSlotNsLo)->store(static_cast<int32_t>(static_cast<uint64_t>(self.pidNsInode) & 0xFFFFFFFFu));
-      AtomicWord(idw + kSlotNsHi)->store(static_cast<int32_t>(static_cast<uint64_t>(self.pidNsInode) >> 32));
-      AtomicWord(SlotPtr(data, slotsBase, s, kSlotState))
-          ->store(static_cast<int32_t>(kMutexStateActive), std::memory_order_release);
-      return (s << 16) | ((g + 1) & kMutexGenMask);
-    }
+  // Pass 2: reclaim a slot whose identity is provably dead and whose token is
+  // not the current lockWord value (§7.2). The lockWord is re-read per slot:
+  // a steal can make yesterday's holder-token stale mid-scan.
+  for (uint32_t s = 0; s < kMutexSlotCount; s++) {
+    const uint32_t st = SlotState(data, slotsBase, s);
+    if (st != kMutexStateActive) continue;
+    const uint32_t staleToken = (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
+    const uint32_t currentLock = static_cast<uint32_t>(
+        AtomicWord(data)->load(std::memory_order_acquire)) & kMutexTokenMask;
+    if (staleToken == currentLock) continue;
+    if (CheckLiveness(SlotIdentity(data, slotsBase, s)) != Liveness::kDead) continue;
+    if (!CasSlotState(data, slotsBase, s, kMutexStateActive, kMutexStateReserved)) continue;
+    const uint32_t token = PublishClaimedSlot(data, slotsBase, s, self);
+    MutexRegisterClaim(isolate, data, token, static_cast<int>(s));
+    return token;
   }
+
   ThrowError(isolate, "E_TIMEOUT",
              "no mutex participant slot available for thread (all " +
                  std::to_string(kMutexSlotCount) + " slots held by live threads)",
@@ -152,6 +190,7 @@ struct HeldLock {
 
 struct HeldState {
   std::vector<HeldLock> locks;
+  std::vector<int32_t*> claimedData;  // every mutex segment this isolate claimed on
   bool hookRegistered = false;
 };
 
@@ -160,10 +199,12 @@ std::map<v8::Isolate*, HeldState> g_held;
 
 }  // namespace
 
-void MutexTrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot) {
+// Claim-time registration (review P1/F2/F14): one native call per Mutex
+// instance (its lazy slot claim), zero per lock()/unlock(). The teardown
+// hook releases anything still held and frees this thread's slots.
+void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot) {
   std::lock_guard<std::mutex> lock(g_held_mu);
   HeldState& st = g_held[isolate];
-  const std::shared_ptr<Mapping> pin = Registry::FindByAddress(data);
   if (!st.hookRegistered) {
     st.hookRegistered = true;
     node::AddEnvironmentCleanupHook(
@@ -171,23 +212,27 @@ void MutexTrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token, int slo
         [](void* p) { MutexCleanupIsolate(static_cast<v8::Isolate*>(p)); },
         isolate);
   }
-  for (const HeldLock& h : st.locks) {
-    if (h.data == data && h.token == token) return;
+  bool knownData = false;
+  for (int32_t* d : st.claimedData) {
+    if (d == data) {
+      knownData = true;
+      break;
+    }
   }
-  st.locks.push_back({data, token, slot, false, 0, std::move(pin)});
-}
-
-void MutexUntrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token) {
-  std::lock_guard<std::mutex> lock(g_held_mu);
-  auto it = g_held.find(isolate);
-  if (it == g_held.end()) return;
-  for (auto vit = it->second.locks.begin(); vit != it->second.locks.end(); ++vit) {
-    if (vit->data == data && vit->token == token) {
-      it->second.locks.erase(vit);
+  if (!knownData) st.claimedData.push_back(data);
+  for (HeldLock& h : st.locks) {
+    if (h.data == data && h.slot == slot && !h.isRole) {
+      h.token = token;  // re-claim after a gen bump: refresh the token
       return;
     }
   }
+  // Pin captured NOW, while the mapping is certainly alive (review F14: a
+  // later unlink erases the registry entry, and a pin looked up at teardown
+  // would be null and skip the release).
+  const std::shared_ptr<Mapping> pin = Registry::FindByAddress(data);
+  st.locks.push_back({data, token, slot, false, 0, std::move(pin)});
 }
+
 
 void MutexReleaseThreadSlots(int32_t* data) {
   const uint32_t slotsBase = kMutexHeaderWords;
@@ -226,11 +271,13 @@ void ReleaseHeldLock(const HeldLock& h) {
 
 void MutexCleanupIsolate(v8::Isolate* isolate) {
   std::vector<HeldLock> held;
+  std::vector<int32_t*> datas;
   {
     std::lock_guard<std::mutex> lock(g_held_mu);
     auto it = g_held.find(isolate);
     if (it == g_held.end()) return;
     held.swap(it->second.locks);
+    datas.swap(it->second.claimedData);
     g_held.erase(it);
   }
   for (const HeldLock& h : held) {
@@ -248,6 +295,11 @@ void MutexCleanupIsolate(v8::Isolate* isolate) {
     } else {
       ReleaseHeldLock(h);
     }
+  }
+  // Review F2: free this thread's participant slots in every claimed segment
+  // (a worker that locked, unlocked and exited used to leak its slot forever).
+  for (int32_t* d : datas) {
+    MutexReleaseThreadSlots(d);
   }
 }
 

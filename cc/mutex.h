@@ -46,12 +46,11 @@ uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& 
 bool MutexOwnerAlive(int32_t* data, uint32_t token, uint32_t slotsWordOffset,
                      uint32_t slotCount);
 
-// Per-isolate held-lock registry for the §7.1 env-cleanup hook: a dead worker
-// must not leave locks behind in a live process. Tracking registers the hook
-// on first use; teardown releases every still-held lock as OWNER_DIED and
-// wakes one waiter.
-void MutexTrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot);
-void MutexUntrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token);
+// Claim-time registration (review P1/F2/F14): registers (data, token, pin)
+// with the isolate's env-cleanup hook — zero native calls per lock/unlock.
+// Teardown releases anything still held (as OWNER_DIED + wake) and frees
+// this thread's participant slots in every claimed segment.
+void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot);
 
 // Free this thread's slot(s) in `data` (graceful close; slots of dead threads
 // are reclaimed on demand anyway).

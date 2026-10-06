@@ -284,13 +284,23 @@ An identity is `{ pid, startTime, pidNsInode, threadId }`:
 - **threadId** (Node `worker_threads.threadId`). **Why:** all workers share one PID,
   so pid alone cannot tell which thread holds a lock or distinguish a dead worker from a live sibling.
 
-Liveness check: process exists (`kill(pid,0)`: success or **`EPERM` = alive**, `ESRCH` = dead;
-Windows `OpenProcess`+`GetExitCodeProcess`) **and** its start time matches.
+Liveness check: `kill(pid,0)` (`ESRCH` = dead) then one `/proc/<pid>/stat` read that must
+succeed and match — state `Z`/`X` (zombie) counts as **dead** (a zombie answers `kill(pid,0)`
+as alive and would keep a holder unstealable forever; fix round 2026-10-06), a start-time
+mismatch counts as dead (pid recycled), and an unreadable stat (hidepid) counts as **unknown →
+never steal**. An identity whose start time was never recorded (`-1`) is never stealable either.
+Windows `OpenProcess`+`GetExitCodeProcess`. Self-identity (startTime, pid-ns inode) is cached
+per thread and refreshed when the pid changes; a claim with an unrecordable identity throws
+`E_SYSTEM` rather than stamping a slot that later misjudges its live owner.
 
 **Worker death inside a live process:** the addon registers an env-cleanup hook per
-isolate. When a worker exits or is terminated, the hook marks every lock that thread
-holds as `OWNER_DIED` and wakes waiters. **Why:** a process-liveness check cannot detect
-a dead thread in a live process.
+isolate (at slot-claim time — one native registration per Mutex instance, zero per
+lock/unlock; fix round 2026-10-06). When a worker exits or is terminated, the hook
+releases anything the thread still holds (marking `OWNER_DIED` and waking a waiter),
+clears its ring-role claims, **and frees the thread's participant slots** — an exited
+worker used to leak its slot permanently and exhaust the 64-row table. **Why:** a
+process-liveness check cannot detect a dead thread in a live process, and slot
+reclamation only sees dead *processes*.
 
 ### 7.2 Layout
 

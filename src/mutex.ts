@@ -115,7 +115,6 @@ export class Mutex {
         if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
-          this.b.mutexTrackHeld(this.name, this.view, token);
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
         }
         continue;
@@ -125,7 +124,9 @@ export class Mutex {
           segmentName: this.name,
         });
       }
-      // Dead owner? Steal: single CAS deadToken -> myToken (§7.3).
+      // Dead owner? Steal: single CAS deadToken -> myToken (§7.3). ownerDied
+      // is reported to the STEALER only — storing the flag here made the
+      // NEXT acquire report it a second time (review F22).
       if (!this.b.mutexOwnerAlive(this.view, tokenBits)) {
         const stolen = Atomics.compareExchange(
           this.view,
@@ -134,10 +135,8 @@ export class Mutex {
           token | (lw & HAS_WAITERS),
         );
         if (stolen === lw) {
-          Atomics.store(this.view, OWNER_DIED, 1);
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
-          this.b.mutexTrackHeld(this.name, this.view, token);
           return { ownerDied: true };
         }
         continue; // lost the race: retry
@@ -172,7 +171,6 @@ export class Mutex {
     if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
       Atomics.add(this.view, SEQ, 1);
       this.held = true;
-      this.b.mutexTrackHeld(this.name, this.view, token);
       return true;
     }
     return false;
@@ -191,7 +189,6 @@ export class Mutex {
         if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
-          this.b.mutexTrackHeld(this.name, this.view, token);
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
         }
         continue;
@@ -204,10 +201,8 @@ export class Mutex {
       if (!this.b.mutexOwnerAlive(this.view, tokenBits)) {
         const stolen = Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS));
         if (stolen === lw) {
-          Atomics.store(this.view, OWNER_DIED, 1);
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
-          this.b.mutexTrackHeld(this.name, this.view, token);
           return { ownerDied: true };
         }
         continue;
@@ -223,7 +218,10 @@ export class Mutex {
           ? new Promise<never>((_, rej) => {
               const onAbort = () => rej(signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted'));
               signal.addEventListener('abort', onAbort, { once: true });
-              waitP.finally(() => signal.removeEventListener('abort', onAbort));
+              // two-armed: a .finally-derived promise would carry rejections
+              // unhandled and kill the process (review F11)
+              void waitP.then(() => signal.removeEventListener('abort', onAbort),
+                              () => signal.removeEventListener('abort', onAbort));
             })
           : null;
       const slice = (await (abortP !== null ? Promise.race([waitP, abortP]) : waitP)) as string;
@@ -248,14 +246,12 @@ export class Mutex {
       if ((lw & TOKEN_MASK) !== token) {
         // our unlock raced a steal: the stealer owns it now
         this.held = false;
-        this.b.mutexUntrackHeld(this.view, token);
         throw new MembridgeError('E_NOT_OWNER', 'mutex was stolen after owner death', {
           segmentName: this.name,
         });
       }
       if (Atomics.compareExchange(this.view, LOCK_WORD, lw, 0) === lw) {
         this.held = false;
-        this.b.mutexUntrackHeld(this.view, token);
         if (lw & HAS_WAITERS) {
           this.b.syncNotify(this.view, LOCK_WORD, 1);
         }

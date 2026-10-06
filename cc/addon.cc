@@ -716,38 +716,32 @@ void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
       v8::Boolean::New(isolate, MutexOwnerAlive(data, token, kMutexHeaderWords, kMutexSlotCount)));
 }
 
-// mutexTrackHeld(name, view, token) / mutexUntrackHeld(view, token)
-void MutexTrackHeldJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
-  v8::HandleScope scope(isolate);
-  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
-  if (args.Length() < 3 || !args[2]->IsNumber()) {
-    isolate->ThrowException(
-        v8::Exception::TypeError(Str(isolate, "mutexTrackHeld(name, view, token)")));
-    return;
-  }
-  int32_t* data = DataAddrOf(isolate, args[1]);
-  const uint32_t token = static_cast<uint32_t>(args[2]->NumberValue(ctx).ToChecked());
-  const uint32_t slot = (token & kMutexTokenMask) >> 16;
-  MutexTrackHeld(isolate, data, token, static_cast<int>(slot));
-  args.GetReturnValue().Set(v8::Undefined(isolate));
-}
+// ---- guarded trampolines ---------------------------------------------------
+// Every JS entry point catches NativeError (JS exception already pending).
+// Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
 
-void MutexUntrackHeldJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
-  v8::HandleScope scope(isolate);
-  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
-  if (args.Length() < 2 || !args[1]->IsNumber()) {
-    isolate->ThrowException(
-        v8::Exception::TypeError(Str(isolate, "mutexUntrackHeld(view, token)")));
-    return;
+#define MEMBRIDGE_TRAMPOLINE(JsName, Impl)                                        \
+  void JsName(const v8::FunctionCallbackInfo<v8::Value>& args) {                  \
+    try {                                                                         \
+      Impl(args);                                                                 \
+    } catch (const NativeError&) {                                                \
+      /* JS exception pending; RAII guards already unwound. */                    \
+    } catch (...) {                                                               \
+      v8::Isolate* iso = args.GetIsolate();                                       \
+      iso->ThrowException(MakeError(iso, "E_SYSTEM", "internal error"));          \
+    }                                                                             \
   }
-  int32_t* data = DataAddrOf(isolate, args[0]);
-  const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
-  MutexUntrackHeld(isolate, data, token);
-  args.GetReturnValue().Set(v8::Undefined(isolate));
-}
 
+MEMBRIDGE_TRAMPOLINE(OpenJs, Open)
+MEMBRIDGE_TRAMPOLINE(UnlinkJs, Unlink)
+MEMBRIDGE_TRAMPOLINE(CloseJs, Close)
+MEMBRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
+MEMBRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
+MEMBRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
+MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
+MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
+MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
+MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
 // ringClaimRole(name, view, isProducer) -> token
 void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
@@ -766,9 +760,7 @@ void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Number::New(isolate, token));
 }
 
-// readHeader(name, maxAttach) -> { magic, layoutVersion, initState, headerBytes,
-// flags, dataBytes, attach: [{pid, threadId, startTime, pidNsInode, refcount}] }
-// (§9 stat; throws E_NOT_FOUND / E_INCOMPATIBLE)
+// readHeader(name, maxAttach) -> header fields + attach rows (§9 stat)
 void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
   v8::HandleScope scope(isolate);
@@ -812,36 +804,8 @@ void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(o);
 }
 
-// ---- guarded trampolines ---------------------------------------------------
-// Every JS entry point catches NativeError (JS exception already pending).
-// Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
-
-#define MEMBRIDGE_TRAMPOLINE(JsName, Impl)                                        \
-  void JsName(const v8::FunctionCallbackInfo<v8::Value>& args) {                  \
-    try {                                                                         \
-      Impl(args);                                                                 \
-    } catch (const NativeError&) {                                                \
-      /* JS exception pending; RAII guards already unwound. */                    \
-    } catch (...) {                                                               \
-      v8::Isolate* iso = args.GetIsolate();                                       \
-      iso->ThrowException(MakeError(iso, "E_SYSTEM", "internal error"));          \
-    }                                                                             \
-  }
-
-MEMBRIDGE_TRAMPOLINE(OpenJs, Open)
-MEMBRIDGE_TRAMPOLINE(UnlinkJs, Unlink)
-MEMBRIDGE_TRAMPOLINE(CloseJs, Close)
-MEMBRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
-MEMBRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
-MEMBRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
-MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
-MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
-MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
-MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
 MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
 MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
-MEMBRIDGE_TRAMPOLINE(MutexTrackHeldJs2, MutexTrackHeldJs)
-MEMBRIDGE_TRAMPOLINE(MutexUntrackHeldJs2, MutexUntrackHeldJs)
 MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
 MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
 
@@ -864,8 +828,6 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"syncWaitAsync", SyncWaitAsyncJs2},
       {"mutexClaimSlot", MutexClaimSlotJs2},
       {"mutexOwnerAlive", MutexOwnerAliveJs2},
-      {"mutexTrackHeld", MutexTrackHeldJs2},
-      {"mutexUntrackHeld", MutexUntrackHeldJs2},
       {"ringClaimRole", RingClaimRoleJs2},
       {"readHeader", ReadHeaderJs2},
   };

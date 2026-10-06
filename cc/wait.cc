@@ -93,6 +93,9 @@ struct Hub {
   std::deque<std::pair<std::shared_ptr<PromiseState>, Fulfill>> queue;
   int pending = 0;
   bool closed = false;
+  // Set while the handle is closing: keeps the Hub alive until uv's close
+  // callback runs, so g_hubs can drop it immediately (review F3).
+  std::shared_ptr<Hub> selfKeepAlive;
 };
 
 std::mutex g_hubs_mu;
@@ -110,7 +113,7 @@ struct WaitNode {
   bool hasTimeout;
   double deadlineMs;  // steady-clock ms; valid when hasTimeout
   std::shared_ptr<PromiseState> state;
-  Hub* hub;
+  std::shared_ptr<Hub> hub;  // owns the hub: survives teardown's erase+close (F18)
   bool onThread = false;
   bool cancelled = false;
   std::atomic<bool> delivered{false};  // exactly one pending-decrement per node
@@ -122,6 +125,7 @@ void ResolveOnLoop(v8::Isolate* isolate, PromiseState& state, const char* result
   v8::Local<v8::Promise::Resolver> resolver = state.resolver.Get(isolate);
   state.resolver.Reset();
   state.buf.Reset();
+  state.context.Reset();  // Globals must not die off-isolate (review F17)
   resolver
       ->Resolve(ctx, v8::String::NewFromUtf8(isolate, result).ToLocalChecked())
       .Check();
@@ -170,18 +174,19 @@ void WakeMux() {
 
 void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
   if (node->delivered.exchange(true)) return;  // one delivery per node, ever
-  Hub* hub = node->hub;
+  const std::shared_ptr<Hub> hub = node->hub;  // keeps the hub alive (F18)
   // Do NOT settle here — the resolve point (AsyncCallback or the teardown
   // hook) settles exactly once. Dropping out of the wait set happens via
-  // `cancelled`, which the mux snapshot prunes.
+  // `cancelled`, which the mux snapshot prunes. The closed-check and the
+  // send happen under the same lock: no send on a closing/closed handle.
   bool send = false;
   if (!node->state->settled.load()) {
     std::lock_guard<std::mutex> lk(hub->mu);
     if (!hub->closed) {
       hub->queue.emplace_back(node->state, result);
+      if (hub->pending > 0) hub->pending--;
       send = true;
     }
-    if (hub->pending > 0) hub->pending--;
   }
   node->cancelled = true;
   if (send) uv_async_send(&hub->async);
@@ -293,7 +298,7 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   }
 #endif
   if (node->onThread) {
-    Hub* hub = node->hub;
+    const std::shared_ptr<Hub> hub = node->hub;
     {
       std::lock_guard<std::mutex> lock(g_mu);
       g_threadWaits--;
@@ -304,9 +309,10 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
         }
       }
     }
-    // The loop may have been held open only for this thread's tail: re-run
-    // the idle check (an extra send with an empty queue is harmless).
-    if (hub != nullptr) uv_async_send(&hub->async);
+    if (hub != nullptr) {
+      std::lock_guard<std::mutex> lk(hub->mu);
+      if (!hub->closed) uv_async_send(&hub->async);  // empty-queue wake: harmless
+    }
   }
 }
 
@@ -366,8 +372,10 @@ void MuxMain() {
     } else if (r == -1 && errno == EAGAIN) {
       // Some word changed before we could park (or the control word moved).
       // Fulfil every data waiter whose word already differs: the store the
-      // waiter awaits has landed.
+      // waiter awaits has landed. Skip delivered/cancelled nodes — their
+      // buffer pin may already be gone, so their word may be unmapped (F32).
       for (size_t i = 0; i < snapshot.size(); i++) {
+        if (snapshot[i]->delivered.load() || snapshot[i]->cancelled) continue;
         if (*snapshot[i]->addr != static_cast<int32_t>(snapshot[i]->expected)) {
           Deliver(snapshot[i], Fulfill::kOk);
         }
@@ -548,7 +556,7 @@ bool StartAsyncWait(v8::Isolate* isolate, v8::Local<v8::Promise::Resolver> resol
   node->hasTimeout = hasTimeout;
   node->deadlineMs = hasTimeout ? NowMs() + timeoutMs : 0;
   node->state = state;
-  node->hub = hub.get();
+  node->hub = hub;
 
   EnsureMux();
   bool registered = false;
@@ -620,13 +628,27 @@ void CancelIsolateWaits(v8::Isolate* isolate) {
       ResolveOnLoop(isolate, *state, "timed-out");
     }
   }
-  if (Hub* hub = HubFor(isolate)) {
+  std::shared_ptr<Hub> hub;
+  {
+    std::lock_guard<std::mutex> lock(g_hubs_mu);
+    auto it = g_hubs.find(isolate);
+    if (it != g_hubs.end()) {
+      hub = it->second;
+      // Erase NOW (review F3): a later isolate at the same address must get a
+      // fresh hub, not this closed one whose loop is dying.
+      g_hubs.erase(it);
+    }
+  }
+  if (hub != nullptr) {
     std::lock_guard<std::mutex> lock(hub->mu);
     hub->closed = true;
     hub->pending = 0;
     // Close the handle so the isolate's loop can shut down cleanly (worker
     // .terminate() tears the loop down; an open handle aborts the process).
-    uv_close(reinterpret_cast<uv_handle_t*>(&hub->async), nullptr);
+    // selfKeepAlive holds the Hub until uv's close callback fires.
+    hub->selfKeepAlive = hub;
+    uv_close(reinterpret_cast<uv_handle_t*>(&hub->async),
+             [](uv_handle_t* h) { static_cast<Hub*>(h->data)->selfKeepAlive.reset(); });
   }
 }
 

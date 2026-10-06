@@ -42,6 +42,21 @@ per unlock in a system that HAD waiters, which we accept.
   consistent under races; the bit alone is sufficient once acquisition
   preserves it.
 
+## Amendment (2026-10-07, fix round 2)
+
+The waiter path must issue `or(lockWord, HAS_WAITERS)` on **every** loop pass,
+not only when the word it read lacked the bit. Skipping the OR when the first
+read already showed HAS_WAITERS left a race: a never-waited newcomer acquires
+with a bare token between the waiter's read and park, erasing the bit; the
+waiter then parks on `expected` without the bit, the newcomer's unlock sees no
+bit and does not notify, and the waiter sleeps a full slice. Re-verification
+measured 32 slice timeouts in 4 s under tight loops before the fix. The parked
+value is always `prev | HAS_WAITERS` (the OR's return word plus the bit), and
+acquisition after parking writes `token | HAS_WAITERS`. Also amended: unlock
+*does* clear the bit via its whole-word CAS to 0 — the consequence paragraph
+below originally claimed otherwise (harmless: the waiter re-ORs on its next
+pass, costing at most one extra wake).
+
 ## Consequences
 
 Handoffs after a wake no longer depend on the timeout slice (measured:

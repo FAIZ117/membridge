@@ -339,14 +339,16 @@ check so it is never evicted; and a stale token can never win a CAS again.
 ### 7.3 Protocol
 
 - **Lock:** CAS `0 → myToken` — a whole-word write, so a stale HAS_WAITERS bit a lost
-  race left behind is cleared. On failure: set `HAS_WAITERS`, **re-read the word and retry
-  immediately if it now reads free**, then `sync.wait(lockWord, observed)`; after the first
-  park, acquisition writes `myToken | HAS_WAITERS` — the bit is preserved because other
-  waiters may still be parked on the word the new owner will unlock (Drepper's mutex2; fix
-  round 2026-10-06, ADR 0005 — the bare-token acquire erased the bit and waiters slept
-  full slices on a free lock). Every wait has a bounded timeout (default 250 ms, clamped to
-  the caller's remaining timeout) after which the owner's liveness is checked.
-  **Why a timeout at all:** a dead owner never calls `notify`.
+  race left behind is cleared. On failure: `prev = or(lockWord, HAS_WAITERS)` **unconditionally
+  on every pass** (re-verification R13: skipping the OR when the first read had the bit set
+  left a window where a newcomer's bare-token acquire cleared it and a waiter parked on a
+  no-bit word — 250–500 ms stalls). If `prev` reads free, retry immediately; otherwise park
+  on `prev | HAS_WAITERS` (ADR 0005, amended: the parked value is always the OR result).
+  After the first park, acquisition writes `myToken | HAS_WAITERS` — the bit is preserved
+  because other waiters may still be parked on the word the new owner will unlock. Every
+  wait has a bounded timeout (default 250 ms, clamped to the caller's remaining timeout)
+  after which the owner's liveness is checked. **Why a timeout at all:** a dead owner never
+  calls `notify`.
 - **Steal:** owner token → slot → identity is dead (§7.1) and slot gen matches the token
   → CAS `deadToken → myToken`, set `ownerDied = 1`. Losing the CAS just means retry.
 - **No heartbeat.** **Why:** the owner cannot update a heartbeat while inside a synchronous

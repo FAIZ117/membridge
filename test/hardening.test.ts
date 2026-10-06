@@ -471,3 +471,76 @@ test('R4/R5 hostile geometry races: native view guards', () => {
   assert.throws(() => b.mutexClaimSlot('/membridge-test-x', short), (e: any) =>
     e.code === 'E_SIZE_INVALID');
 });
+
+test('R11/R12: claim-after-unlink teardown is clean; pins release on close/GC', () => {
+  const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+  // R12: 500 short-lived mutexes on unlinked segments must not pin 500
+  // mappings + fds for the isolate's lifetime. The fd check runs in a
+  // --expose-gc child so collection is deterministic.
+  const name = uniqueName();
+  const r = spawnSync(process.execPath, ['--expose-gc', '-e', `
+    const { readdirSync } = require('node:fs');
+    const { open, unlink } = require(process.env.MX_PKG);
+    const { Mutex } = require(process.env.MX_PKG.replace(/core\\.js$/, 'mutex.js'));
+    const before = readdirSync('/proc/self/fd').length;
+    for (let i = 0; i < 500; i++) {
+      const n = '/membridge-test-r12-' + process.pid + '-' + i;
+      const m = Mutex.open(n);
+      m.lock();
+      m.unlock();
+      m.close();
+      unlink(n);
+    }
+    global.gc(); global.gc();
+    const after = readdirSync('/proc/self/fd').length;
+    console.log('FDS ' + (after - before));
+  `], {
+    env: { ...process.env, MX_PKG: require.resolve('../src/core') },
+    encoding: 'utf8',
+  });
+  const delta = Number((r.stdout.match(/FDS (\d+)/) || [])[1] ?? 999);
+  assert.ok(delta < 50, `fd leak: ${delta} fds held after 500 closed mutexes (stderr: ${r.stderr.slice(0, 200)})`);
+});
+
+
+test('R11: claim-after-unlink worker terminate does not segfault teardown', async () => {
+// R11: claim a mutex, unlink the name, terminate a worker that holds it —
+  // teardown must NOT segfault (used to walk unmapped claimedData).
+  const n2 = uniqueName();
+  const { Worker } = await import('node:worker_threads');
+  const w = new Worker(
+    `const { workerData } = require('worker_threads');
+     const { Mutex } = require(workerData.pkg);
+     const m = Mutex.open(workerData.name);
+     m.lock();
+     require('node:worker_threads').parentPort?.postMessage('held');
+     setInterval(() => {}, 1 << 30);`,
+    { eval: true, workerData: { name: n2, pkg: require.resolve('../src/mutex') } },
+  );
+  await new Promise<void>((r) => w.on('message', () => r()));
+  unlink(n2);  // registry entry erased; pin from the SAB must keep it safe
+  const t = new Promise((r) => setTimeout(r, 100));
+  await t;
+  await w.terminate();
+  // survive one full turn: the old code segfaulted in the cleanup hook here
+  await new Promise((r) => setTimeout(r, 200));
+  unlinkQuietly(n2);
+});
+
+
+function countFds(): number {
+  return (require('node:fs') as typeof import('node:fs')).readdirSync('/proc/self/fd').length;
+}
+
+test('R20: NaN/Infinity timeouts are rejected, not infinite hangs', async () => {
+  const { Mutex } = await import('../src/mutex');
+  const name = uniqueName();
+  try {
+    const m = Mutex.open(name);
+    assert.throws(() => m.lock({ timeoutMs: NaN }), (e: any) => e.code === 'E_SIZE_INVALID');
+    assert.throws(() => m.lock({ timeoutMs: Infinity }), (e: any) => e.code === 'E_SIZE_INVALID');
+    assert.throws(() => m.lock({ timeoutMs: -5 }), (e: any) => e.code === 'E_SIZE_INVALID');
+  } finally {
+    unlinkQuietly(name);
+  }
+});

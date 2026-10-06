@@ -50,7 +50,9 @@ bool MutexOwnerAlive(int32_t* data, uint32_t token, uint32_t slotsWordOffset,
 // with the isolate's env-cleanup hook — zero native calls per lock/unlock.
 // Teardown releases anything still held (as OWNER_DIED + wake) and frees
 // this thread's participant slots in every claimed segment.
-void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot);
+void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
+                        v8::Local<v8::SharedArrayBuffer> sab);
+void MutexUnregisterClaim(v8::Isolate* isolate, int32_t* data, int slot);
 
 // Free this thread's slot(s) in `data` (graceful close; slots of dead threads
 // are reclaimed on demand anyway).

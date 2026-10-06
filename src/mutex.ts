@@ -39,6 +39,15 @@ const sliceOf = (deadline: number): number =>
 
 const sleepSliceMs = 250; // dead-owner detection cadence (§7.3)
 
+// R20: NaN/Infinity/negative timeouts used to slip through as an infinite
+// park with no liveness re-check.
+function checkTimeoutMs(timeoutMs: number | undefined, who: string): void {
+  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    throw new MembridgeError('E_SIZE_INVALID',
+      `${who}: timeoutMs must be a finite positive number (got ${timeoutMs})`);
+  }
+}
+
 export interface LockOptions {
   /** Total time to wait before E_TIMEOUT (<= 2^31 ms). Default: wait indefinitely. */
   timeoutMs?: number;
@@ -68,12 +77,23 @@ function selfIdentityWords(): { pid: number; tid: number; start: number; ns: num
   return { pid: id.pid, tid: id.threadId, start: id.startTime, ns: id.pidNsInode };
 }
 
+// R12: when a Mutex instance is collected, drop its native entry (and the
+// BackingStore pin that keeps an unlinked segment's pages + fd alive).
+const claimRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number }>((v) => {
+  try {
+    nativeOrThrow().mutexUnregisterClaim(v.data, v.slot);
+  } catch {
+    // isolate tearing down: the env hook covers the remainder
+  }
+});
+
 export class Mutex {
   private readonly name: string;
   private readonly view: Int32Array;
   private readonly b: ReturnType<typeof nativeOrThrow>;
   private claimed: Slot | null = null;
   private held = false;
+  private registered = false;
 
   private constructor(name: string, view: Int32Array) {
     this.name = name;
@@ -98,7 +118,24 @@ export class Mutex {
     if (this.claimed !== null) return this.claimed;
     const r = this.b.mutexClaimSlot(this.name, this.view);
     this.claimed = { slot: r.slot, gen: r.gen, token: r.token };
+    if (!this.registered) {
+      // R11/R12: pin the SAB's own BackingStore with the native entry, and
+      // unregister when this instance is collected (or closed).
+      this.b.mutexRegisterPin(this.name, this.view, r.slot, r.token,
+        this.view.buffer as SharedArrayBuffer);
+      claimRegistry.register(this, { data: this.view, slot: r.slot }, this);
+      this.registered = true;
+    }
     return this.claimed;
+  }
+
+  /** Release this instance's native claim (pin + teardown entry). Idempotent. */
+  close(): void {
+    if (this.claimed !== null && this.registered) {
+      claimRegistry.unregister(this);
+      this.b.mutexUnregisterClaim(this.view, this.claimed.slot);
+      this.registered = false;
+    }
   }
 
   private lockWord(): number {
@@ -111,6 +148,7 @@ export class Mutex {
 
   /** Acquire the lock, blocking. */
   lock(opts?: LockOptions): LockResult {
+    checkTimeoutMs(opts?.timeoutMs, 'lock');
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
     let waited = false;  // once we have parked, acquire PRESERVES HAS_WAITERS
@@ -152,21 +190,21 @@ export class Mutex {
         }
         continue; // lost the race: retry
       }
-      // Alive holder: announce ourselves, then RE-READ — if the word went
-      // free between our OR and the read, retry immediately instead of
-      // sleeping on a free lock for a full slice (review F10).
-      if (!(lw & HAS_WAITERS)) {
-        Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
-      }
-      const expected = this.lockWord();
-      if ((expected & TOKEN_MASK) === 0) {
+      // Alive holder: ALWAYS OR the bit in (review R13: skipping the OR when
+      // the first read had it set left a window where a newcomer's bare-token
+      // acquire cleared it and we parked on a no-bit word — 250-500 ms
+      // stalls). The OR returns the pre-OR word: if it was free, retry
+      // immediately; otherwise park on prev|HAS_WAITERS, exactly what the
+      // word holds now.
+      const prev = Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
+      if ((prev & TOKEN_MASK) === 0) {
         waited = true;
         continue;
       }
       if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
         throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
-      this.b.syncWait(this.view, LOCK_WORD, expected, sliceOf(deadline));
+      this.b.syncWait(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
       waited = true;
     }
   }
@@ -195,6 +233,7 @@ export class Mutex {
    * never the libuv pool. Aborts with the signal between wait slices. */
   async lockAsync(opts?: LockOptions & { signal?: AbortSignal }): Promise<LockResult> {
     const signal = opts?.signal;
+    checkTimeoutMs(opts?.timeoutMs, 'lockAsync');
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
     let waited = false;
@@ -224,11 +263,8 @@ export class Mutex {
         }
         continue;
       }
-      if (!(lw & HAS_WAITERS)) {
-        Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
-      }
-      const expected = this.lockWord();
-      if ((expected & TOKEN_MASK) === 0) {
+      const prev = Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
+      if ((prev & TOKEN_MASK) === 0) {
         waited = true;
         continue;
       }
@@ -236,7 +272,7 @@ export class Mutex {
       if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
         throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
-      const waitP = waitAsync(this.view, LOCK_WORD, expected, sliceOf(deadline));
+      const waitP = waitAsync(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
       const abortP =
         signal !== undefined
           ? new Promise<never>((_, rej) => {

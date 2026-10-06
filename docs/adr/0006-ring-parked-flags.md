@@ -26,6 +26,18 @@ wait usually rides the futex_waitv multiplexer.
 - **Exact waiter counts:** more state to crash-recover; a boolean is enough
   because extra wakes are already allowed (spurious-wake model, §6).
 
+## Amendment (2026-10-07, fix round 2)
+
+The flags are set/cleared by the **synchronous** `reserve`/`commit`/`peek`/
+`release` paths only. The async variants (`reserveAsync`/`peekAsync`) initially
+waited without touching the flags, so their peers never notified them and every
+async wake cost a full wait slice (review R14: async consumer 383 msgs/s with
+37% of messages over 200 ms). The async paths now poll-then-`waitAsync` on the
+peer's counter with the same set/re-check/clear pattern as the sync paths.
+Also: a crashed waiter leaves its flag set — a busy successor that never parks
+then pays one futile wake per message until it parks once; role claims reset
+the peer's flags at takeover so the stale flag clears on handover.
+
 ## Consequences
 
 A waiter that crashes between set and clear leaves the flag set — the other

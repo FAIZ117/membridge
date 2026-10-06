@@ -4,9 +4,10 @@
 
 import { test } from 'node:test';
 import fs from 'node:fs';
-import { fork } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { open, unlink } from '../src/core';
 import { RingProducer, RingConsumer } from '../src/ringbuffer';
+import { Mutex, MUTEX_DATA_BYTES } from '../src/mutex';
 import { assert, uniqueName, unlinkQuietly, buildHeader, shmPath } from './helpers';
 
 const POSIX = process.platform === 'linux' || process.platform === 'darwin';
@@ -559,6 +560,46 @@ test('R14: peekAsync wakes in milliseconds when the producer commits', async () 
     const ms = performance.now() - t0;
     assert.strictEqual(Buffer.from(msg!).toString(), 'async wake');
     assert.ok(ms < 150, `async wake took ${ms.toFixed(1)} ms (slice-bound = flagless wait)`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+// F23: a slot stuck mid-publish (state Free with a non-zero pid — the pid is
+// the publish-claim marker) is recovered when that pid is provably dead.
+// Before fix round 3 the equivalent crash state leaked the slot permanently.
+test('F23: slots stuck mid-publish with a dead pid are recovered', { skip: POSIX ? false : SKIP }, async (t: any) => {
+  const name = uniqueName();
+  try {
+    // a provably dead identity (SIGKILLed and reaped; startTime pinned)
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    const deadPid = child.pid ?? -1;
+    child.kill('SIGKILL');
+    await new Promise<void>((resolve) => child.on('exit', resolve));
+
+    const totalBytes = 4096 + MUTEX_DATA_BYTES;
+    craft(name, {
+      initState: 2,
+      headerBytes: 4096,
+      dataBytes: MUTEX_DATA_BYTES,
+      flags: 0x100, // kKindMutex
+    }, totalBytes);
+    // Fill all 64 participant slots as "reserving, reserver died": state Free,
+    // non-zero dead pid, non-zero gen.
+    const path = shmPath(name)!;
+    const buf = fs.readFileSync(path);
+    for (let s = 0; s < 64; s++) {
+      const off = 4096 + s * 32;
+      buf.writeInt32LE(deadPid, off + 0); // pid: mid-publish marker (review F23)
+      buf.writeInt32LE(1, off + 24);      // gen
+      buf.writeInt32LE(0, off + 28);      // state: Free
+    }
+    fs.writeFileSync(path, buf);
+    // The claimer must recover a slot instead of E_TIMEOUT.
+    const m = Mutex.open(name);
+    m.lock();
+    m.unlock();
+    m.close();
   } finally {
     unlinkQuietly(name);
   }

@@ -23,9 +23,13 @@ constexpr uint32_t kMutexSlotWords = 8;    // identity 6 words + gen + state
 constexpr uint32_t kMutexDataBytes =
     (kMutexHeaderWords + kMutexSlotCount * kMutexSlotWords) * 4;  // 2064
 
+// Slot states (review F23): there is no RESERVED state. A slot mid-publish
+// reads state Free with a NON-ZERO pid word — the pid doubles as the publish-
+// claim marker (a virgin slot reads pid 0), and it is recoverable exactly when
+// that pid is provably dead. Release zeroes the pid BEFORE the state CAS, so
+// the invariant is: state Free ⇒ pid 0 (virgin) or pid = crashed reserver.
 constexpr uint32_t kMutexStateFree = 0;
 constexpr uint32_t kMutexStateActive = 1;
-constexpr uint32_t kMutexStateReserved = 2;
 
 // token = (slotIndex << 16) | gen15; bit 31 = HAS_WAITERS
 constexpr uint32_t kMutexHasWaiters = 0x80000000u;
@@ -69,10 +73,15 @@ constexpr uint32_t kRingProducerWord = 32;     // byte 128
 constexpr uint32_t kRingConsumerWord = 33;     // byte 132
 
 uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* data,
-                       uint32_t roleWord, uint32_t slotIndex);
+                       uint32_t roleWord, uint32_t slotIndex, bool isProducer);
 
 void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
                     uint32_t roleWordOffset);
+
+// Collected RingConsumer (FinalizationRegistry / close(), review R15b):
+// clear the role word if it still holds the instance's token and free the
+// role's slot, so a replacement consumer can open without a thread exit.
+void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot);
 
 }  // namespace membridge
 

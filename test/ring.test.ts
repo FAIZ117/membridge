@@ -8,7 +8,7 @@ import { fork } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { RingProducer, RingConsumer, RING_HEADER_BYTES } from '../src/ringbuffer';
 import { open } from '../src/core';
-import { assert, uniqueName, unlinkQuietly } from './helpers';
+import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core');
 const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
@@ -279,6 +279,14 @@ function registerTests(): void {
         'same-thread re-claim works');
       p1.write(Buffer.from('x'));
       assert.strictEqual(Buffer.from(c1.read({ timeoutMs: 1000 })!).toString(), 'x');
+      // R15b: a SECOND consumer instance on this thread is refused — two live
+      // consumers could both peek the same message and double-process it.
+      assertThrowsCode(() => RingConsumer.open(name), 'E_ROLE_TAKEN');
+      // close() releases the role, so a replacement can open immediately
+      c1.close();
+      const c2 = RingConsumer.open(name);
+      assert.strictEqual(c2.read({ timeoutMs: 200 }), null, 'role re-claimed after close');
+      c2.close();
       // role takeover after death is covered by the mid-reserve/mid-peek tests
     } finally {
       unlinkQuietly(name);

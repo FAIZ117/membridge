@@ -43,3 +43,19 @@ instant. A dead holder in a foreign pid namespace is treated as alive forever
 (safe; recovery needs a process in the owner's namespace or reap). Up to 64
 concurrent participant threads per mutex; exhausted tables surface as
 E_TIMEOUT after reclamation finds nothing dead.
+
+## Amendment (2026-10-07, fix round 3)
+
+The slot state machine drops its RESERVED state (review F23). The claimer's
+**pid word doubles as the publish-claim marker**: a virgin slot reads pid 0, a
+slot mid-publish reads the reserver's pid while the state word is still Free,
+and release zeroes the pid before the Free CAS — so `Free ⇒ pid 0 or a crashed
+reserver`. A mid-publish slot whose pid is provably dead is recovered by CASing
+the pid to the claimer's; previously a crash inside the publish window leaked
+the slot forever (the claim loop only skipped it). Exclusivity of the publish
+right moved entirely to a single-attempt gen CAS: the old RESERVED state-CAS
+was doing that job, and a retrying gen bump would have let two racers publish
+two tokens for one slot. A recycled pid reads alive, leaving one slot unusable
+until process exit — the same accepted liveness-at-read-time risk the Active
+reclaim carries. Ring roles share the machine, and a collected consumer
+releases its role (R15b) so a replacement can open on the same thread.

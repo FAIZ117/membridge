@@ -325,16 +325,32 @@ steal could not be atomic. The token points at a participant slot whose identity
 written **before** the CAS, so a holder that crashes between "acquire" and "record owner"
 cannot exist.
 
-**Slot reclamation:** the env-cleanup hook (§7.1) frees a thread's slot on graceful
-exit, but a SIGKILLed process's slot would linger and exhaust the 64-slot table
-under churn. A thread that finds no free slot scans for one whose identity fails
-the §7.1 liveness check **and whose token is not the current `lockWord` value** —
-a dead *holder's* slot is freed by the steal path first (the contender steals the
-lock into its own already-claimed slot, after which the dead slot is unreferenced)
+**Slot reclamation (fix round 3, R23→F23):** the env-cleanup hook (§7.1) frees a
+thread's slot on graceful exit, but a SIGKILLed process's slot would linger and
+exhaust the 64-slot table under churn. A thread that finds no free slot scans for
+one whose identity fails the §7.1 liveness check **and whose token is not the current
+`lockWord` value** — a dead *holder's* slot is freed by the steal path first (the
+contender steals the lock into its own already-claimed slot, after which the dead slot is unreferenced)
 — and claims it with a single CAS on `slot.gen`, bumping gen. **Why CAS on gen:**
 bumping gen instantly invalidates every outstanding token pointing there (the same
 mechanism that makes stealing safe); a live owner's slot always passes the liveness
 check so it is never evicted; and a stale token can never win a CAS again.
+
+**Slot states (fix round 3, F23).** A slot has exactly two states: `Active`
+(published) and `Free` (state word 0). There is no RESERVED state — the claimer's
+**pid word doubles as the publish-claim marker**: a virgin slot reads pid 0, a slot
+mid-publish reads the reserver's pid with state still Free, and release zeroes the
+pid BEFORE the Free CAS, so the invariant is `Free ⇒ pid 0 (virgin) or pid =
+crashed reserver`. A mid-publish slot whose pid is provably dead (pid-only check:
+ESRCH or zombie — no startTime comparison, the start words may still belong to the
+previous owner) is recovered by CASing the pid to the claimer's. A recycled pid
+reads alive, leaving that one slot unusable until process exit — accepted (the
+same liveness-at-read-time risk the Active reclaim carries). A pid-CAS-won claim
+and a gen-CAS-won reclaim each hold an exclusive publish right; the publish's gen
+bump is attempted exactly once and a loser rescans, so two racers can never both
+publish (that would mint two tokens for one slot). Ring roles (§8) share this
+machine; a consumer additionally releases its role when the JS instance is
+collected or `close()`d (R15b) so a replacement can open without a thread exit.
 
 ### 7.3 Protocol
 

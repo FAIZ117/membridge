@@ -69,23 +69,25 @@ bool CasSlotState(int32_t* data, uint32_t slotsBase, uint32_t slot, uint32_t exp
 void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
                     uint32_t roleWordOffset);
 
-// Publish `self` into slot `s` under an already-won RESERVATION and return
-// the token. Gen bumps skip values that would make the token 0 (slot 0, gen
-// 0): token 0 IS the free word — a claim producing it would break mutual
+// Publish `self` into slot `s` and return the token. The gen CAS here is the
+// EXCLUSIVE publish right (review F23: with the old RESERVED state gone, this
+// is the only serialization between reclaim racers) — it is attempted ONCE:
+// on failure the caller rescans, never retries blindly, because a retry would
+// overwrite the identity a winning racer just published (two owners on one
+// slot). Gen bumps skip values that would make the token 0 (slot 0, gen 0):
+// token 0 IS the free word — a claim producing it would break mutual
 // exclusion (review F12).
 namespace {
-uint32_t PublishClaimedSlot(int32_t* data, uint32_t slotsBase, uint32_t s,
-                            const Identity& self) {
+bool PublishClaimedSlot(int32_t* data, uint32_t slotsBase, uint32_t s,
+                        const Identity& self, uint32_t* outToken) {
   uint32_t g = SlotGen(data, slotsBase, s);
   int32_t gExpected = static_cast<int32_t>(g);
   uint32_t next = g + 1;
   if (s == 0 && (next & kMutexGenMask) == 0) next++;  // never token 0
-  while (!AtomicWord(SlotPtr(data, slotsBase, s, kSlotGen))
-              ->compare_exchange_strong(gExpected, static_cast<int32_t>(next),
-                                        std::memory_order_acq_rel)) {
-    g = static_cast<uint32_t>(gExpected);
-    next = g + 1;
-    if (s == 0 && (next & kMutexGenMask) == 0) next++;
+  if (!AtomicWord(SlotPtr(data, slotsBase, s, kSlotGen))
+           ->compare_exchange_strong(gExpected, static_cast<int32_t>(next),
+                                     std::memory_order_acq_rel)) {
+    return false;
   }
   int32_t* idw = SlotPtr(data, slotsBase, s, 0);
   AtomicWord(idw + kSlotPid)->store(self.pid, std::memory_order_release);
@@ -100,7 +102,8 @@ uint32_t PublishClaimedSlot(int32_t* data, uint32_t slotsBase, uint32_t s,
       ->store(static_cast<int32_t>(static_cast<uint64_t>(self.pidNsInode) >> 32));
   AtomicWord(SlotPtr(data, slotsBase, s, kSlotState))
       ->store(static_cast<int32_t>(kMutexStateActive), std::memory_order_release);
-  return (s << 16) | (next & kMutexGenMask);
+  *outToken = (s << 16) | (next & kMutexGenMask);
+  return true;
 }
 }  // namespace
 
@@ -124,20 +127,45 @@ uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& 
         SlotIdentity(data, slotsBase, s).startTime == self.startTime) {
       uint32_t token = (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
       if (token == 0) {
-        if (!CasSlotState(data, slotsBase, s, kMutexStateActive, kMutexStateReserved)) continue;
-        token = PublishClaimedSlot(data, slotsBase, s, self);  // bumps off 0
+        if (!PublishClaimedSlot(data, slotsBase, s, self, &token)) continue;  // bumps off 0
       }
       MutexRegisterClaim(isolate, data, token, static_cast<int>(s),
                          v8::Local<v8::SharedArrayBuffer>());
       return token;
     }
   }
+  // Free/reserving slots (review F23): the slot's PID word doubles as the
+  // publish-claim marker. A virgin slot has pid 0 — win the publish right by
+  // CASing our pid in (state stays Free until the identity is fully published
+  // and the slot flips to Active). A slot with a pid is mid-publish by that
+  // thread: recoverable exactly when that pid is provably dead (no startTime
+  // comparison — the start words may still belong to the previous owner).
+  // Free slots normally have pid 0 (release zeroes it), so the common path
+  // still performs no liveness syscalls (review P8).
   for (uint32_t s = 0; s < kMutexSlotCount; s++) {
     if (SlotState(data, slotsBase, s) != kMutexStateFree) continue;
-    if (!CasSlotState(data, slotsBase, s, kMutexStateFree, kMutexStateReserved)) continue;
-    const uint32_t token = PublishClaimedSlot(data, slotsBase, s, self);
+    auto* pidWord = AtomicWord(SlotPtr(data, slotsBase, s, kSlotPid));
+    const int32_t pidNow = pidWord->load(std::memory_order_acquire);
+    int32_t expectedPid = pidNow;
+    if (pidNow == 0) {
+      if (!pidWord->compare_exchange_strong(expectedPid, static_cast<int32_t>(self.pid),
+                                            std::memory_order_acq_rel)) {
+        continue;  // raced another claimer: retry
+      }
+    } else if (pidNow == static_cast<int32_t>(self.pid)) {
+      // our own crashed mid-publish slot: reuse the right we already hold
+    } else if (CheckPidAlive(pidNow) == Liveness::kDead) {
+      if (!pidWord->compare_exchange_strong(expectedPid, static_cast<int32_t>(self.pid),
+                                            std::memory_order_acq_rel)) {
+        continue;
+      }
+    } else {
+      continue;  // a live thread holds the publish right
+    }
+    uint32_t token = 0;
+    if (!PublishClaimedSlot(data, slotsBase, s, self, &token)) continue;
     MutexRegisterClaim(isolate, data, token, static_cast<int>(s),
-                         v8::Local<v8::SharedArrayBuffer>());
+                       v8::Local<v8::SharedArrayBuffer>());
     return token;
   }
 
@@ -146,7 +174,9 @@ uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& 
   // the GEN word, not the state word: only the reclaimer bumps a dead slot's
   // gen, so winning it proves no concurrent claim intervened (the state-CAS
   // version was ABA-prone: R scans a dead slot, Q reclaims and publishes it,
-  // R's stale state-CAS still succeeds and overwrites Q's identity).
+  // R's stale state-CAS still succeeds and overwrites Q's identity). The
+  // identity rewrite happens in place under the gen-CAS — the state stays
+  // Active throughout (review F23: there is no RESERVED state anymore).
   for (uint32_t s = 0; s < kMutexSlotCount; s++) {
     if (SlotState(data, slotsBase, s) != kMutexStateActive) continue;
     uint32_t staleToken = (s << 16) | (SlotGen(data, slotsBase, s) & kMutexGenMask);
@@ -154,8 +184,8 @@ uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& 
         AtomicWord(data)->load(std::memory_order_acquire)) & kMutexTokenMask;
     if (staleToken == currentLock) continue;
     if (CheckLiveness(SlotIdentity(data, slotsBase, s)) != Liveness::kDead) continue;
-    if (!CasSlotState(data, slotsBase, s, kMutexStateActive, kMutexStateReserved)) continue;
-    const uint32_t token = PublishClaimedSlot(data, slotsBase, s, self);
+    uint32_t token = 0;
+    if (!PublishClaimedSlot(data, slotsBase, s, self, &token)) continue;
     MutexRegisterClaim(isolate, data, token, static_cast<int>(s), v8::Local<v8::SharedArrayBuffer>());
     return token;
   }
@@ -171,13 +201,12 @@ bool MutexOwnerAlive(int32_t* data, uint32_t token, uint32_t slotsWordOffset,
   const uint32_t slot = (token & kMutexTokenMask) >> 16;
   const uint32_t gen = token & kMutexGenMask;
   if (slot >= slotCount) return true;   // malformed: never steal
-  const uint32_t state = SlotState(data, slotsWordOffset, slot);
-  if (state == kMutexStateReserved) return true;  // mid-claim: never steal
   // Review F13: a gen mismatch means the slot was RECLAIMED after this token
   // was issued — its holder died (reclaim only takes dead identities) and no
   // live thread can ever present this token again. Treat it as dead so the
   // word does not wedge forever; the steal CAS still has to win.
   if ((SlotGen(data, slotsWordOffset, slot) & kMutexGenMask) != gen) return false;
+  const uint32_t state = SlotState(data, slotsWordOffset, slot);
   if (state != kMutexStateActive) return true;
   const Liveness l = CheckLiveness(SlotIdentity(data, slotsWordOffset, slot));
   return l != Liveness::kDead;  // unknown liveness -> alive (never steal, §7.1)
@@ -258,6 +287,9 @@ void MutexReleaseThreadSlots(int32_t* data) {
     if (SlotState(data, slotsBase, s) == kMutexStateActive &&
         SlotIdentity(data, slotsBase, s).pid == self.pid &&
         SlotIdentity(data, slotsBase, s).threadId == self.threadId) {
+      // Zero the pid BEFORE freeing (review F23): a Free slot must read
+      // pid 0 so claimers can tell virgin slots from crashed mid-publish ones.
+      AtomicWord(SlotPtr(data, slotsBase, s, kSlotPid))->store(0, std::memory_order_release);
       CasSlotState(data, slotsBase, s, kMutexStateActive, kMutexStateFree);
     }
   }
@@ -280,6 +312,9 @@ void ReleaseHeldLock(const HeldLock& h) {
   }
   AtomicWord(h.data + 1)->store(1, std::memory_order_release);  // ownerDied
   SyncWake(h.data, 1);
+  // Zero the pid BEFORE freeing (review F23 invariant: Free ⇒ pid 0).
+  AtomicWord(SlotPtr(h.data, kMutexHeaderWords, static_cast<uint32_t>(h.slot), kSlotPid))
+      ->store(0, std::memory_order_release);
   CasSlotState(h.data, kMutexHeaderWords, static_cast<uint32_t>(h.slot), kMutexStateActive,
                kMutexStateFree);
 }
@@ -309,6 +344,9 @@ void MutexCleanupIsolate(v8::Isolate* isolate) {
       if (static_cast<uint32_t>(cur) == h.token) {
         roleWord->compare_exchange_strong(cur, 0, std::memory_order_acq_rel);
       }
+      // Zero the pid BEFORE freeing (review F23 invariant: Free ⇒ pid 0).
+      AtomicWord(SlotPtr(h.data, kRingSlotsWordOffset, static_cast<uint32_t>(h.slot), kSlotPid))
+          ->store(0, std::memory_order_release);
       CasSlotState(h.data, kRingSlotsWordOffset, static_cast<uint32_t>(h.slot),
                    kMutexStateActive, kMutexStateFree);
     } else {
@@ -371,13 +409,56 @@ void MutexUnregisterClaim(v8::Isolate* isolate, int32_t* data, int slot) {
   }
 }
 
+// JS RingConsumer collected (FinalizationRegistry / close()) — review R15b:
+// release the role so a replacement consumer can open on this thread without
+// waiting for the thread to exit. The role word is cleared only if it still
+// holds our token; the slot is freed with the Free⇒pid-0 invariant. Only the
+// consumer registers for GC release (a collected producer's role must stay
+// held: a replacement producer joining while a live sibling still writes
+// would break SPSC — the producer role releases at thread teardown).
+void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot) {
+  HeldLock dropped;
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lock(g_held_mu);
+    auto it = g_held.find(isolate);
+    if (it == g_held.end()) return;
+    auto& locks = it->second.locks;
+    for (auto vit = locks.begin(); vit != locks.end(); ++vit) {
+      if (vit->data == data && vit->slot == slot && vit->isRole) {
+        dropped = *vit;
+        found = true;
+        locks.erase(vit);
+        break;
+      }
+    }
+  }
+  if (!found) return;
+  if (dropped.bsPin == nullptr && dropped.pin == nullptr) return;  // R11: unmapped
+  auto* roleWord = AtomicWord(dropped.data + dropped.roleWordOffset);
+  int32_t cur = roleWord->load(std::memory_order_acquire);
+  if (static_cast<uint32_t>(cur) == dropped.token) {
+    roleWord->compare_exchange_strong(cur, 0, std::memory_order_acq_rel);
+  }
+  AtomicWord(SlotPtr(dropped.data, kRingSlotsWordOffset, static_cast<uint32_t>(dropped.slot),
+                     kSlotPid))
+      ->store(0, std::memory_order_release);
+  CasSlotState(dropped.data, kRingSlotsWordOffset, static_cast<uint32_t>(dropped.slot),
+               kMutexStateActive, kMutexStateFree);
+}
+
 // ---- §8 ring role claims ----------------------------------------------------
 
 namespace {
 
 // A role claim is a restricted slot claim: the role owns exactly one slot.
+// `isProducer` gates the same-thread re-claim (review R15b): two live producer
+// handles on one thread are harmless (the data path is per-thread), but two
+// live CONSUMER instances could both peek the same message and double-process
+// it, so a same-thread consumer re-claim is E_ROLE_TAKEN.
 uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* data,
-                       uint32_t slotsBase, uint32_t roleWordOffset, uint32_t slotIndex) {
+                       uint32_t slotsBase, uint32_t roleWordOffset, uint32_t slotIndex,
+                       bool isProducer) {
   const Identity self = SelfIdentity();
   if (self.startTime < 0) {
     // Refuse to claim with an unrecordable identity (review R19, matching the
@@ -388,8 +469,8 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
                name);
   }
   auto* roleWord = AtomicWord(data + roleWordOffset);
-  // Review F23: bound the scan — a slot stuck RESERVED by a crashed claimer
-  // used to spin this loop at 100% CPU with the JS thread blocked forever.
+  // Bound the scan (review F23): a stuck slot must fail with E_TIMEOUT, never
+  // spin this loop at 100% CPU with the JS thread blocked.
   for (int guard = 0; guard < 10000; guard++) {
     const uint32_t cur = static_cast<uint32_t>(roleWord->load(std::memory_order_acquire));
     if (cur != 0) {
@@ -401,7 +482,10 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
         const Identity id = SlotIdentity(data, slotsBase, slotIndex);
         if (id.pid == self.pid && id.threadId == self.threadId &&
             id.startTime == self.startTime) {
-          return cur;
+          if (isProducer) return cur;
+          ThrowError(isolate, "E_ROLE_TAKEN",
+                     "ring consumer already open on this thread (two live consumer "
+                     "instances could double-process a message)", name);
         }
       }
       // A holder exists: live -> E_ROLE_TAKEN; dead -> clear and take over.
@@ -415,10 +499,10 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
       }
     }
 
-    // Claim our slot: reuse this thread's live slot, else the role slot is
-    // free (never used or freed) or its last owner is dead -> reclaim.
+    // Claim our slot: reuse this thread's live slot, take a free one (the pid
+    // word is the publish-claim marker, review F23), or take over a dead
+    // holder's slot.
     const uint32_t st = SlotState(data, slotsBase, slotIndex);
-    bool usable = false;
     if (st == kMutexStateActive) {
       const Identity id = SlotIdentity(data, slotsBase, slotIndex);
       if (id.pid == self.pid && id.threadId == self.threadId &&
@@ -433,27 +517,60 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
         }
         continue;
       }
-      usable = CheckLiveness(id) == Liveness::kDead;
-    } else if (st == kMutexStateFree) {
-      usable = true;
+      if (CheckLiveness(id) != Liveness::kDead) continue;
+      // Dead Active role holder: rewrite the identity in place. PublishClaimedSlot
+      // wins the gen CAS exactly once, so takeover racers cannot double-write;
+      // a loser of the role-word CAS below recovers on its next scan (the slot
+      // now reads as OUR active slot and re-claims through the mine-branch).
+      uint32_t token = 0;
+      if (!PublishClaimedSlot(data, slotsBase, slotIndex, self, &token)) continue;
+      int32_t expected3 = static_cast<int32_t>(cur);
+      if (roleWord->compare_exchange_strong(expected3, static_cast<int32_t>(token),
+                                            std::memory_order_acq_rel)) {
+        MutexTrackRole(isolate, data, token, static_cast<int>(slotIndex), roleWordOffset);
+        return token;
+      }
+      continue;  // role word raced: next scan re-claims through the mine-branch
     }
-    if (!usable || !CasSlotState(data, slotsBase, slotIndex, st, kMutexStateReserved)) {
-      continue;  // raced: retry the whole claim
+    if (st == kMutexStateFree) {
+      auto* pidWord = AtomicWord(SlotPtr(data, slotsBase, slotIndex, kSlotPid));
+      const int32_t pidNow = pidWord->load(std::memory_order_acquire);
+      int32_t expectedPid = pidNow;
+      if (pidNow == 0) {
+        if (!pidWord->compare_exchange_strong(expectedPid, static_cast<int32_t>(self.pid),
+                                              std::memory_order_acq_rel)) {
+          continue;
+        }
+      } else if (pidNow != static_cast<int32_t>(self.pid)) {
+        // mid-publish by a dead claimer: recover it (review F23)
+        if (CheckPidAlive(pidNow) != Liveness::kDead) continue;
+        if (!pidWord->compare_exchange_strong(expectedPid, static_cast<int32_t>(self.pid),
+                                              std::memory_order_acq_rel)) {
+          continue;
+        }
+      }
+      // PublishClaimedSlot bumps gen skipping token-0 values (review F12: the
+      // ring's role words used to hit token 0 = "free" every 32768th claim).
+      uint32_t token = 0;
+      if (!PublishClaimedSlot(data, slotsBase, slotIndex, self, &token)) {
+        // lost the gen race: give the publish right back and rescan
+        pidWord->store(0, std::memory_order_release);
+        continue;
+      }
+      int32_t expected3 = static_cast<int32_t>(cur);
+      if (roleWord->compare_exchange_strong(expected3, static_cast<int32_t>(token),
+                                            std::memory_order_acq_rel)) {
+        // the role dies with the isolate: track for the §7.1 env-cleanup hook
+        MutexTrackRole(isolate, data, token, static_cast<int>(slotIndex), roleWordOffset);
+        return token;
+      }
+      // Lost the role CAS (raced takeover): drop our slot claim and retry.
+      pidWord->store(0, std::memory_order_release);
+      CasSlotState(data, slotsBase, slotIndex, kMutexStateActive, kMutexStateFree);
+      continue;
     }
-    // PublishClaimedSlot bumps gen skipping token-0 values (review F12: the
-    // ring's role words used to hit token 0 = "free" every 32768th claim).
-    const uint32_t token = PublishClaimedSlot(data, slotsBase, slotIndex, self);
-    int32_t expected3 = static_cast<int32_t>(cur);
-    if (roleWord->compare_exchange_strong(expected3, static_cast<int32_t>(token),
-                                          std::memory_order_acq_rel)) {
-      // the role dies with the isolate: track for the §7.1 env-cleanup hook
-      MutexTrackRole(isolate, data, token, static_cast<int>(slotIndex), roleWordOffset);
-      return token;
-    }
-    // Lost the role CAS (raced takeover): drop our slot claim and retry.
-    CasSlotState(data, slotsBase, slotIndex, kMutexStateActive, kMutexStateFree);
   }
-  ThrowError(isolate, "E_TIMEOUT", "ring role claim made no progress (slot stuck RESERVED?)",
+  ThrowError(isolate, "E_TIMEOUT", "ring role claim made no progress (slot stuck?)",
              name);
 }
 
@@ -475,8 +592,9 @@ void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slo
 }
 
 uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* data,
-                       uint32_t roleWord, uint32_t slotIndex) {
-  return ClaimRoleSlot(isolate, name, data, kRingSlotsWordOffset, roleWord, slotIndex);
+                       uint32_t roleWord, uint32_t slotIndex, bool isProducer) {
+  return ClaimRoleSlot(isolate, name, data, kRingSlotsWordOffset, roleWord, slotIndex,
+                       isProducer);
 }
 
 }  // namespace membridge

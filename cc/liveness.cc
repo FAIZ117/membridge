@@ -160,6 +160,19 @@ Liveness CheckLiveness(const Identity& id) {
   return Liveness::kAlive;
 }
 
+
+Liveness CheckPidAlive(int32_t pid) {
+  // Pid-only judgment (review F23): no startTime comparison — a slot
+  // mid-publish carries the previous owner's start words.
+  if (pid <= 0) return Liveness::kUnknown;
+  if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
+  int64_t start = -1;
+  char state = '?';
+  if (!ReadProcStat(pid, &start, &state)) return Liveness::kUnknown;
+  if (state == 'Z' || state == 'X') return Liveness::kDead;
+  return Liveness::kAlive;
+}
+
 #elif defined(__APPLE__)
 
 Identity SelfIdentity() {
@@ -188,6 +201,13 @@ Liveness CheckLiveness(const Identity& id) {
     return Liveness::kAlive;
   }
   return Liveness::kDead;
+}
+
+
+Liveness CheckPidAlive(int32_t pid) {
+  if (pid <= 0) return Liveness::kUnknown;
+  if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
+  return Liveness::kAlive;
 }
 
 #elif defined(_WIN32)
@@ -230,6 +250,20 @@ Liveness CheckLiveness(const Identity& id) {
   return Liveness::kAlive;
 }
 
+
+Liveness CheckPidAlive(int32_t pid) {
+  if (pid <= 0) return Liveness::kUnknown;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+  if (h == nullptr) {
+    return GetLastError() == ERROR_ACCESS_DENIED ? Liveness::kUnknown : Liveness::kDead;
+  }
+  DWORD exitCode = 0;
+  BOOL ok = GetExitCodeProcess(h, &exitCode);
+  CloseHandle(h);
+  if (!ok) return Liveness::kUnknown;
+  return exitCode != STILL_ACTIVE ? Liveness::kDead : Liveness::kAlive;
+}
+
 #else
 
 Identity SelfIdentity() {
@@ -237,6 +271,11 @@ Identity SelfIdentity() {
 }
 
 Liveness CheckLiveness(const Identity&) {
+  return Liveness::kUnknown;
+}
+
+
+Liveness CheckPidAlive(int32_t) {
   return Liveness::kUnknown;
 }
 

@@ -854,6 +854,22 @@ void MutexUnregisterClaimJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Undefined(isolate));
 }
 
+// mutexUnregisterRole(view, slot) — collected RingConsumer (review R15b):
+// clear the role word + free the role slot so a replacement can open.
+void MutexUnregisterRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 2) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "mutexUnregisterRole(view, slot)")));
+    return;
+  }
+  int32_t* data = DataAddrOf(isolate, args[0], 256);  // ring header words
+  MutexUnregisterRole(isolate, data, args[1]->Int32Value(ctx).ToChecked());
+  args.GetReturnValue().Set(v8::Undefined(isolate));
+}
+
 // mutexAttachPin(view, slot, sab) — re-register the pin on a live Mutex whose
 // SAB we now hold (used after claim when the JS layer has the instance).
 // ringClaimRole(name, view, isProducer) -> token
@@ -870,7 +886,8 @@ void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   int32_t* data = DataAddrOf(isolate, args[1], 256);  // ring header words
   const uint32_t token = RingClaimRole(
       isolate, std::string(*nameArg, nameArg.length()), data,
-      isProducer ? kRingProducerWord : kRingConsumerWord, isProducer ? 0 : 1);
+      isProducer ? kRingProducerWord : kRingConsumerWord, isProducer ? 0 : 1,
+      isProducer);
   args.GetReturnValue().Set(v8::Number::New(isolate, token));
 }
 
@@ -922,6 +939,7 @@ MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
 MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
 MEMBRIDGE_TRAMPOLINE(MutexRegisterPinJs2, MutexRegisterPinJs)
 MEMBRIDGE_TRAMPOLINE(MutexUnregisterClaimJs2, MutexUnregisterClaimJs)
+MEMBRIDGE_TRAMPOLINE(MutexUnregisterRoleJs2, MutexUnregisterRoleJs)
 MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
 MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
 MEMBRIDGE_TRAMPOLINE(CheckLivenessJsBridge2, CheckLivenessJsBridge)
@@ -947,6 +965,7 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"mutexOwnerAlive", MutexOwnerAliveJs2},
       {"mutexRegisterPin", MutexRegisterPinJs2},
       {"mutexUnregisterClaim", MutexUnregisterClaimJs2},
+      {"mutexUnregisterRole", MutexUnregisterRoleJs2},
       {"ringClaimRole", RingClaimRoleJs2},
       {"readHeader", ReadHeaderJs2},
       {"checkLiveness", CheckLivenessJsBridge2},

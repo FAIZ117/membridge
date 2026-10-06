@@ -38,6 +38,7 @@ const CONSUMER_TOKEN = 33;
 const CAPACITY = 34;
 const MAX_MESSAGE = 35;
 const DATA_WORD = RING_HEADER_BYTES / 4; // 64
+const CONSUMER_SLOT = 1;  // role slot index (producer 0, consumer 1)
 // Parked flags (review P3): word 1 shares head's cache line, word 17 tail's.
 // The other side notifies only when the flag is set, so an unparked
 // data-plane operation costs zero FUTEX_WAKEs. A crashed waiter leaves its
@@ -49,6 +50,19 @@ const sleepSliceMs = 250;
 const nowMs = (): number => performance.now();  // monotonic (review F35)
 const sliceOf = (deadline: number): number =>
   Math.max(1, Math.min(sleepSliceMs, deadline - nowMs()));
+
+// R15b: when a RingConsumer is collected (or closed), release its role so a
+// replacement consumer can open on this thread without waiting for thread
+// exit. Producer roles are deliberately NOT GC-released: a collected
+// producer's role must stay held, because a replacement producer joining
+// while a live sibling still writes would break SPSC.
+const consumerRoleRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number }>((v) => {
+  try {
+    nativeOrThrow().mutexUnregisterRole(v.data, v.slot);
+  } catch {
+    // isolate tearing down: the env-cleanup hook covers the remainder
+  }
+});
 
 function align8(n: number): number {
   return (n + 7) & ~7;
@@ -356,7 +370,18 @@ export class RingConsumer {
     b.ringClaimRole(name, view, false);
     const c = new RingConsumer(name, view, capacity);
     c.claimed = true;
+    consumerRoleRegistry.register(c, { data: view, slot: CONSUMER_SLOT }, c);
     return c;
+  }
+
+  /** Release this instance's consumer role (idempotent). After close() the
+   * instance is dead; a new RingConsumer can open on this thread. */
+  close(): void {
+    if (this.claimed) {
+      consumerRoleRegistry.unregister(this);
+      this.b.mutexUnregisterRole(this.view, CONSUMER_SLOT);
+      this.claimed = false;
+    }
   }
 
   private head(): number {

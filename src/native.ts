@@ -27,6 +27,7 @@ export interface Native {
   mutexOwnerAlive(view: Int32Array, token: number): boolean;
   mutexRegisterPin(name: string, view: Int32Array, slot: number, token: number, sab: SharedArrayBuffer): void;
   mutexUnregisterClaim(view: Int32Array, slot: number): void;
+  mutexUnregisterRole(view: Int32Array, slot: number): void;
   // §8 ring role claims (producer slot 0 / consumer slot 1)
   ringClaimRole(name: string, view: Int32Array, isProducer: boolean): number;
   // §7.1 liveness for §9 stat

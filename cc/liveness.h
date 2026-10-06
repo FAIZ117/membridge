@@ -17,6 +17,9 @@ enum class Liveness { kAlive, kDead, kUnknown };
 // live process are detected by the env-cleanup hook (M4).
 Liveness CheckLiveness(const Identity& id);
 
+// JS-facing wrapper (§9 stat): 'alive' | 'dead' | 'unknown'.
+const char* CheckLivenessJs(int32_t pid, int64_t startTime, int64_t pidNsInode);
+
 }  // namespace membridge
 
 #endif  // MEMBRIDGE_LIVENESS_H_

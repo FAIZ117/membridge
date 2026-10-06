@@ -60,3 +60,9 @@ and on timeout.
   not use it for latency-critical control loops.
 - `MEMBRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB) caps segment sizes; a ring's
   capacity counts against it (`E_SIZE_INVALID` above the cap, §8.1).
+- **Async waits are budgeted per process**: 127 multiplexed + 64 thread
+  fallbacks = 191 outstanding `waitAsync`/`lockAsync` waits, then
+  `E_TOO_MANY_WAITERS` (all segments and isolates share the budget).
+- `reap()` is for segments expected idle: it decides from an attach-table
+  snapshot, so a joiner claiming a row mid-scan can be unlinked under (it
+  keeps its mapping, POSIX-style).

@@ -219,4 +219,14 @@ Liveness CheckLiveness(const Identity&) {
 
 #endif
 
+const char* CheckLivenessJs(int32_t pid, int64_t startTime, int64_t pidNsInode) {
+  const Identity id{pid, 0, startTime, pidNsInode};
+  switch (CheckLiveness(id)) {
+    case Liveness::kAlive: return "alive";
+    case Liveness::kDead: return "dead";
+    case Liveness::kUnknown: return "unknown";
+  }
+  return "unknown";
+}
+
 }  // namespace membridge

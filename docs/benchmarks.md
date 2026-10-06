@@ -5,17 +5,23 @@ shared runners are noisy, and throughput thresholds in tests rot). Machine for
 the numbers below: dev workstation, Linux 7.2.8 x86_64 (Fedora), Node 24.18.0,
 g++ 15.3, Release build, 18 cores, otherwise idle. Re-run with `npm run bench`.
 
-## Results (2026-10-06, membridge 0.0.0)
+## Results (2026-10-06, after the review fix round)
 
 | Bench | Value |
 |-------|-------|
 | contention — same-process `Atomics.add` (5 M ops on a membridge SAB) | ~110–120 M ops/s |
-| contention — cross-process futex handoff (ping/pong round trip, shared futex) | ~0.002 ms/round-trip (~500–580k/s) |
-| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | ~0.18 µs/op |
-| mutex — holder SIGKILLed → steal (SIGKILL → acquired) | < 250 ms (one detection slice; typically ~0 ms when the kill is observed immediately) |
-| ring — 64 B messages (copying `write`/`read`) | ~2.0–2.4 M msgs/s (~150 MB/s) |
-| ring — 4 KiB messages | ~330–360k msgs/s (~1.3–1.5 GB/s) |
-| ring — 64 KiB messages | ~28–32k msgs/s (~1.8–2.1 GB/s) |
+| contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~175k/s) |
+| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **~0.07 µs/op** (was 0.18 before per-lock native tracking was removed) |
+| mutex — 3-way contended handoff | no slice-bound waits (was up to 750 ms); sub-slice handoffs |
+| mutex — holder SIGKILLed → steal (SIGKILL → acquired) | ~0 ms (zombie-aware liveness) |
+| ring — 64 B messages (copying `write`/`read`) | **~3.2 M msgs/s** (~205 MB/s; was ~2.3 M before parked flags) |
+| ring — 4 KiB messages | ~330k msgs/s (~1.36 GB/s) |
+| ring — 64 KiB messages | ~27k msgs/s (~1.8 GB/s) |
+
+The handoff number changed meaning in the fix round: the bench's pong side
+now parks on the token instead of spinning, so it measures a true
+sleep→wake→sleep round trip (~6 µs) rather than a spin-loop counterpart
+(~2 µs against a busy peer).
 
 ## Reading them
 

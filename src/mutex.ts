@@ -40,7 +40,7 @@ const sliceOf = (deadline: number): number =>
 const sleepSliceMs = 250; // dead-owner detection cadence (§7.3)
 
 export interface LockOptions {
-  /** Total time to wait before E_TIMEOUT. Default: wait indefinitely. */
+  /** Total time to wait before E_TIMEOUT (<= 2^31 ms). Default: wait indefinitely. */
   timeoutMs?: number;
 }
 

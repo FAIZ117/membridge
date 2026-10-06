@@ -268,6 +268,12 @@ loop = up to 50 ms per contended handoff). This is the foundation for everything
   The multiplexer is woken to change its wait set by a private control futex in its own wait vector.
 - Exposed publicly (`membridge/sync`) because users building their own lock-free
   structures on a membridge SAB hit F1 just the same.
+- **Async-wait capacity (fix round 2026-10-06):** one process-wide waiter
+  budget — 127 multiplexed `futex_waitv` entries + 64 one-thread-per-wait
+  fallbacks (191); a further `waitAsync` rejects `E_TOO_MANY_WAITERS` and the
+  mux rebuilds its wait set per registration/wake. Amortizing same-word waits
+  into one kernel entry is the known next step if servers park hundreds of
+  `lockAsync` waits (review P6); documented rather than built.
 
 ## 7. Crash-safe Mutex
 
@@ -444,6 +450,14 @@ c.read()                                  // convenience = peek + copy + release
 | `list()` | Linux: readdir `/dev/shm`, keep entries whose header has membridge magic (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
 | `reap({ dryRun })` | unlink segments whose every attach slot is dead and that have no `ATTACH_OVERFLOW` flag. Unknown liveness (foreign pid namespace) counts as alive. | Linux (needs `list`); `reap(name)` for a single segment on all OSes |
 | `open(..., { unlinkWhenUnused: true })` | the last process to detach (attach table becomes empty) unlinks the name | all |
+
+**Reap semantics (fix round 2026-10-06):** the creator publishes magic only
+AFTER claiming its attach row, so a reaper can never observe an empty-table
+segment whose creator is mid-open. The residual race — a reaper's stat
+snapshot taken just before a joiner claims its row — is inherent to
+reap-by-snapshot and documented: `reap()` is for segments expected idle; a
+joiner that loses the race keeps its (unlinked) mapping alive exactly like
+POSIX `unlink` semantics, and the name is gone for later openers by design.
 
 **Why this replaces rev 1's `cleanupOnExit`:** exit handlers do not run on SIGKILL, SIGBUS
 or OOM-kill (nor on SIGINT/SIGTERM without handlers), so they cannot clean up after

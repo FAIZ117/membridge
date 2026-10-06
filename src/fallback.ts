@@ -26,7 +26,8 @@ export function fallbackOpen(name: string, size: number | undefined, opts: OpenO
     throw new MembridgeError('E_EXISTS', `segment '${name}' already exists`, { segmentName: name });
   }
   if (existing === undefined) {
-    if (size === undefined) {
+    if (size === undefined || opts.mode === 'join') {
+      // join on a missing name never creates (native parity, review F36)
       throw new MembridgeError('E_NOT_FOUND', `segment '${name}' does not exist`, { segmentName: name });
     }
     const sab = new SharedArrayBuffer(size);

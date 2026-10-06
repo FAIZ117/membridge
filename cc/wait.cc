@@ -72,19 +72,28 @@ double NowMs() {
 
 #if defined(__linux__)
 struct timespec DeadlineToTimespec(double deadlineMs) {
-  // futex_waitv takes an ABSOLUTE timeout on the given clockid — deadlineMs is
-  // on the steady (monotonic) epoch, so convert directly, no "remaining".
-  if (deadlineMs < 0) deadlineMs = 0;
+  // futex_waitv takes an ABSOLUTE timeout on the given clockid — deadlineMs
+  // is on the steady (monotonic) epoch, so convert directly, no "remaining".
+  // Clamped to a range time_t/int64 can represent (review F9: 1e300 ms
+  // overflowed into EINVAL).
+  if (!(deadlineMs > 0)) deadlineMs = 0;
+  if (deadlineMs > 1e15) deadlineMs = 1e15;  // ~31,700 years: saturation, not wrap
   struct timespec ts;
   ts.tv_sec = static_cast<time_t>(deadlineMs / 1000);
-  ts.tv_nsec = static_cast<long>((deadlineMs - ts.tv_sec * 1000) * 1e6);
+  double rem = deadlineMs - static_cast<double>(ts.tv_sec) * 1000.0;
+  long nsec = static_cast<long>(rem * 1e6);
+  if (nsec >= 1000000000L) {
+    nsec -= 1000000000L;
+    ts.tv_sec += 1;
+  }
+  ts.tv_nsec = nsec;
   return ts;
 }
 #endif
 
 // ---- node + hub ------------------------------------------------------------
 
-enum class Fulfill { kOk, kTimedOut };
+enum class Fulfill { kOk, kNotEqual, kTimedOut };
 
 struct WaitNode;
 
@@ -159,7 +168,9 @@ void AsyncCallback(uv_async_t* handle) {
   }
   for (auto& f : batch) {
     if (f.first->settled.exchange(true)) continue;
-    ResolveOnLoop(hub->isolate, *f.first, f.second == Fulfill::kOk ? "ok" : "timed-out");
+    ResolveOnLoop(hub->isolate, *f.first,
+                  f.second == Fulfill::kOk ? "ok"
+                                           : f.second == Fulfill::kNotEqual ? "not-equal" : "timed-out");
   }
   // Loop pinning is done in JS (sync.ts holds a timer while waits pend):
   // uv_ref alone proved unreliable across Node versions (Node 22 runner).
@@ -256,7 +267,7 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       break;
     }
     if (errno == EAGAIN) {
-      Deliver(node, Fulfill::kOk);  // the awaited store already landed
+      Deliver(node, Fulfill::kNotEqual);  // §6 parity with sync wait
       break;
     }
     if (errno == ETIMEDOUT) {
@@ -448,7 +459,8 @@ void MuxMain() {
       for (size_t i = 0; i < snapshot.size(); i++) {
         if (snapshot[i]->delivered.load() || snapshot[i]->cancelled) continue;
         if (*snapshot[i]->addr != static_cast<int32_t>(snapshot[i]->expected)) {
-          Deliver(snapshot[i], Fulfill::kOk);
+          // §6 contract parity with sync wait: the value already differs.
+          Deliver(snapshot[i], Fulfill::kNotEqual);
         }
       }
     } else if (r == -1 && errno == ETIMEDOUT) {
@@ -494,7 +506,9 @@ void EnsureMux() {
 WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
 #if defined(__linux__)
   const bool infinite = timeoutMs != timeoutMs;  // NaN = infinite
-  const double deadline = infinite ? 0 : NowMs() + timeoutMs;  // absolute
+  double timeout = timeoutMs;
+  if (!(timeout > 0) || timeout > 1e15) timeout = 1e15;  // clamp (review F9)
+  const double deadline = infinite ? 0 : NowMs() + timeout;  // absolute
   for (;;) {
     struct timespec ts;
     struct timespec* tsp = nullptr;

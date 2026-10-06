@@ -47,9 +47,23 @@ function wordAddrCheck(view: Int32Array, index: number): void {
   }
 }
 
+// Timeouts are clamped to 2^31 ms (~24.8 days): beyond that the value cannot
+// be represented as a timespec deadline without int64 overflow, and no
+// plausible caller means a literal >24-day wait (review F9 — 1e300 used to
+// spin the multiplexer at 100% CPU on an EINVAL loop). NaN stays invalid.
+const MAX_TIMEOUT_MS = 2 ** 31;
+
 function timeoutCheck(timeoutMs: number | undefined): void {
-  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
-    throw new MembridgeError('E_NAME_INVALID', 'timeoutMs must be a positive number');
+  if (timeoutMs !== undefined) {
+    if (Number.isNaN(timeoutMs) || timeoutMs <= 0) {
+      throw new MembridgeError('E_NAME_INVALID', 'timeoutMs must be a positive number');
+    }
+    if (timeoutMs > MAX_TIMEOUT_MS) {
+      throw new MembridgeError(
+        'E_NAME_INVALID',
+        `timeoutMs must be <= ${MAX_TIMEOUT_MS} (~24.8 days); use no timeout for longer waits`,
+      );
+    }
   }
 }
 
@@ -81,7 +95,9 @@ export function notify(view: Int32Array, index: number, count?: number): void {
 }
 
 /**
- * Like {@link wait} but returns a Promise; the wait runs on a membridge-owned
+ * Like {@link wait} but returns a Promise; resolves `'not-equal'` when the
+ * word differs from `expected` before the wait parks (same contract as the
+ * synchronous {@link wait}). The wait runs on a membridge-owned
  * waiter thread (never the libuv pool threadpool). Isolate teardown (worker
  * exit or `.terminate()`) cancels the wait and resolves `'timed-out'`.
  */

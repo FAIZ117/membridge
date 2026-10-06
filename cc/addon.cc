@@ -70,20 +70,25 @@ void SetErrField(v8::Isolate* isolate, v8::Local<v8::Object> o, const char* key,
 }  // namespace
 
 void SetErrorCtor(v8::Isolate* isolate, v8::Local<v8::Function> ctor) {
+  bool fresh = false;
   {
     std::lock_guard<std::mutex> lock(g_error_mu);
+    fresh = g_error_ctors.find(isolate) == g_error_ctors.end();
     g_error_ctors[isolate].Reset(isolate, ctor);
   }
-  // Drop the entry when the isolate goes away so the map never holds a
-  // Global for a destroyed isolate.
-  node::AddEnvironmentCleanupHook(
-      isolate,
-      [](void* p) {
-        v8::Isolate* iso = static_cast<v8::Isolate*>(p);
-        std::lock_guard<std::mutex> lock(g_error_mu);
-        g_error_ctors.erase(iso);
-      },
-      isolate);
+  // Register the isolate-teardown hook exactly once per isolate: Node treats
+  // a duplicate (fn, arg) cleanup-hook pair as a CHECK failure (review F38 —
+  // a module-registry reset re-running the loader would abort the process).
+  if (fresh) {
+    node::AddEnvironmentCleanupHook(
+        isolate,
+        [](void* p) {
+          v8::Isolate* iso = static_cast<v8::Isolate*>(p);
+          std::lock_guard<std::mutex> lock(g_error_mu);
+          g_error_ctors.erase(iso);
+        },
+        isolate);
+  }
 }
 
 void ThrowError(v8::Isolate* isolate, const char* code, const std::string& message) {
@@ -182,7 +187,9 @@ bool ParseOpts(v8::Isolate* isolate, v8::Local<v8::Value> optsVal, OpenOpts* opt
   if (GetProp(isolate, ctx, o, "initTimeoutMs", &v) && !v->IsUndefined()) {
     if (!v->IsNumber()) return false;
     const double d = v->NumberValue(ctx).ToChecked();
-    if (!(d > 0)) return false;
+    // finite, positive, and clamped to a range int64 microseconds can hold
+    // (review F35: 1e300 * 1000 overflowed the int64 cast — UB)
+    if (!(d > 0) || d > 2147483647.0) return false;
     opts->initTimeoutMs = d;
   }
   if (GetProp(isolate, ctx, o, "raw", &v) && !v->IsUndefined()) {
@@ -716,6 +723,23 @@ void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
       v8::Boolean::New(isolate, MutexOwnerAlive(data, token, kMutexHeaderWords, kMutexSlotCount)));
 }
 
+// checkLiveness(pid, startTime, pidNsInode) -> 'alive'|'dead'|'unknown' (§9)
+void CheckLivenessJsBridge(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 3) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "checkLiveness(pid, startTime, pidNsInode)")));
+    return;
+  }
+  const char* r = CheckLivenessJs(
+      args[0]->Int32Value(ctx).ToChecked(),
+      static_cast<int64_t>(args[1]->NumberValue(ctx).ToChecked()),
+      static_cast<int64_t>(args[2]->NumberValue(ctx).ToChecked()));
+  args.GetReturnValue().Set(Str(isolate, r));
+}
+
 // ---- guarded trampolines ---------------------------------------------------
 // Every JS entry point catches NativeError (JS exception already pending).
 // Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
@@ -808,6 +832,7 @@ MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
 MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
 MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
 MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
+MEMBRIDGE_TRAMPOLINE(CheckLivenessJsBridge2, CheckLivenessJsBridge)
 
 void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();  // F16: no Context::GetIsolate in V8 14.6
@@ -830,6 +855,7 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"mutexOwnerAlive", MutexOwnerAliveJs2},
       {"ringClaimRole", RingClaimRoleJs2},
       {"readHeader", ReadHeaderJs2},
+      {"checkLiveness", CheckLivenessJsBridge2},
   };
   for (const Reg& r : regs) {
     v8::Local<v8::Function> f =

@@ -27,6 +27,8 @@ export interface Native {
   mutexOwnerAlive(view: Int32Array, token: number): boolean;
   // §8 ring role claims (producer slot 0 / consumer slot 1)
   ringClaimRole(name: string, view: Int32Array, isProducer: boolean): number;
+  // §7.1 liveness for §9 stat
+  checkLiveness(pid: number, startTime: number, pidNsInode: number): 'alive' | 'dead' | 'unknown';
   // §9 stat support (header read without mapping the data region)
   readHeader(name: string, maxAttach?: number): {
     magic: number;

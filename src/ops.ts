@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import { MembridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { unlink, validateName } from './core';
+import { nativeOrThrow as binding } from './native';
 
 export interface SegmentStat {
   name: string;
@@ -54,6 +55,12 @@ const FLAG_UNLINKED = 2;
 const KIND_MASK = 0xff << 8;
 const MAGIC = 0x424d454d;
 
+/** Native §7.1 liveness: 'alive' | 'dead' | 'unknown' (never-steal). */
+function livenessOf(pid: number, startTime: number, pidNsInode: number): boolean | 'unknown' {
+  const r = binding().checkLiveness(pid, startTime, pidNsInode);
+  return r === 'alive' ? true : r === 'dead' ? false : 'unknown';
+}
+
 function kindOf(flags: number): 'plain' | 'mutex' | 'ring' {
   const k = flags & KIND_MASK;
   if (k === 1 << 8) return 'mutex';
@@ -86,24 +93,17 @@ export function stat(name: string): SegmentStat {
       segmentName: name,
     });
   }
-  const identity = b.selfIdentity();
   const attachSlots: SegmentStat['attachSlots'] = [];
   for (const row of h.attach) {
     if (row.refcount <= 0 || row.pid === 0) continue;
-    // §7.1 liveness: kill(pid,0) (success or EPERM = alive) within our own
-    // pid namespace; foreign namespaces read 'unknown' and block reap (§9).
-    let alive: boolean | 'unknown' = 'unknown';
-    if (row.pidNsInode > 0 && identity.pidNsInode > 0 && row.pidNsInode !== identity.pidNsInode) {
-      alive = 'unknown';
-    } else if (process.platform === 'win32') {
-      alive = true; // OpenProcess liveness lands with the Windows CI pass
+    // §7.1 liveness through the native check (review F34: the old JS path was
+    // a bare kill(pid,0) — no zombie detection, no start-time match, and
+    // Windows always said alive).
+    let alive: boolean | 'unknown';
+    if (process.platform === 'win32') {
+      alive = 'unknown'; // OpenProcess liveness lands with the Windows CI pass
     } else {
-      try {
-        process.kill(row.pid, 0);
-        alive = true;
-      } catch (e: any) {
-        alive = e.code === 'EPERM';
-      }
+      alive = livenessOf(row.pid, row.startTime, row.pidNsInode);
     }
     attachSlots.push({
       pid: row.pid,

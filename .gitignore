@@ -5,3 +5,6 @@ prebuilds/
 *.node
 *.tsbuildinfo
 .DS_Store
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts

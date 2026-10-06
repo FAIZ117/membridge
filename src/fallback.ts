@@ -3,7 +3,16 @@
 // E_NATIVE_UNAVAILABLE. The fallback maps names to JS SharedArrayBuffers in
 // THIS PROCESS ONLY — a cross-process bug if misused as if it were shared
 // memory. It still checks sizes (shmbuf ignored size on re-open). Mutex and
-// RingBuffer refuse it unless explicitly opted in.
+// RingBuffer always require the native addon (E_NATIVE_UNAVAILABLE): the
+// fallback serves plain data segments only.
+//
+// Scope (review F36): the name table is per ISOLATE — each worker_threads
+// isolate loads a fresh copy of this module, and a plain JS Map cannot be
+// shared across realms (globalThis is per-worker; only a SharedArrayBuffer
+// could carry the table, and a serialized table over Atomics would be
+// re-implementing membridge in JS). Cross-isolate sharing is exactly what the
+// native addon provides; the fallback is a single-isolate convenience and
+// says so.
 
 import { MembridgeError } from './errors';
 import type { OpenOptions } from './core';
@@ -13,7 +22,7 @@ interface FallbackEntry {
   dataBytes: number;
 }
 
-const segments = new Map<string, FallbackEntry>();
+const segments = new Map<string, FallbackEntry>();  // per isolate (see scope note)
 
 export function fallbackEnabled(opts?: OpenOptions): boolean {
   if (opts?.allowFallback === true) return true;

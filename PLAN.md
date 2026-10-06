@@ -216,8 +216,13 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
 
 - Opt-in only: `MEMBRIDGE_ALLOW_FALLBACK=1` or `open(..., { allowFallback: true })`.
   Otherwise, a missing addon → `E_NATIVE_UNAVAILABLE`.
-- In fallback, `Mutex` and `RingBuffer` throw `E_NATIVE_UNAVAILABLE` unless explicitly opted in.
-  Fallback still checks sizes (shmbuf ignored size on re-open).
+- The name table is per ISOLATE (fix round 3, F36): a worker_threads isolate
+  loads a fresh fallback module, and a plain JS Map cannot cross realms —
+  cross-isolate sharing is precisely what the native addon provides. A worker
+  joining a main-thread fallback segment gets a clean `E_NOT_FOUND`.
+- `Mutex` and `RingBuffer` always require the native addon (`E_NATIVE_UNAVAILABLE`)
+  — there is no fallback opt-in for them (fix round 3 corrected this doc; the code
+  never had one). Fallback still checks sizes (shmbuf ignored size on re-open).
 - **Why:** a fallback that silently "works" inside one process turns a missing build
   into a cross-process correctness bug that only appears in production.
 

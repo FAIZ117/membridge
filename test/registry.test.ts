@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { Worker } from 'node:worker_threads';
 import { spawnSync } from 'node:child_process';
 import { open, unlink } from '../src/core';
+import { fallbackOpen, fallbackUnlink } from '../src/fallback';
 import { Mutex } from '../src/mutex';
 import { RingProducer } from '../src/ringbuffer';
 import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
@@ -158,5 +159,34 @@ test('kind mismatch on registry reuse -> E_INCOMPATIBLE (review F33)', () => {
     m.unlock();
   } finally {
     unlinkQuietly(name);
+  }
+});
+
+// F36: the fallback name table is per ISOLATE — a worker isolate loads a
+// fresh copy of the fallback module and cannot see main-thread segments
+// (a plain JS Map cannot cross realms). Pins the documented scope.
+test('fallback table is per isolate; cross-isolate join is a clean E_NOT_FOUND (review F36)', async () => {
+  const name = uniqueName();
+  const FB = require.resolve('../fallback.js'); // runtime-relative to dist/test
+  try {
+    fallbackOpen(name, 4096, { mode: 'create' });
+    const w = new Worker(
+      `const { workerData, parentPort } = require('worker_threads');
+       const { fallbackOpen } = require(workerData.fb);
+       try {
+         fallbackOpen(workerData.name, undefined, { mode: 'join' });
+         parentPort.postMessage('BAD: joined');
+       } catch (e) {
+         parentPort.postMessage(e.code);
+       }`,
+      { eval: true, workerData: { name, fb: FB } },
+    );
+    const got = await new Promise<string>((res, rej) => {
+      w.on('message', (m: string) => res(m));
+      w.on('error', rej);
+    });
+    assert.strictEqual(got, 'E_NOT_FOUND', 'worker cannot see the main isolate fallback segment');
+  } finally {
+    fallbackUnlink(name);
   }
 });

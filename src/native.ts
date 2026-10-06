@@ -27,6 +27,8 @@ export interface Native {
   mutexOwnerAlive(view: Int32Array, token: number): boolean;
   mutexTrackHeld(name: string, view: Int32Array, token: number): void;
   mutexUntrackHeld(view: Int32Array, token: number): void;
+  // §8 ring role claims (producer slot 0 / consumer slot 1)
+  ringClaimRole(name: string, view: Int32Array, isProducer: boolean): number;
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };

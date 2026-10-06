@@ -13,6 +13,7 @@
 import { MembridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { open, unlink } from './core';
+import { waitAsync } from './sync'; // pinned loop while async waits pend
 
 // Data-region layout (mirrors cc/mutex.h)
 const HEADER_WORDS = 4; // lockWord, ownerDied, seq, pad
@@ -216,7 +217,7 @@ export class Mutex {
       }
       if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
       const expected = this.lockWord();
-      const waitP = this.b.syncWaitAsync(this.view, LOCK_WORD, expected, sleepSliceMs);
+      const waitP = waitAsync(this.view, LOCK_WORD, expected, sleepSliceMs);
       const abortP =
         signal !== undefined
           ? new Promise<never>((_, rej) => {

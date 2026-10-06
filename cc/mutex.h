@@ -43,7 +43,8 @@ uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& 
 // is alive (unknown liveness counts as alive — never steal across pid
 // namespaces, §7.1). A gen mismatch (stale token) also reports alive: the
 // real holder's unlock path fixes the word.
-bool MutexOwnerAlive(int32_t* data, uint32_t token);
+bool MutexOwnerAlive(int32_t* data, uint32_t token, uint32_t slotsWordOffset,
+                     uint32_t slotCount);
 
 // Per-isolate held-lock registry for the §7.1 env-cleanup hook: a dead worker
 // must not leave locks behind in a live process. Tracking registers the hook
@@ -55,6 +56,22 @@ void MutexUntrackHeld(v8::Isolate* isolate, int32_t* data, uint32_t token);
 // Free this thread's slot(s) in `data` (graceful close; slots of dead threads
 // are reclaimed on demand anyway).
 void MutexReleaseThreadSlots(int32_t* data);
+
+// ---- §8 ring role claims ---------------------------------------------------
+// The ring data region embeds a 2-slot participant table (same 8-word slot
+// layout as the mutex) at kRingSlotsWordOffset; role word 0 = producer's
+// token, 1 = consumer's. Claiming takes the role's own slot (producer -> 0,
+// consumer -> 1): live holder -> E_ROLE_TAKEN; dead holder -> replaced with a
+// gen bump; fresh segment -> plain claim.
+constexpr uint32_t kRingSlotsWordOffset = 36;  // byte 144 (two 32 B slots)
+constexpr uint32_t kRingProducerWord = 32;     // byte 128
+constexpr uint32_t kRingConsumerWord = 33;     // byte 132
+
+uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* data,
+                       uint32_t roleWord, uint32_t slotIndex);
+
+void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
+                    uint32_t roleWordOffset);
 
 }  // namespace membridge
 

@@ -11,6 +11,33 @@ import { nativeOrThrow } from './native';
 
 export type WaitResult = 'ok' | 'not-equal' | 'timed-out';
 
+// Loop pinning: a pending native wait does not keep the event loop alive by
+// itself (uv_ref proved unreliable across Node versions), so sync.ts holds a
+// ref'd timer while any waitAsync is outstanding — same semantics as a
+// pending setTimeout.
+let outstandingWaits = 0;
+let keepAlive: NodeJS.Timeout | null = null;
+
+function pinLoopWhile(p: Promise<WaitResult>): Promise<WaitResult> {
+  outstandingWaits++;
+  if (keepAlive === null) {
+    keepAlive = setInterval(() => {}, 0x7fffffff);
+  }
+  // Two-armed .then (not .finally): a .finally-derived promise would carry
+  // rejections with no handler and fail the surrounding test.
+  const release = () => {
+    if (--outstandingWaits <= 0) {
+      outstandingWaits = 0;
+      if (keepAlive !== null) {
+        clearInterval(keepAlive);
+        keepAlive = null;
+      }
+    }
+  };
+  void p.then(release, release);
+  return p;
+}
+
 function wordAddrCheck(view: Int32Array, index: number): void {
   if (!(view instanceof Int32Array)) {
     throw new MembridgeError('E_NAME_INVALID', 'wait/notify need an Int32Array (waitable words are i32 only)');
@@ -70,5 +97,7 @@ export function waitAsync(
     throw new MembridgeError('E_NAME_INVALID', 'expected must be an i32 value');
   }
   const b = nativeOrThrow();
-  return b.syncWaitAsync(view, index, expected, timeoutMs === undefined ? -1 : timeoutMs) as Promise<WaitResult>;
+  return pinLoopWhile(
+    b.syncWaitAsync(view, index, expected, timeoutMs === undefined ? -1 : timeoutMs) as Promise<WaitResult>,
+  );
 }

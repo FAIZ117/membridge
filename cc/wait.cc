@@ -113,6 +113,7 @@ struct WaitNode {
   Hub* hub;
   bool onThread = false;
   bool cancelled = false;
+  std::atomic<bool> delivered{false};  // exactly one pending-decrement per node
 };
 
 void ResolveOnLoop(v8::Isolate* isolate, PromiseState& state, const char* result) {
@@ -129,25 +130,6 @@ void ResolveOnLoop(v8::Isolate* isolate, PromiseState& state, const char* result
   isolate->PerformMicrotaskCheckpoint();
 }
 
-void AsyncCallback(uv_async_t* handle) {
-  auto* hub = static_cast<Hub*>(handle->data);
-  std::deque<std::pair<std::shared_ptr<PromiseState>, Fulfill>> batch;
-  {
-    std::lock_guard<std::mutex> lock(hub->mu);
-    batch.swap(hub->queue);
-  }
-  for (auto& f : batch) {
-    if (f.first->settled.exchange(true)) continue;
-    ResolveOnLoop(hub->isolate, *f.first, f.second == Fulfill::kOk ? "ok" : "timed-out");
-  }
-  {
-    std::lock_guard<std::mutex> lock(hub->mu);
-    if (!hub->closed && hub->pending <= 0) {
-      uv_unref(reinterpret_cast<uv_handle_t*>(handle));
-    }
-  }
-}
-
 // ---- process-wide wait set + multiplexer -----------------------------------
 
 constexpr size_t kMuxCapacity = 127;  // futex_waitv entries minus control word
@@ -162,6 +144,23 @@ size_t g_threadWaits = 0;
 bool g_muxStarted = false;
 bool g_waitvOk = false;
 
+void AsyncCallback(uv_async_t* handle) {
+  auto* hub = static_cast<Hub*>(handle->data);
+  std::deque<std::pair<std::shared_ptr<PromiseState>, Fulfill>> batch;
+  {
+    std::lock_guard<std::mutex> lock(hub->mu);
+    batch.swap(hub->queue);
+  }
+  for (auto& f : batch) {
+    if (f.first->settled.exchange(true)) continue;
+    ResolveOnLoop(hub->isolate, *f.first, f.second == Fulfill::kOk ? "ok" : "timed-out");
+  }
+  // Loop pinning is done in JS (sync.ts holds a timer while waits pend):
+  // uv_ref alone proved unreliable across Node versions (Node 22 runner).
+}
+
+
+
 void WakeMux() {
 #if defined(__linux__)
   // The control word is process-private, so PRIVATE is correct here.
@@ -170,6 +169,7 @@ void WakeMux() {
 }
 
 void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
+  if (node->delivered.exchange(true)) return;  // one delivery per node, ever
   Hub* hub = node->hub;
   // Do NOT settle here — the resolve point (AsyncCallback or the teardown
   // hook) settles exactly once. Dropping out of the wait set happens via
@@ -293,14 +293,20 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   }
 #endif
   if (node->onThread) {
-    std::lock_guard<std::mutex> lock(g_mu);
-    g_threadWaits--;
-    for (auto it = g_threads.begin(); it != g_threads.end(); ++it) {
-      if (it->get() == node.get()) {
-        g_threads.erase(it);
-        break;
+    Hub* hub = node->hub;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      g_threadWaits--;
+      for (auto it = g_threads.begin(); it != g_threads.end(); ++it) {
+        if (it->get() == node.get()) {
+          g_threads.erase(it);
+          break;
+        }
       }
     }
+    // The loop may have been held open only for this thread's tail: re-run
+    // the idle check (an extra send with an empty queue is harmless).
+    if (hub != nullptr) uv_async_send(&hub->async);
   }
 }
 
@@ -519,6 +525,8 @@ bool StartAsyncWait(v8::Isolate* isolate, v8::Local<v8::Promise::Resolver> resol
       hub->async.data = hub.get();
       uv_loop_t* loop = node::GetCurrentEventLoop(isolate);
       uv_async_init(loop, &hub->async, AsyncCallback);
+      // Delivery-only handle: it must never pin the loop (sync.ts owns the
+      // loop lifetime with a JS timer while waits are outstanding).
       uv_unref(reinterpret_cast<uv_handle_t*>(&hub->async));
       g_hubs[isolate] = hub;
       node::AddEnvironmentCleanupHook(
@@ -570,7 +578,6 @@ bool StartAsyncWait(v8::Isolate* isolate, v8::Local<v8::Promise::Resolver> resol
   {
     std::lock_guard<std::mutex> lock(hub->mu);
     hub->pending++;
-    uv_ref(reinterpret_cast<uv_handle_t*>(&hub->async));
   }
   return true;
 }
@@ -617,7 +624,6 @@ void CancelIsolateWaits(v8::Isolate* isolate) {
     std::lock_guard<std::mutex> lock(hub->mu);
     hub->closed = true;
     hub->pending = 0;
-    uv_unref(reinterpret_cast<uv_handle_t*>(&hub->async));
     // Close the handle so the isolate's loop can shut down cleanly (worker
     // .terminate() tears the loop down; an open handle aborts the process).
     uv_close(reinterpret_cast<uv_handle_t*>(&hub->async), nullptr);

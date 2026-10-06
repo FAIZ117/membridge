@@ -9,6 +9,7 @@ outlive individual plan revisions.
 | `adr/` | Architecture Decision Records — one numbered file per lasting design decision, with alternatives considered |
 | `compat.md` | Support matrix: OS × feature × Node version × Electron caveat |
 | `release.md` | Runbook for prebuilds and `npm publish` (owner-only step) |
+| `review/` | Timestamped review reports (correctness, performance, security), one file per review round |
 
 ## ADRs
 

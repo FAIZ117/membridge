@@ -39,10 +39,10 @@ The contract agents may rely on; each is verified from its milestone onward.
 
 | Task | Command | Available |
 |------|---------|-----------|
-| Build native addon | `npx node-gyp rebuild` | M2 |
-| Build TypeScript | `npm run build` | M2 |
-| Run all tests | `npm test` | M2 |
-| Run one test file | `node --test dist/test/<name>.test.js` | M2 |
+| Build native addon | `npx node-gyp rebuild` | M2 ✓ |
+| Build TypeScript | `npm run build` | M2 ✓ |
+| Run all tests | `npm test` (= build + `node --test dist/test/*.test.js`) | M2 ✓ |
+| Run one test file | `node --test dist/test/<name>.test.js` | M2 ✓ |
 | Benchmarks | `npm run bench` | M5 |
 | Re-run a fact probe | `node probes/<fact>.js` | M1 |
 

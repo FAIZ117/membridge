@@ -1,0 +1,140 @@
+// registry.test.ts — §5.4 lifecycle + §13 registry/GC tests. GC assertions
+// run in dedicated `--expose-gc` child processes (the test runner does not
+// forward that flag into its per-file children); the parent asserts exit
+// codes. Other tests run in-process.
+
+import { test } from 'node:test';
+import { Worker } from 'node:worker_threads';
+import { spawnSync } from 'node:child_process';
+import { open, unlink } from '../src/core';
+import { assert, uniqueName, unlinkQuietly } from './helpers';
+
+const PKG = require.resolve('../src/core'); // tests use core directly (debug hooks are not re-exported)
+
+/** Run a script with --expose-gc in a child; exit 0 = assertion held. */
+function runInGcChild(script: string, name: string): { status: number; out: string } {
+  const r = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
+    env: { ...process.env, MEMBRIDGE_TEST_NAME: name, MEMBRIDGE_TEST_PKG: PKG },
+    encoding: 'utf8',
+  });
+  return { status: r.status ?? -1, out: r.stdout + r.stderr };
+}
+
+test('GC: mapping freed only after the last SAB is collected (child, --expose-gc)', () => {
+  const name = uniqueName();
+  try {
+    const r = runInGcChild(
+      `
+      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
+      const name = process.env.MEMBRIDGE_TEST_NAME;
+      let sab = open(name, 4096);
+      new Int32Array(sab)[0] = 3;
+      if (!debugRegistryHas(name)) process.exit(2);
+      sab = null;
+      for (let i = 0; i < 6; i++) global.gc();
+      process.exit(debugRegistryHas(name) ? 3 : 0);
+      `,
+      name,
+    );
+    assert.strictEqual(r.status, 0, `child exit ${r.status}: ${r.out}`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('GC: mapping kept alive while ANY SAB reference remains (child, --expose-gc)', () => {
+  const name = uniqueName();
+  try {
+    const r = runInGcChild(
+      `
+      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
+      const name = process.env.MEMBRIDGE_TEST_NAME;
+      let a = open(name, 4096);
+      const b = open(name, 4096);
+      new Int32Array(a)[0] = 3;
+      a = null;
+      for (let i = 0; i < 6; i++) global.gc();
+      if (!debugRegistryHas(name)) process.exit(2);
+      if (new Int32Array(b)[0] !== 3) process.exit(3);
+      process.exit(0);
+      `,
+      name,
+    );
+    assert.strictEqual(r.status, 0, `child exit ${r.status}: ${r.out}`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('GC: grow replaces the registry entry; old SABs stay valid (child, --expose-gc)', () => {
+  const name = uniqueName();
+  try {
+    const r = runInGcChild(
+      `
+      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
+      const name = process.env.MEMBRIDGE_TEST_NAME;
+      const old = open(name, 4096);
+      new Int32Array(old)[0] = 7;
+      const grown = open(name, 16384, { sizePolicy: 'grow' });
+      if (grown.byteLength !== 16384) process.exit(2);
+      if (new Int32Array(grown)[0] !== 7) process.exit(3);
+      if (!debugRegistryHas(name)) process.exit(4);
+      if (new Int32Array(old).length !== 1024) process.exit(5);
+      if (new Int32Array(old)[0] !== 7) process.exit(6);
+      process.exit(0);
+      `,
+      name,
+    );
+    assert.strictEqual(r.status, 0, `child exit ${r.status}: ${r.out}`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('at-least prefix and full view share one mapping', () => {
+  const name = uniqueName();
+  try {
+    const full = open(name, 8192);
+    new Int32Array(full)[2047] = 42;
+    const prefix = open(name, 4096, { sizePolicy: 'at-least' });
+    assert.strictEqual(prefix.byteLength, 4096);
+    assert.strictEqual(new Int32Array(prefix)[0], 0);
+    new Int32Array(prefix)[1] = 9;
+    assert.strictEqual(new Int32Array(full)[1], 9);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('worker isolate reuses the same mapping and shares memory', async () => {
+  const name = uniqueName();
+  try {
+    const main = open(name, 4096);
+    new Int32Array(main)[2] = 21;
+    const workerSaw = await new Promise<number>((resolve, reject) => {
+      const w = new Worker(
+        `const { parentPort, workerData } = require('worker_threads');
+         const { open } = require(workerData.pkg);
+         const sab = open(workerData.name, 4096);
+         parentPort.postMessage({ first: new Int32Array(sab)[2] });
+         Atomics.add(new Int32Array(sab), 3, 5);`,
+        { eval: true, workerData: { name, pkg: PKG } },
+      );
+      w.on('message', (m: { first: number }) => resolve(m.first));
+      w.on('error', reject);
+    });
+    assert.strictEqual(workerSaw, 21, 'worker reads through the shared mapping');
+    assert.strictEqual(new Int32Array(main)[3], 5, 'main reads the worker write');
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('unlink while SABs are alive: memory stays valid, name is gone', () => {
+  const name = uniqueName();
+  const sab = open(name, 4096);
+  new Int32Array(sab)[0] = 17;
+  unlink(name);
+  assert.strictEqual(new Int32Array(sab)[0], 17, 'SAB survives unlink');
+  unlinkQuietly(name);
+});

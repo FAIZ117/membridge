@@ -152,6 +152,10 @@ export class Mutex {
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
     let waited = false;  // once we have parked, acquire PRESERVES HAS_WAITERS
+    // R18: probe the holder's liveness once up front and again only after a
+    // slice that timed out — not on every contended pass (a wake with the
+    // word still held used to trigger a /proc read each pass).
+    let livenessCheckDue = true;
     for (;;) {
       const lw = this.lockWord();
       const tokenBits = lw & TOKEN_MASK;
@@ -176,7 +180,7 @@ export class Mutex {
       // Dead owner? Steal: single CAS deadToken -> myToken (§7.3). ownerDied
       // is reported to the STEALER only — storing the flag here made the
       // NEXT acquire report it a second time (review F22).
-      if (!this.b.mutexOwnerAlive(this.view, tokenBits)) {
+      if (livenessCheckDue && !this.b.mutexOwnerAlive(this.view, tokenBits)) {
         const stolen = Atomics.compareExchange(
           this.view,
           LOCK_WORD,
@@ -190,6 +194,7 @@ export class Mutex {
         }
         continue; // lost the race: retry
       }
+      livenessCheckDue = false;
       // Alive holder: ALWAYS OR the bit in (review R13: skipping the OR when
       // the first read had it set left a window where a newcomer's bare-token
       // acquire cleared it and we parked on a no-bit word — 250-500 ms
@@ -204,8 +209,9 @@ export class Mutex {
       if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
         throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
-      this.b.syncWait(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
+      const wr = this.b.syncWait(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
       waited = true;
+      if (wr === 'timed-out') livenessCheckDue = true;  // R18: re-probe the holder
     }
   }
 
@@ -237,6 +243,7 @@ export class Mutex {
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
     let waited = false;
+    let livenessCheckDue = true;  // R18: probe up front, then after timed-out slices only
     for (;;) {
       const lw = this.lockWord();
       const tokenBits = lw & TOKEN_MASK;
@@ -254,7 +261,7 @@ export class Mutex {
           segmentName: this.name,
         });
       }
-      if (!this.b.mutexOwnerAlive(this.view, tokenBits)) {
+      if (livenessCheckDue && !this.b.mutexOwnerAlive(this.view, tokenBits)) {
         const stolen = Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS));
         if (stolen === lw) {
           Atomics.add(this.view, SEQ, 1);
@@ -263,6 +270,7 @@ export class Mutex {
         }
         continue;
       }
+      livenessCheckDue = false;
       const prev = Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
       if ((prev & TOKEN_MASK) === 0) {
         waited = true;
@@ -284,9 +292,10 @@ export class Mutex {
                               () => signal.removeEventListener('abort', onAbort));
             })
           : null;
-      await (abortP !== null ? Promise.race([waitP, abortP]) : waitP);
+      const wr = await (abortP !== null ? Promise.race([waitP, abortP]) : waitP);
       waited = true;
       if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
+      if (wr === 'timed-out') livenessCheckDue = true;  // R18: re-probe the holder
     }
   }
 

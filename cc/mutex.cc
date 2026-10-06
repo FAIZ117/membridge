@@ -379,6 +379,14 @@ namespace {
 uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* data,
                        uint32_t slotsBase, uint32_t roleWordOffset, uint32_t slotIndex) {
   const Identity self = SelfIdentity();
+  if (self.startTime < 0) {
+    // Refuse to claim with an unrecordable identity (review R19, matching the
+    // mutex claim): a role slot stamped startTime=-1 is judged Unknown =
+    // never steal, so the role could never be taken over after a crash.
+    ThrowError(isolate, "E_SYSTEM",
+               "cannot establish thread identity (/proc unavailable); refusing to claim a ring role",
+               name);
+  }
   auto* roleWord = AtomicWord(data + roleWordOffset);
   // Review F23: bound the scan — a slot stuck RESERVED by a crashed claimer
   // used to spin this loop at 100% CPU with the JS thread blocked forever.

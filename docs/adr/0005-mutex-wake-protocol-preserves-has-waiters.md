@@ -33,6 +33,9 @@ parking on it. `tryLock` preserves the bit on acquire. Unlock semantics are
 unchanged: notify one when the bit is set. The bit is intentionally never
 cleared by an unlock — the worst case is one extra FUTEX_WAKE (~0.16 µs)
 per unlock in a system that HAD waiters, which we accept.
+**[Amended 2026-10-07: unlock's whole-word CAS to 0 DOES clear the bit, and
+the waiter path always ORs — both corrections below supersede this
+paragraph.]**
 
 ## Alternatives considered
 

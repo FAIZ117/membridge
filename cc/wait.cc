@@ -112,12 +112,6 @@ struct Hub {
 std::mutex g_hubs_mu;
 std::map<v8::Isolate*, std::shared_ptr<Hub>> g_hubs;
 
-Hub* HubFor(v8::Isolate* isolate) {
-  std::lock_guard<std::mutex> lock(g_hubs_mu);
-  auto it = g_hubs.find(isolate);
-  return it == g_hubs.end() ? nullptr : it->second.get();
-}
-
 struct WaitNode {
   int32_t* addr;
   uint32_t expected;
@@ -190,8 +184,10 @@ void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
   const std::shared_ptr<Hub> hub = node->hub;  // keeps the hub alive (F18)
   // Do NOT settle here — the resolve point (AsyncCallback or the teardown
   // hook) settles exactly once. Dropping out of the wait set happens via
-  // `cancelled`, which the mux snapshot prunes. The closed-check and the
-  // send happen under the same lock: no send on a closing/closed handle.
+  // `cancelled`, which the mux snapshot prunes. The closed-check happens
+  // under the hub lock; the send itself runs after releasing it (F18):
+  // uv_async_send is thread-safe and idempotent, so a send racing a close
+  // is harmless — a closed handle just ignores it.
   bool send = false;
   if (!node->state->settled.load()) {
     std::lock_guard<std::mutex> lk(hub->mu);
@@ -202,7 +198,7 @@ void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
     }
   }
   node->cancelled = true;
-  if (send) uv_async_send(&hub->async);
+  if (send) uv_async_send(&hub->async);  // after the lock (F18)
 }
 
 // Fallback waiter thread: one per wait (futex where available, bounded poll
@@ -438,31 +434,40 @@ void MuxMain() {
     }
     long r = syscall(__NR_futex_waitv, vec.data(), static_cast<int>(n), 0, tsp, CLOCK_MONOTONIC);
 
-    std::lock_guard<std::mutex> lock(g_mu);
-    // r is the 0-based INDEX of the woken entry (M1 probe pinned this).
-    if (r >= 0 && static_cast<size_t>(r) < snapshot.size()) {
-      Deliver(snapshot[static_cast<size_t>(r)], Fulfill::kOk);
-    } else if (r == -1 && errno == EAGAIN) {
-      // Some word changed before we could park (or the control word moved).
-      // Fulfil every data waiter whose word already differs: the store the
-      // waiter awaits has landed. Skip delivered/cancelled nodes — their
-      // buffer pin may already be gone, so their word may be unmapped (F32).
-      for (size_t i = 0; i < snapshot.size(); i++) {
-        if (snapshot[i]->delivered.load() || snapshot[i]->cancelled) continue;
-        if (*snapshot[i]->addr != static_cast<int32_t>(snapshot[i]->expected)) {
-          // §6 contract parity with sync wait: the value already differs.
-          Deliver(snapshot[i], Fulfill::kNotEqual);
+    bool backoff = false;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      // r is the 0-based INDEX of the woken entry (M1 probe pinned this).
+      if (r >= 0 && static_cast<size_t>(r) < snapshot.size()) {
+        Deliver(snapshot[static_cast<size_t>(r)], Fulfill::kOk);
+      } else if (r == -1 && errno == EAGAIN) {
+        // Some word changed before we could park (or the control word moved).
+        // Fulfil every data waiter whose word already differs: the store the
+        // waiter awaits has landed. Skip delivered/cancelled nodes — their
+        // buffer pin may already be gone, so their word may be unmapped (F32).
+        for (size_t i = 0; i < snapshot.size(); i++) {
+          if (snapshot[i]->delivered.load() || snapshot[i]->cancelled) continue;
+          if (*snapshot[i]->addr != static_cast<int32_t>(snapshot[i]->expected)) {
+            // §6 contract parity with sync wait: the value already differs.
+            Deliver(snapshot[i], Fulfill::kNotEqual);
+          }
         }
-      }
-    } else if (r == -1 && errno == ETIMEDOUT) {
-      const double now = NowMs();
-      for (size_t i = 0; i < snapshot.size(); i++) {
-        if (snapshot[i]->hasTimeout && snapshot[i]->deadlineMs <= now) {
-          Deliver(snapshot[i], Fulfill::kTimedOut);
+      } else if (r == -1 && errno == ETIMEDOUT) {
+        const double now = NowMs();
+        for (size_t i = 0; i < snapshot.size(); i++) {
+          if (snapshot[i]->hasTimeout && snapshot[i]->deadlineMs <= now) {
+            Deliver(snapshot[i], Fulfill::kTimedOut);
+          }
         }
+      } else if (r == -1 && errno != EINTR) {
+        // EINVAL/EFAULT/ENOMEM/…: re-snapshotting immediately would hot-spin
+        // on a persistent failure (review R21) — back off before retrying.
+        // EINTR stays prompt: a signal means something happened.
+        backoff = true;
       }
+      // control-word wake (r == snapshot.size()): re-snapshot and go again.
     }
-    // EINTR / control wake / other: re-snapshot and go again.
+    if (backoff) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 #endif
 }
@@ -496,9 +501,17 @@ void EnsureMux() {
 
 WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
 #if defined(__linux__)
-  const bool infinite = timeoutMs != timeoutMs;  // NaN = infinite
+  const bool infinite = timeoutMs != timeoutMs;  // NaN = no-timeout sentinel (bindings)
+  if (!infinite && !(timeoutMs > 0)) {
+    // Zero or negative timeout: check once, never park (review R21 —
+    // InitOrJoin recomputes `remaining` after its deadline check, so a
+    // sub-µs window used to hit the 1e15 clamp and park until someone
+    // else touches the word, far beyond the caller's deadline).
+    return *addr != static_cast<int32_t>(expected) ? WaitResult::kNotEqual
+                                                   : WaitResult::kTimedOut;
+  }
   double timeout = timeoutMs;
-  if (!(timeout > 0) || timeout > 1e15) timeout = 1e15;  // clamp (review F9)
+  if (timeout > 1e15) timeout = 1e15;  // ~31,700 years: saturation, not wrap (review F9)
   const double deadline = infinite ? 0 : NowMs() + timeout;  // absolute
   for (;;) {
     struct timespec ts;
@@ -659,6 +672,17 @@ bool StartAsyncWait(v8::Isolate* isolate, v8::Local<v8::Promise::Resolver> resol
   bool onThread = false;
   {
     std::lock_guard<std::mutex> lock(g_mu);
+    // Prune terminal entries before budgeting (review F37): cancelled or
+    // already-settled nodes are only erased by the mux's own loop, so a
+    // burst of timeouts would otherwise count against kMuxCapacity until
+    // the mux happened to wake.
+    for (auto it = g_pending.begin(); it != g_pending.end();) {
+      if ((*it)->cancelled || (*it)->state->settled.load()) {
+        it = g_pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
     const size_t pending = g_pending.size();
     if (g_waitvOk && pending < kMuxCapacity) {
       g_pending.push_back(node);

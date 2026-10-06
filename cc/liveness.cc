@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
 
 #if defined(__linux__)
@@ -86,10 +87,14 @@ int64_t ReadPidNsInode(int32_t pid) {
 
 Identity SelfIdentity() {
   // Per-thread cache (review P7): startTime and the pid-ns inode are process
-  // constants; re-read only when the pid changes.
+  // constants; re-read only when the pid changes. A FAILED read is not cached
+  // (review R19): a transient EMFILE at a thread's first read must not pin
+  // startTime=-1 (or an unknown ns) on the thread forever — every later claim
+  // would stamp -1, and a -1 identity is judged Unknown = never steal.
   static thread_local struct {
     int32_t pid = -1;
     int32_t tid = -1;
+    bool startValid = false;
     int64_t start = -1;
     int64_t ns = -1;
   } cache;
@@ -98,14 +103,21 @@ Identity SelfIdentity() {
   if (cache.pid != pid || cache.tid != tid) {
     cache.pid = pid;
     cache.tid = tid;
+    cache.startValid = false;
     cache.start = -1;
-    ReadProcStat(pid, &cache.start, nullptr);
-    cache.ns = ReadPidNsInode(0);
+    cache.ns = -1;
+    int64_t start = -1;
+    if (ReadProcStat(pid, &start, nullptr)) {
+      cache.start = start;
+      cache.startValid = true;
+    }
+    const int64_t ns = ReadPidNsInode(0);
+    if (ns > 0) cache.ns = ns;  // -1 (unreadable) stays uncached
   }
   Identity id;
   id.pid = cache.pid;
   id.threadId = cache.tid;
-  id.startTime = cache.start;
+  id.startTime = cache.startValid ? cache.start : -1;
   id.pidNsInode = cache.ns;
   return id;
 }
@@ -113,7 +125,18 @@ Identity SelfIdentity() {
 Liveness CheckLiveness(const Identity& id) {
   if (id.pid <= 0) return Liveness::kDead;
   if (id.startTime < 0) return Liveness::kUnknown;  // identity never recorded: never steal (F25)
-  const int64_t ownNs = ReadPidNsInode(0);
+  // Own pid-ns inode, read once per process (review R18: readlink'ing
+  // /proc/self/ns/pid on every contended mutex pass dominated the steal
+  // path; the namespace of a running process cannot change under it).
+  // A failed read is NOT cached (R19 rule): the cache only settles on a
+  // positive inode, so an unreadable /proc retries on later calls instead
+  // of silently dropping the foreign-namespace never-steal guard forever.
+  static std::atomic<int64_t> ownNsCache{0};  // 0 = unsettled
+  int64_t ownNs = ownNsCache.load(std::memory_order_relaxed);
+  if (ownNs <= 0) {
+    ownNs = ReadPidNsInode(0);
+    if (ownNs > 0) ownNsCache.store(ownNs, std::memory_order_relaxed);
+  }
   if (id.pidNsInode > 0 && ownNs > 0 && id.pidNsInode != ownNs) {
     return Liveness::kUnknown;  // foreign pid namespace: never steal (§7.1)
   }

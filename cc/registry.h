@@ -31,10 +31,12 @@ class Registry {
   // derive per-word kernel-object names from the segment name).
   static std::shared_ptr<Mapping> FindByAddress(const void* addr);
 
-  // True when some OTHER live mapping covers the same base (a second Mapping
-  // this process opened over one segment — review F20): the attach row and
-  // any unlinkWhenUnused decision must not be made unilaterally.
-  bool OthersShareBase(const void* base, const Mapping* self);
+  // True when some OTHER live mapping in this process refers to the same
+  // segment object (review F20): the attach row and any unlinkWhenUnused
+  // decision must not be made unilaterally. Compares recorded object
+  // identity (dev/ino; same name on Windows) — NOT base pointers, which
+  // differ per mmap even for the same segment.
+  bool OthersShareSegment(const Mapping* self);
 
   // All live mappings (debug/ops).
   std::vector<std::shared_ptr<Mapping>> Live();

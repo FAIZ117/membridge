@@ -17,8 +17,11 @@ tail's): CONSUMER_PARKED and PRODUCER_PARKED. The waiting side stores 1,
 RE-CHECKS its condition (JS Atomics are sequentially consistent, so
 flag-then-recheck is race-free), parks, and clears the flag on exit
 (including the found-data path). The notifying side loads the flag after
-advancing its counter and notifies only when set. On Linux ≥5.16 the parked
-wait usually rides the futex_waitv multiplexer.
+advancing its counter and notifies only when set.
+**[Amended 2026-10-07: the parked wait does NOT ride the futex_waitv
+multiplexer — sync paths futex directly on the JS thread and are woken by the
+peer's direct FUTEX_WAKE; async paths ride the mux (or the thread fallback).
+The original sentence described a path that does not exist.]**
 
 ## Alternatives considered
 

@@ -21,7 +21,7 @@ after the owner pushes.
 | `stat(name)` | ✓ | ✓ (native header read) | ✓ (read-only section view) |
 | `list()` | ✓ (magic-filtered readdir) | ✗ `E_UNSUPPORTED` (POSIX shm cannot be enumerated) | ✗ `E_UNSUPPORTED` |
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
-| Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
+| Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
 
 **Correction (2026-10-06 fix round 2):** the macOS sync paths no longer fake
 weak-import declarations of `os_sync` symbols that may not exist (R17) — they
@@ -67,4 +67,16 @@ and on timeout.
   `E_TOO_MANY_WAITERS` (all segments and isolates share the budget).
 - `reap()` is for segments expected idle: it decides from an attach-table
   snapshot, so a joiner claiming a row mid-scan can be unlinked under (it
-  keeps its mapping, POSIX-style).
+  keeps its mapping, POSIX-style). The same benign race exists in the last
+  `Detach`'s unlink decision: a joiner that claims its row between the
+  snapshot and the `shm_unlink` keeps a valid mapping of a now-unlinked
+  object (review R24).
+- **`raw: true` grow is not serialized across processes** (review F31): raw
+  segments have no init lock, so two raw growers both `fstat` the old size and
+  the smaller `ftruncate` can land last — shrinking the file under the other
+  grower's mapping. Do not grow raw segments from multiple processes; use a
+  header segment (its grow takes the init lock).
+- **Mutex participant slots are bounded (64 per segment)**: when all 64 are
+  held by live threads, `claim()` throws `E_TIMEOUT` (review F37). Exited
+  workers free their slots via cleanup hooks; SIGKILLed processes' slots are
+  reclaimed by the §7.1 liveness scan.

@@ -55,8 +55,8 @@ void Mapping::Detach() {
   }
   // Review F20: a second Mapping over the same segment (e.g. after grow)
   // shares the attach row — only the last one in THIS process may release
-  // it and decide unlinkWhenUnused.
-  if (Registry::Get().OthersShareBase(base, this)) {
+  // it and decide unlinkWhenUnused. Compared by object identity, not base.
+  if (Registry::Get().OthersShareSegment(this)) {
     attachSlot = -1;
     return;
   }
@@ -147,11 +147,27 @@ void Registry::Erase(const std::string& name) {
   map_.erase(name);
 }
 
-bool Registry::OthersShareBase(const void* base, const Mapping* self) {
+bool Registry::OthersShareSegment(const Mapping* self) {
   std::lock_guard<std::mutex> lock(mu_);
   for (auto it = map_.begin(); it != map_.end(); ++it) {
     if (auto m = it->second.lock()) {
-      if (m.get() != self && m->base == base) return true;
+      if (m.get() == self) continue;
+      // Review F20: same segment = same object identity, not the same base
+      // address — two Mappings over one segment map it at different
+      // addresses, so a base compare missed them and each side believed it
+      // was the last holder (double row release, premature unlink).
+#if defined(_WIN32)
+      // Sections have no inode: a named section opened under one name is
+      // one kernel object, so the registry key (name) decides.
+      if (m->name == self->name) return true;
+#else
+      if (self->ino != 0 && m->ino != 0) {
+        if (m->dev == self->dev && m->ino == self->ino) return true;
+      } else if (m->name == self->name) {
+        // Identity never recorded (fstat failed): fall back to the name.
+        return true;
+      }
+#endif
     }
   }
   return false;

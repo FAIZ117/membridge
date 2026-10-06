@@ -126,7 +126,7 @@ isNative(): boolean
 | Field | Type | Purpose |
 |-------|------|---------|
 | magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
-| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. Joiners wait on it with native wait (§6); every transition wakes the word. **Protocol (fix round 2026-10-06):** the creator ftruncates the header page immediately after `O_EXCL`, publishes `headerBytes` + its attach row + `initializerSlot`, stores 1, and only then sizes the object fully and stores 2 — a joiner never sees a live creator at state 0. A joiner at state 0 grace-waits (250 ms in `OpenSegment` for the header page, 50 ms for the state word), then wins a 0→1 CAS to initialize. A dead initializer at state 1 is handed back through a 1→0 CAS so exactly ONE joiner wins the 0→1 CAS — no concurrent-WriteHeader war. Takeover is idempotent and rewrites every field. |
+| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. Joiners wait on it with native wait (§6); every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, wins a 0→1 CAS (the initializer baton), publishes `headerBytes` + its attach row + `initializerSlot`, writes the full header, then stores 2 and wakes the word; any throw between the CAS and the ready store restores 0 so another opener can take over. A joiner therefore never sees a live creator at state 0 with a published header. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8) and wins the 0→1 CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer at state 1 is handed back through a 1→0 CAS so exactly ONE joiner wins the 0→1 CAS — no concurrent-WriteHeader war. Takeover is idempotent and rewrites every field. |
 | headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
 | flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
 | attach table | N × 32 B | One slot per attached process: identity (§7.1) + local refcount. ~120 slots with a 4 KiB page. |
@@ -350,11 +350,16 @@ check so it is never evicted; and a stale token can never win a CAS again.
   after which the owner's liveness is checked. **Why a timeout at all:** a dead owner never
   calls `notify`.
 - **Steal:** owner token → slot → identity is dead (§7.1) and slot gen matches the token
-  → CAS `deadToken → myToken`, set `ownerDied = 1`. Losing the CAS just means retry.
+  → CAS `deadToken → myToken`. The flag word is NOT written at steal time: storing
+  `ownerDied = 1` here made the NEXT acquire report the same death twice (review F22) —
+  only the stealer's `lock()` return reports it. Losing the CAS just means retry.
 - **No heartbeat.** **Why:** the owner cannot update a heartbeat while inside a synchronous
   critical section (the event loop is blocked), so a heartbeat timeout would steal from a
   live, busy owner. Stealing on liveness alone is both safe and sufficient.
-- **Unlock:** verify `lockWord` holds my token (else `E_NOT_OWNER`), store `0`, notify one if `HAS_WAITERS`.
+- **Unlock:** verify `lockWord` holds my token (else `E_NOT_OWNER`), CAS `lockWord → 0`
+  (clearing `HAS_WAITERS` with the token; review R24 drift note: the CAS is the whole
+  release), then notify one if the word had `HAS_WAITERS` — the always-OR park (R13)
+  makes a bare-token unlock impossible, so the notify always matches a parked value.
 - **Owner-died is reported, not hidden** (the equivalent of pthread `EOWNERDEAD`):
   `lock()` returns `{ ownerDied: boolean }`; `withLock(fn)` passes it to `fn`.
   **Why:** the protected data may be half-updated; only the caller can repair it.
@@ -365,7 +370,10 @@ check so it is never evicted; and a stale token can never win a CAS again.
   (Linux `FUTEX_LOCK_PI` would require the kernel's TID-based word format, which conflicts
   with the token design and does not exist on macOS/Windows.)
 - **API:** `Mutex.open(name)`, `lock({timeoutMs})`, `tryLock()`, `lockAsync({timeoutMs, signal})`,
-  `unlock()`, `withLock(fn)`, `withLockAsync(fn)`. Timeout → `E_TIMEOUT`.
+  `unlock()`, `withLock(fn)`, `withLockAsync(fn)`. Timeout → `E_TIMEOUT` — including when
+  all 64 participant slots are held by live threads on `claim()` (F37: slot exhaustion is
+  the same bounded "try again later" condition, not a hang). An invalid `timeoutMs`
+  (NaN, ≤ 0, > 2^31 ms) throws `E_NAME_INVALID` before any native call (review R20/R24).
 
 **Alternative considered: OS robust mutexes** (Linux `PTHREAD_MUTEX_ROBUST`, Windows named
 mutex `WAIT_ABANDONED`). Rejected as the primary mechanism: macOS has no robust mutexes

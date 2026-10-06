@@ -5,18 +5,18 @@ shared runners are noisy, and throughput thresholds in tests rot). Machine for
 the numbers below: dev workstation, Linux 7.2.8 x86_64 (Fedora), Node 24.18.0,
 g++ 15.3, Release build, 18 cores, otherwise idle. Re-run with `npm run bench`.
 
-## Results (2026-10-06, after the review fix round)
+## Results (2026-10-06, after fix round 2)
 
 | Bench | Value |
 |-------|-------|
-| contention — same-process `Atomics.add` (5 M ops on a membridge SAB) | ~110–120 M ops/s |
-| contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~175k/s) |
-| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **~0.07 µs/op** (was 0.18 before per-lock native tracking was removed) |
+| contention — same-process `Atomics.add` (5 M ops on a membridge SAB) | ~119 M ops/s |
+| contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~180k/s) |
+| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **~0.06 µs/op** |
 | mutex — 3-way contended handoff | sub-slice handoffs in the standard bench; under TIGHT loops a never-waited newcomer can still erase `HAS_WAITERS` once and cost one wait slice (ADR 0005 residual, bounded) |
 | mutex — holder SIGKILLed → steal (SIGKILL → acquired) | ~0 ms (zombie-aware liveness) |
-| ring — 64 B messages (copying `write`/`read`) | **~3.2 M msgs/s** (~205 MB/s; was ~2.3 M before parked flags) |
-| ring — 4 KiB messages | ~330k msgs/s (~1.36 GB/s) |
-| ring — 64 KiB messages | ~27k msgs/s (~1.8 GB/s) |
+| ring — 64 B messages (copying `write`/`read`) | **~2.9 M msgs/s** (~187 MB/s; run-to-run 2.9–3.2 M) |
+| ring — 4 KiB messages | ~317k msgs/s (~1.3 GB/s) |
+| ring — 64 KiB messages | ~26k msgs/s (~1.7 GB/s) |
 | ring — async (`reserveAsync`/`peekAsync`) with flags | millisecond-scale wake latency (R14 regression test asserts < 50 ms) |
 
 The handoff number changed meaning in the fix round: the bench's pong side

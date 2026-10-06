@@ -1,7 +1,8 @@
 # membridge — Implementation Plan (rev 2)
 
-> **Status: implementation — rev 2 (2026-10-05), revised after review. M1 spike
-> landed: §2 reflects its results; `probes/` holds the re-runnable evidence.**
+> **Status: implemented (rev 2) — M1–M8 landed. §2 reflects the spike's
+> results; `probes/` holds the re-runnable evidence; lasting decisions carry
+> ADRs (docs/adr/0001–0004).**
 > Name `membridge` verified free on npm (registry 404, checked 2026-10-05).
 > Every design decision below carries a **Why** so it can be challenged on its merits.
 > §11 lists what changed from rev 1 and the evidence behind each change.

@@ -14,6 +14,7 @@
 #include "header.h"
 #include "liveness.h"
 #include "segment.h"
+#include "wait.h"
 
 #include <chrono>
 #include <thread>
@@ -217,14 +218,18 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       return;
     }
 
-    // A live initializer is working: wait for ready or timeout.
-    if (std::chrono::steady_clock::now() >= deadline) {
+    // A live initializer is working: native wait on the initState word (it is
+    // i32 and shared — §6), in bounded chunks so initializer death is noticed.
+    const double now = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now >= std::chrono::duration<double, std::milli>(deadline.time_since_epoch()).count()) {
       ThrowError(isolate, "E_INIT_TIMEOUT",
                  "segment initializer did not finish within " +
                      std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
                  name);
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(500));
+    SyncWait(&h->initState, static_cast<uint32_t>(state), 250.0);
   }
 }
 

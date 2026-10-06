@@ -7,6 +7,7 @@
         "cc/segment.cc",
         "cc/registry.cc",
         "cc/header.cc",
+        "cc/wait.cc",
         "cc/liveness.cc"
       ],
       "cflags_cc": ["-std=c++20", "-fexceptions"],

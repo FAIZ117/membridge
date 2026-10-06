@@ -8,9 +8,11 @@
 #include "liveness.h"
 #include "registry.h"
 #include "segment.h"
+#include "wait.h"
 
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -517,6 +519,117 @@ void Guarded(const v8::FunctionCallbackInfo<v8::Value>& args, Fn&& fn) {
   }
 }
 
+// ---- §6 sync primitive -----------------------------------------------------
+
+int32_t* WordAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg, int32_t index) {
+  if (!arg->IsInt32Array()) {
+    ThrowError(isolate, "E_NAME_INVALID",
+               "sync.wait/notify need an Int32Array view over a membridge segment");
+  }
+  v8::Local<v8::Int32Array> view = arg.As<v8::Int32Array>();
+  const size_t words = view->Length();
+  if (index < 0 || static_cast<size_t>(index) >= words) {
+    ThrowError(isolate, "E_NAME_INVALID", "word index out of range");
+  }
+  auto* base = static_cast<int32_t*>(view->Buffer()->Data());
+  return base + view->ByteOffset() / 4 + index;
+}
+
+void SyncWaitJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 3) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "wait(view: Int32Array, index: number, expected: number, timeoutMs?: number)")));
+    return;
+  }
+  const int32_t index = args[1]->Int32Value(ctx).ToChecked();
+  int32_t* addr = WordAddrOf(isolate, args[0], index);
+  const uint32_t expected = static_cast<uint32_t>(args[2]->Int32Value(ctx).ToChecked());
+  double timeoutMs = 0;
+  bool hasTimeout = false;
+  if (args.Length() >= 4 && args[3]->IsNumber()) {
+    timeoutMs = args[3]->NumberValue(ctx).ToChecked();
+    // JS layer sends -1 for "no timeout".
+    if (timeoutMs >= 0) {
+      if (!(timeoutMs > 0)) {
+        isolate->ThrowException(v8::Exception::RangeError(Str(isolate, "timeoutMs must be > 0")));
+        return;
+      }
+      hasTimeout = true;
+    }
+  }
+  const WaitResult r =
+      SyncWait(addr, expected, hasTimeout ? timeoutMs : std::numeric_limits<double>::quiet_NaN());
+  switch (r) {
+    case WaitResult::kOk: args.GetReturnValue().Set(Str(isolate, "ok")); return;
+    case WaitResult::kNotEqual: args.GetReturnValue().Set(Str(isolate, "not-equal")); return;
+    case WaitResult::kTimedOut: args.GetReturnValue().Set(Str(isolate, "timed-out")); return;
+  }
+}
+
+void SyncNotifyJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 2) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "notify(view: Int32Array, index: number, count?: number)")));
+    return;
+  }
+  const int32_t index = args[1]->Int32Value(ctx).ToChecked();
+  int32_t* addr = WordAddrOf(isolate, args[0], index);
+  int count = 2147483647;
+  if (args.Length() >= 3 && !args[2]->IsUndefined()) {
+    const double d = args[2]->NumberValue(ctx).ToChecked();
+    // JS layer sends -1 for the default (wake all waiters).
+    if (d >= 0) {
+      count = static_cast<int>(d > 2147483647.0 ? 2147483647.0 : d);
+    }
+  }
+  args.GetReturnValue().Set(v8::Number::New(isolate, SyncWake(addr, count)));
+}
+
+void SyncWaitAsyncJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 3) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "waitAsync(view: Int32Array, index: number, expected: number, timeoutMs?: number)")));
+    return;
+  }
+  v8::Local<v8::Value> viewVal = args[0];
+  const int32_t index = args[1]->Int32Value(ctx).ToChecked();
+  int32_t* addr = WordAddrOf(isolate, viewVal, index);
+  const uint32_t expected = static_cast<uint32_t>(args[2]->Int32Value(ctx).ToChecked());
+  double timeoutMs = 0;
+  bool hasTimeout = false;
+  if (args.Length() >= 4 && args[3]->IsNumber()) {
+    timeoutMs = args[3]->NumberValue(ctx).ToChecked();
+    // JS layer sends -1 for "no timeout".
+    if (timeoutMs >= 0) {
+      if (!(timeoutMs > 0)) {
+        isolate->ThrowException(v8::Exception::RangeError(Str(isolate, "timeoutMs must be > 0")));
+        return;
+      }
+      hasTimeout = true;
+    }
+  }
+
+  v8::Local<v8::Promise::Resolver> resolver =
+      v8::Promise::Resolver::New(ctx).ToLocalChecked();
+  v8::Local<v8::ArrayBuffer> buf = viewVal.As<v8::Int32Array>()->Buffer();
+  const bool ok = StartAsyncWait(isolate, resolver, buf, addr, expected, timeoutMs, hasTimeout);
+  if (!ok) {
+    v8::Local<v8::Value> err =
+        MakeError(isolate, "E_TOO_MANY_WAITERS", "too many pending async waits");
+    resolver->Reject(ctx, err).Check();
+  }
+  args.GetReturnValue().Set(resolver->GetPromise());
+}
+
 // ---- guarded trampolines ---------------------------------------------------
 // Every JS entry point catches NativeError (JS exception already pending).
 // Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
@@ -540,6 +653,9 @@ MEMBRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
 MEMBRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
 MEMBRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
 MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
+MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
+MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
+MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
 
 void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();  // F16: no Context::GetIsolate in V8 14.6
@@ -555,6 +671,9 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"isNative", IsNativeJs},
       {"debugRegistryHas", DebugRegistryHasJs},
       {"selfIdentity", SelfIdentityJs2},
+      {"syncWait", SyncWaitJs2},
+      {"syncNotify", SyncNotifyJs2},
+      {"syncWaitAsync", SyncWaitAsyncJs2},
   };
   for (const Reg& r : regs) {
     v8::Local<v8::Function> f =

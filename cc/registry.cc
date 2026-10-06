@@ -82,6 +82,14 @@ void Registry::Erase(const std::string& name) {
   map_.erase(name);
 }
 
+std::shared_ptr<Mapping> Registry::FindByAddress(const void* addr) {
+  for (const std::shared_ptr<Mapping>& m : Get().Live()) {
+    const char* base = static_cast<const char*>(m->base);
+    if (addr >= base && addr < base + m->mappingBytes) return m;
+  }
+  return nullptr;
+}
+
 std::vector<std::shared_ptr<Mapping>> Registry::Live() {
   std::lock_guard<std::mutex> lock(mu_);
   std::vector<std::shared_ptr<Mapping>> out;

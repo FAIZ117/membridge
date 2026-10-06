@@ -226,7 +226,7 @@ loop = up to 50 ms per contended handoff). This is the foundation for everything
 |----|-----------|-------|
 | Linux | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG` on the mapped address | Shared futexes are keyed by the underlying page, so they work across processes. 32-bit words only → every waitable word in our layouts is `i32`. |
 | macOS | `os_sync_wait_on_address` / `os_sync_wake_by_address_*` with the SHARED flag (14.4+) | U1. If the spike fails or the OS is older: bounded exponential back-off polling (50 µs → 2 ms), documented as higher latency. |
-| Windows | Per-word named semaphore `Local\membridge-<seg>-w<offset>` + waiter count in shm | U3. Notify releases `min(count, waiters)`. Spurious wakeups allowed; callers re-check the word. |
+| Windows | Per-word named semaphore `Local\membridge-<seg>-w<offset>`; the semaphore's permits are the waiter bookkeeping (no separate shm count) | U3. Notify releases `count` permits — more than waiters is fine: extra permits surface as the spurious wakeups this row already allows, and every waiter re-checks the word. |
 
 - **Sync waits** block the calling JS thread (same as `Atomics.wait`) — documented;
   use `waitAsync` on a server main thread.
@@ -418,7 +418,7 @@ different memory. Ref-counting in the attach table plus `reap()` covers both cas
 
 ## 10. Errors
 
-`MembridgeError extends Error` with `code`, plus structured fields (`name`, `requested`, `existing`, …):
+`MembridgeError extends Error` with `code`, plus structured fields (`segmentName`, `requested`, `existing`, `syscall`, `errno`; "segmentName" rather than `name` because `Error.name` already carries the error-class name):
 
 `E_NAME_INVALID` · `E_SIZE_INVALID` · `E_SIZE_MISMATCH` · `E_EXISTS` · `E_NOT_FOUND` ·
 `E_INCOMPATIBLE` · `E_INIT_TIMEOUT` · `E_NO_SPACE` · `E_GROW_UNSUPPORTED` · `E_NOT_OWNER` ·

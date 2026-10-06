@@ -18,6 +18,10 @@ export interface Native {
   unlink(name: string): void;
   close(name: string): void;
   isNative(): boolean;
+  // §6 sync primitive (-1 = no timeout on the wait calls)
+  syncWait(view: Int32Array, index: number, expected: number, timeoutMs: number): string;
+  syncNotify(view: Int32Array, index: number, count: number): number;
+  syncWaitAsync(view: Int32Array, index: number, expected: number, timeoutMs: number): Promise<string>;
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };

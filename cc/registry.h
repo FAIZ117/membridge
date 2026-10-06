@@ -27,6 +27,10 @@ class Registry {
   // even if it is still alive through live SABs.
   void Erase(const std::string& name);
 
+  // Live mapping whose range contains `addr`, or nullptr (§6 platform paths
+  // derive per-word kernel-object names from the segment name).
+  static std::shared_ptr<Mapping> FindByAddress(const void* addr);
+
   // All live mappings (debug/ops).
   std::vector<std::shared_ptr<Mapping>> Live();
 

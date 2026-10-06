@@ -208,17 +208,15 @@ void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
 // Fallback waiter thread: one per wait (futex where available, bounded poll
 // otherwise). Runs with the node already removed from g_pending.
 #if defined(__APPLE__)
-// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flag. Weak
-// imports keep the addon loadable on older macOS; when the symbols are
-// absent we degrade to the bounded-poll fallback below.
-extern "C" {
-int os_sync_wait_on_address(void* address, uint64_t value, size_t size, uint32_t flags)
-    __attribute__((weak_import));
-int os_sync_wake_by_address_shared(void* address, size_t size, uint32_t flags)
-    __attribute__((weak_import));
-}
-#ifndef OS_SYNC_WAIT_ON_ADDRESS_SHARED
-#define OS_SYNC_WAIT_ON_ADDRESS_SHARED 0x00000001
+// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flag, via the
+// SDK's real header (review R17: hand-declared externs used a nonexistent
+// `_shared` wake export and a wrong-arity timeout call — no compile, and
+// wakes would have been no-ops). Availability is checked at runtime; on
+// older macOS the calls resolve to null and the code falls back to poll.
+#include <AvailabilityMacros.h>
+#if defined(__MAC_14_4) || MAC_OS_X_VERSION_MIN_REQUIRED >= 140400
+#include <os/os_sync_wait_on_address.h>
+#define MEMBRIDGE_HAVE_OS_SYNC 1
 #endif
 #endif
 
@@ -322,12 +320,10 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   // symbols exist (14.4+), else bounded exponential back-off poll (50 us ->
   // 2 ms). The untimed os_sync call was a review finding (P5): a timed
   // waitAsync could never time out without a wake.
-  const bool useTimed =
-      os_sync_wait_on_address_with_timeout != nullptr &&
-      os_sync_wake_by_address_shared != nullptr;
-  const bool usePlain =
-      !useTimed && os_sync_wait_on_address != nullptr &&
-      os_sync_wake_by_address_shared != nullptr;
+  // os_sync has NO timeout parameter: park in bounded slices and re-check
+  // the deadline ourselves (review P5: the untimed call meant a timed
+  // waitAsync could never time out without a wake).
+  const bool useOsSync = os_sync_wait_on_address != nullptr;
   double delayUs = 50;
   for (;;) {
     if (node->cancelled) break;  // resolved by the teardown hook
@@ -335,31 +331,26 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       Deliver(node, Fulfill::kOk);
       break;
     }
-    uint64_t sliceNs = 250ull * 1000000ull;
+    uint32_t sliceMs = 250;
     if (node->hasTimeout) {
       const double rem = node->deadlineMs - NowMs();
       if (rem <= 0) {
         Deliver(node, Fulfill::kTimedOut);
         break;
       }
-      const double sliceMsD = rem > 250.0 ? 250.0 : rem;
-      sliceNs = static_cast<uint64_t>(sliceMsD * 1e6) * 1000ull;
+      sliceMs = static_cast<uint32_t>(rem > 250.0 ? 250.0 : rem);
     }
-    if (useTimed) {
-      os_sync_wait_on_address_with_timeout(
-          node->addr, static_cast<uint64_t>(static_cast<uint32_t>(node->expected)),
-          sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED, sliceNs);
-      // spurious wakes and value changes are re-checked on the next iteration
-    } else if (usePlain) {
-      // pre-14.4 os_sync has no timeout variant: poll it in short slices
+    if (useOsSync) {
       os_sync_wait_on_address(node->addr, static_cast<uint64_t>(
                                               static_cast<uint32_t>(node->expected)),
                               sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
-      std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(sliceNs / 1000)));
-      (void)delayUs;
+      // Spurious wakes and value changes are re-checked on the next
+      // iteration; the deadline is re-checked because the park is untimed.
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
+      (void)sliceMs;
     }
   }
 #else
@@ -527,32 +518,24 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
     return WaitResult::kTimedOut;  // unexpected errno: bounded failure
   }
 #elif defined(__APPLE__)
-  // macOS (U1, unverified locally): os_sync with the timeout variant; the
-  // poll fallback stays for OSes without the symbols.
+  // macOS (U1, unverified locally): os_sync has NO timeout parameter — park
+  // in bounded untimed slices and re-check the word and deadline ourselves
+  // (review P5/R17: the with-timeout call does not exist in the SDK).
   const bool infinite = timeoutMs != timeoutMs;
   const double deadline = infinite ? 0 : NowMs() + timeoutMs;
-  if (os_sync_wait_on_address_with_timeout != nullptr) {
-    for (;;) {
-      if (*addr != static_cast<int32_t>(expected)) return WaitResult::kNotEqual;
-      if (!infinite) {
-        const double rem = deadline - NowMs();
-        if (rem <= 0) return WaitResult::kTimedOut;
-        const uint64_t ns = static_cast<uint64_t>(rem * 1e6) * 1000ull;
-        os_sync_wait_on_address_with_timeout(addr, expected, sizeof(int32_t),
-                                             OS_SYNC_WAIT_ON_ADDRESS_SHARED, ns);
-      } else {
-        os_sync_wait_on_address_with_timeout(
-            addr, expected, sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
-            250ull * 1000000ull);
-      }
-    }
-  }
+  const bool useOsSync = os_sync_wait_on_address != nullptr;
   double delayUs = 50;
   for (;;) {
-    if (*addr != static_cast<int32_t>(expected)) return WaitResult::kOk;
+    if (*addr != static_cast<int32_t>(expected)) return WaitResult::kNotEqual;
     if (!infinite && NowMs() >= deadline) return WaitResult::kTimedOut;
-    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
-    if (delayUs < 2000) delayUs *= 2;
+    if (useOsSync) {
+      os_sync_wait_on_address(addr, expected, sizeof(int32_t),
+                              OS_SYNC_WAIT_ON_ADDRESS_SHARED);
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
+      if (delayUs < 2000) delayUs *= 2;
+    }
   }
 #elif defined(_WIN32)
   // Windows (U3): block on the word's named semaphore in bounded slices and
@@ -602,8 +585,11 @@ int SyncWake(int32_t* addr, int count) {
   return static_cast<int>(
       syscall(SYS_futex, addr, FUTEX_WAKE, static_cast<uint32_t>(count), nullptr, nullptr, 0));
 #elif defined(__APPLE__)
-  if (os_sync_wake_by_address_shared != nullptr) {
-    return os_sync_wake_by_address_shared(addr, sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
+  if (os_sync_wake_by_address_all != nullptr) {
+    // macOS exports _all (no _shared): it may wake waiters on ANY value
+    // change — spurious wakes are within §6's model, and every waiter
+    // re-checks the word.
+    return os_sync_wake_by_address_all(addr, sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
   }
   return 0;  // poll fallback: waiters re-check on their back-off schedule
 #elif defined(_WIN32)

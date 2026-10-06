@@ -126,8 +126,16 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       CloseHandle(existing);
       ThrowSystemError(isolate, "MapViewOfFile", e, name);
     }
+    // Review R16: the mapping size is needed by every downstream check —
+    // query it from the view instead of storing 0 (which made every join
+    // fail E_INCOMPATIBLE and every window clamp to zero).
+    MEMORY_BASIC_INFORMATION mbi{};
+    size_t mapped = 0;
+    if (VirtualQuery(joined, &mbi, sizeof(mbi)) != 0) {
+      mapped = static_cast<size_t>(mbi.RegionSize);
+    }
     h.base = joined;
-    h.mappingBytes = 0;  // whole-section view
+    h.mappingBytes = mapped;
     h.fd = -1;
     h.created = false;
     h.section = existing;

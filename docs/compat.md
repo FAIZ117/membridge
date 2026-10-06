@@ -13,8 +13,8 @@ after the owner pushes.
 | `reserve` (fallocate, E_NO_SPACE) | ✓ | ✗ (no-op; fallocate has no shm meaning there)¹ | ✗ (no-op)¹ |
 | `grow` size policy | ✓ (ftruncate under the init lock) | ✗ → `E_GROW_UNSUPPORTED` if U2 holds (shm objects cannot be re-`ftruncate`d) | ✗ → `E_GROW_UNSUPPORTED` (sections are fixed at `CreateFileMappingW` time) |
 | Header page + attach table | ✓ | ✓ | ✓ |
-| `sync.wait` / `notify` | ✓ verified: shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | implemented: `os_sync` SHARED **with timeout**, weak-linked, else bounded poll (50 µs → 2 ms) — **CI-unverified (U1)** | implemented: named semaphores per word, chunked bounded releases — **CI-unverified (U3)** |
-| `sync.waitAsync` | ✓ verified: `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | implemented: one thread per wait over `os_sync_with_timeout`/poll — **CI-unverified (U1)** | implemented: one thread per wait over semaphores — **CI-unverified (U3)** |
+| `sync.wait` / `notify` | ✓ verified: shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | implemented (R17): `os_sync_wait_on_address`/`os_sync_wake_by_address_all` when the SDK declares them (macOS ≥ 14.4), untimed parks in bounded slices with deadline re-check; else bounded poll (50 µs) — **CI-unverified (U1)** | implemented: named semaphores per word, chunked bounded releases — **CI-unverified (U3)** |
+| `sync.waitAsync` | ✓ verified: `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | implemented (R17): wait thread over untimed `os_sync_wait_on_address` slices / poll — **CI-unverified (U1)** | implemented: one thread per wait over semaphores — **CI-unverified (U3)** |
 | `Mutex` | ✓ | ✓ | ✓ |
 | `RingBuffer` | ✓ | ✓ | ✓ |
 | `capacity()` | ✓ (`statfs /dev/shm`) | ✗ `E_UNSUPPORTED` | ✗ `E_UNSUPPORTED` |
@@ -23,11 +23,13 @@ after the owner pushes.
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
 | Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
 
-**Correction (2026-10-06 fix round):** before this round this matrix marked the
-macOS/Windows mechanism rows ✓ from source reading only — the code did not
-even compile there (review F19) and the sync paths fell back to polling on
-macOS. The rows above now say implemented/verified honestly; the first CI run
-on those runners is the gate for flipping them to ✓.
+**Correction (2026-10-06 fix round 2):** the macOS sync paths no longer fake
+weak-import declarations of `os_sync` symbols that may not exist (R17) — they
+compile against the real SDK headers, gated on `__MAC_14_4`, and use
+`os_sync_wake_by_address_all` (the only one of the three wake exports that
+actually ships). Windows join now derives its mapping extent from `VirtualQuery`
+instead of assuming zero (R16). Both remain **CI-unverified** until the first
+runner build passes; do not ship non-Linux claims before that.
 
 ¹ The option is accepted everywhere; on non-Linux it does nothing (lazy tmpfs
 charge is a Linux tmpfs property). `docs` say so; the create still cannot

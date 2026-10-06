@@ -62,12 +62,16 @@ void Mapping::Detach() {
   }
   auto* h = static_cast<Header*>(base);
   if (h != nullptr) {
-    ReleaseAttachRow(h, attachSlot);
+    ReleaseAttachRow(h, attachSlot);  // slot index was validated at claim
     // §9 unlinkWhenUnused: the detach that empties the attach table unlinks
     // the name, so late joiners cannot resurrect an abandoned segment.
     if (unlinkWhenUnused) {
       bool anyAttached = false;
-      const uint32_t n = AttachSlotCount(h->headerBytes);
+      // Frozen row count (review R4): never re-derive from the shared
+      // headerBytes field here — Detach can run on any GC thread.
+      const uint32_t n = attachSlotCount != 0
+                             ? attachSlotCount
+                             : RowCountBounded(h->headerBytes, mappingBytes);
       for (uint32_t i = 0; i < n; i++) {
         if (AtomicSlotRefcount(&h->attachTable[i])->load(std::memory_order_acquire) > 0) {
           anyAttached = true;

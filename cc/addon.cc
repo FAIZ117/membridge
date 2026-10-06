@@ -260,7 +260,10 @@ uint64_t HeaderDataBytes(Header* h) {
 // Returns false when the caller must run a full open.
 bool TryReuse(v8::Isolate* isolate, const std::shared_ptr<Mapping>& m, const OpenOpts& opts,
               bool haveSize, uint64_t requested, uint64_t* windowBytes) {
-  const uint64_t existing = m->raw ? m->dataBytes : HeaderDataBytes(static_cast<Header*>(m->base));
+  const uint64_t existing =
+      m->raw ? m->dataBytes
+             : reinterpret_cast<std::atomic<uint64_t>*>(&static_cast<Header*>(m->base)->dataBytes)
+                   ->load(std::memory_order_acquire);
   uint64_t want = existing;
   if (haveSize) {
     switch (opts.sizePolicy) {
@@ -278,7 +281,10 @@ bool TryReuse(v8::Isolate* isolate, const std::shared_ptr<Mapping>& m, const Ope
         break;
     }
   }
-  if (want > m->dataBytes) return false;  // mapping too small for the window
+  // Review R3/R5: the live header may describe a segment grown past what the
+  // CACHED mapping covers — reuse is only valid when the mapping itself can
+  // hold the window. Otherwise fall through to a full open, which re-maps.
+  if (want > m->mappingBytes - m->headerBytes) return false;
   *windowBytes = want;
   return true;
 }
@@ -377,87 +383,117 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   int attachSlot = -1;
   bool ownsRow = false;
+  uint64_t existing = 0;  // geometry read ONCE by InitOrJoin (review R5)
   if (!opts.raw) {
-    // The takeover path of InitOrJoin rewrites dataBytes; for a size-less
-    // join the honest value is the file size minus the header.
-    const uint64_t initBytes =
-        haveSize ? requested : (guard.h.mappingBytes > headerBytes ? guard.h.mappingBytes - headerBytes : 0);
+    const uint64_t initBytes = haveSize ? requested : 0;
     InitOrJoin(isolate, guard.h, name, opts, headerBytes, initBytes, kindFlags, &attachSlot,
-               &ownsRow);
+               &ownsRow, &existing, haveSize);
 
-    // Grow (§5.3): re-enter the init lock and ftruncate up, then re-map so
-    // the mapping covers the new size. GrowSegment returns 0 when it lost the
-    // lock race — retry the policy against the refreshed header instead of
-    // returning a window past the object (review F8).
-    Header* h = static_cast<Header*>(guard.h.base);
+    // Review R23: a policy throw after InitOrJoin claimed a row used to leak
+    // the row for the process's lifetime. This guard releases it on unwind;
+    // disarmed once the Mapping adopts the row.
+    struct RowGuard {
+      Header* hdr;
+      int slot;
+      bool armed = true;
+      ~RowGuard() {
+        if (armed && hdr != nullptr && slot >= 0) ReleaseAttachRow(hdr, slot);
+      }
+    } rowGuard{static_cast<Header*>(guard.h.base), ownsRow ? attachSlot : -1};
+
     if (haveSize && opts.sizePolicy == SizePolicy::kGrow) {
-      const double giveUp =
+      const double giveUpAt =
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now().time_since_epoch())
               .count() + opts.initTimeoutMs;
-      while (HeaderDataBytes(h) < requested) {
-        const uint64_t grown = GrowSegment(isolate, guard.h, name, opts, headerBytes, requested);
-        h = static_cast<Header*>(guard.h.base);  // GrowSegment may re-map
+      while (existing < requested) {
+        const uint64_t grown = GrowSegment(isolate, guard.h, name, opts, headerBytes, requested,
+                                           opts.maxSegmentBytes);
         if (grown == 0) {
           const double nowMs =
               std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now().time_since_epoch())
                   .count();
-          if (nowMs >= giveUp) {
+          if (nowMs >= giveUpAt) {
             ThrowError(isolate, "E_INIT_TIMEOUT", "segment busy (growing) for too long", name);
           }
           continue;
         }
+        existing = grown;  // GrowSegment re-mapped the handle (winner path)
       }
+      // Review R3: a lost race (another process grew past `requested` while we
+      // waited) exits the loop without our own re-map — refresh the geometry
+      // ONCE more and re-map to cover it.
+      existing = EnsureMappingCovers(isolate, guard.h, name, headerBytes, opts.maxSegmentBytes);
     }
 
-    const uint64_t nowExisting = HeaderDataBytes(h);
-    if (haveSize && opts.sizePolicy == SizePolicy::kExact && nowExisting != requested) {
-      ThrowSizeMismatch(isolate, name, requested, nowExisting);
-    } else if (haveSize && opts.sizePolicy == SizePolicy::kAtLeast && requested > nowExisting) {
-      ThrowSizeMismatch(isolate, name, requested, nowExisting);
+    if (haveSize && opts.sizePolicy == SizePolicy::kExact && existing != requested) {
+      ThrowSizeMismatch(isolate, name, requested, existing);
+    } else if (haveSize && opts.sizePolicy == SizePolicy::kAtLeast && requested > existing) {
+      ThrowSizeMismatch(isolate, name, requested, existing);
     }
+
+    const uint64_t maxWindow = guard.h.mappingBytes > headerBytes
+                                   ? guard.h.mappingBytes - headerBytes
+                                   : 0;
+    const uint64_t wanted = haveSize ? requested : existing;
+    if (wanted > maxWindow) {
+      // Never a silent short window (review R3/R5): the mapping could not be
+      // widened to cover the request — fail loudly.
+      ThrowSizeMismatch(isolate, name, requested, maxWindow);
+    }
+
+    auto m = std::make_shared<Mapping>();
+    m->base = guard.h.base;
+    m->mappingBytes = guard.h.mappingBytes;
+    m->dataBytes = existing;
+    m->headerBytes = headerBytes;
+    m->raw = opts.raw;
+    m->fd = guard.h.fd;
+    m->name = name;
+    m->unlinkWhenUnused = opts.unlinkWhenUnused;
+    m->attachSlot = ownsRow ? attachSlot : -1;
+    m->attachSlotCount = RowCountBounded(headerBytes, guard.h.mappingBytes);
+#ifdef _WIN32
+    m->section = guard.h.section;
+#endif
+    guard.h.base = nullptr;
+    guard.h.fd = -1;
+#ifdef _WIN32
+    guard.h.section = nullptr;
+#endif
+    rowGuard.armed = false;  // the Mapping owns the row now
+    RecordIdentity(*m);  // dev/ino for reuse validation (review F16)
+    Registry::Get().Put(name, m);
+    args.GetReturnValue().Set(MakeWindow(isolate, m, headerBytes, wanted));
+    return;
   }
-  // raw: OpenSegment enforced exact/at-least/grow against st_size before mmap.
 
-  // Authoritative sizes for the Mapping + window. The mapping is the truth:
-  // every window is clamped to mappingBytes - headerBytes (review Sec F1) —
-  // InitOrJoin already validated the header against this bound, so the clamp
-  // is defense in depth.
-  const uint64_t maxWindow =
-      opts.raw ? guard.h.mappingBytes
-               : (guard.h.mappingBytes > headerBytes ? guard.h.mappingBytes - headerBytes : 0);
-  const uint64_t headerExisting =
-      opts.raw ? 0 : HeaderDataBytes(static_cast<Header*>(guard.h.base));
-  const uint64_t wanted =
-      haveSize ? requested : (opts.raw ? guard.h.mappingBytes : headerExisting);
-  const uint64_t windowBytes = wanted > maxWindow ? maxWindow : wanted;
-  const uint64_t mappedDataBytes = windowBytes;
-
-  auto m = std::make_shared<Mapping>();
-  m->base = guard.h.base;
-  m->mappingBytes = guard.h.mappingBytes;
-  m->dataBytes = mappedDataBytes;
-  m->headerBytes = headerBytes;
-  m->raw = opts.raw;
-  m->fd = guard.h.fd;
-  m->name = name;
-  m->unlinkWhenUnused = opts.unlinkWhenUnused;
-  RecordIdentity(*m);
-  // Only the Mapping that claimed the attach row releases it (a second
-  // Mapping over the same segment in this process shares the row).
-  m->attachSlot = ownsRow ? attachSlot : -1;
+  // raw path: OpenSegment enforced exact/at-least/grow against st_size.
+  {
+    auto m = std::make_shared<Mapping>();
+    m->base = guard.h.base;
+    m->mappingBytes = guard.h.mappingBytes;
+    m->dataBytes = guard.h.mappingBytes;
+    m->headerBytes = 0;
+    m->raw = true;
+    m->fd = guard.h.fd;
+    m->name = name;
+    m->unlinkWhenUnused = opts.unlinkWhenUnused;
 #ifdef _WIN32
-  m->section = guard.h.section;
+    m->section = guard.h.section;
 #endif
-  guard.h.base = nullptr;  // ownership moved into the Mapping
-  guard.h.fd = -1;
+    guard.h.base = nullptr;
+    guard.h.fd = -1;
 #ifdef _WIN32
-  guard.h.section = nullptr;
+    guard.h.section = nullptr;
 #endif
-  Registry::Get().Put(name, m);
+    RecordIdentity(*m);
+    Registry::Get().Put(name, m);
+    args.GetReturnValue().Set(MakeWindow(isolate, m, 0, m->mappingBytes));
+    return;
+  }
 
-  args.GetReturnValue().Set(MakeWindow(isolate, m, headerBytes, windowBytes));
 }
 
 void Unlink(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -677,11 +713,18 @@ void SyncWaitAsyncJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 // ---- §7 mutex support (CAS protocol lives in JS; native does liveness) -----
 
-int32_t* DataAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
+int32_t* DataAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg, size_t minBytes) {
   if (!arg->IsInt32Array()) {
     ThrowError(isolate, "E_NAME_INVALID", "expected an Int32Array over the mutex data region");
   }
   v8::Local<v8::Int32Array> view = arg.As<v8::Int32Array>();
+  // Review R5: a view shorter than the layout the native side assumes lets
+  // slot/lock accesses run past the SAB (and possibly the mapping).
+  if (view->Buffer()->ByteLength() < minBytes) {
+    ThrowError(isolate, "E_SIZE_INVALID",
+               "view is smaller than the layout requires (" + std::to_string(minBytes) +
+                   " bytes)");
+  }
   return static_cast<int32_t*>(view->Buffer()->Data()) + view->ByteOffset() / 4;
 }
 
@@ -696,7 +739,7 @@ void MutexClaimSlotJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   }
   v8::String::Utf8Value nameArg(isolate, args[0]);
-  int32_t* data = DataAddrOf(isolate, args[1]);
+  int32_t* data = DataAddrOf(isolate, args[1], kMutexDataBytes);
   const uint32_t token = MutexClaimSlot(isolate, data, std::string(*nameArg, nameArg.length()));
   v8::Local<v8::Object> o = v8::Object::New(isolate);
   o->Set(ctx, Str(isolate, "slot"),
@@ -717,7 +760,7 @@ void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
         v8::Exception::TypeError(Str(isolate, "mutexOwnerAlive(view, token)")));
     return;
   }
-  int32_t* data = DataAddrOf(isolate, args[0]);
+  int32_t* data = DataAddrOf(isolate, args[0], kMutexDataBytes);
   const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
   args.GetReturnValue().Set(
       v8::Boolean::New(isolate, MutexOwnerAlive(data, token, kMutexHeaderWords, kMutexSlotCount)));
@@ -776,8 +819,8 @@ void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   }
   v8::String::Utf8Value nameArg(isolate, args[0]);
-  int32_t* data = DataAddrOf(isolate, args[1]);
   const bool isProducer = args[2]->BooleanValue(isolate);
+  int32_t* data = DataAddrOf(isolate, args[1], 256);  // ring header words
   const uint32_t token = RingClaimRole(
       isolate, std::string(*nameArg, nameArg.length()), data,
       isProducer ? kRingProducerWord : kRingConsumerWord, isProducer ? 0 : 1);

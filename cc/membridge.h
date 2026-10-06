@@ -70,6 +70,9 @@ struct Mapping {
   std::string name;
   int fd = -1;  // POSIX: kept open so `grow` can ftruncate
   int attachSlot = -1;  // claimed attach-table row, -1 = none (raw or overflow)
+  // Row count frozen at open from the validated local headerBytes bounded by
+  // the mapping (review R4): Detach never re-derives it from shared memory.
+  uint32_t attachSlotCount = 0;
   bool unlinkWhenUnused = false;  // §9: the last detacher unlinks the name
   // POSIX object identity: detects another process's unlink+recreate of the
   // same name (review F16/F21). Zero on Windows (sections have no inode).

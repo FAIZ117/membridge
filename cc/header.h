@@ -87,31 +87,56 @@ inline uint32_t EffectiveHeaderBytes() {
 // Attach-table row ops. Claim wins a CAS on refcount 0 -> 1, then writes the
 // identity (the row is exclusively ours while claimed). Returns the row index
 // or -1 (table full — caller sets ATTACH_OVERFLOW).
-int ClaimAttachRow(Header* h, const Identity& self);
-void ReleaseAttachRow(Header* h, int slot);
-// Release rows whose identity is provably dead (§7.1). Returns rows freed.
-int ReleaseDeadRows(Header* h);
 // Find/claim this process's row (per-process attachment, threadId 0).
 // *outOwned is true when this call claimed a fresh row — only the claiming
 // Mapping releases it on detach (a second Mapping over the same segment in
 // this process, e.g. after grow-replaces-entry, shares the row).
-int EnsureAttachedRow(Header* h, const Identity& self, bool* outOwned);
+// `nslots` is the row count computed ONCE from the validated local
+// headerBytes and bounded by the mapping (review R4) — never re-derived from
+// the shared headerBytes field inside the scan.
+int EnsureAttachedRow(Header* h, const Identity& self, bool* outOwned, uint32_t nslots);
+int ClaimAttachRow(Header* h, const Identity& self, uint32_t nslots);
+void ReleaseAttachRow(Header* h, int slot);
+int ReleaseDeadRows(Header* h, uint32_t nslots);
+
+// Row count bounded by both the (locally validated) headerBytes and the real
+// mapping — the only correct way to derive it (review R4).
+inline uint32_t RowCountBounded(uint32_t headerBytes, size_t mappingBytes) {
+  const uint32_t byHeader = AttachSlotCount(headerBytes);
+  const uint64_t byMapping =
+      mappingBytes > sizeof(Header) ? (mappingBytes - sizeof(Header)) / sizeof(AttachSlot) : 0;
+  return static_cast<uint32_t>(byHeader < byMapping ? byHeader : byMapping);
+}
 
 struct SegmentHandle;
 struct OpenOpts;
 
 // The §5.2 create/join + init protocol. `handle` is an open segment (POSIX fd
 // still open); on success the header is ready, *outSlot holds our attach row
-// (-1 for raw or when the table overflowed) and *outOwned whether we claimed it.
+// (-1 for raw or when the table overflowed), *outOwned whether we claimed it,
+// and *outDataBytes carries the geometry read ONCE from the header after
+// validation (the caller must never re-read it — review R5). `mayInitialize`
+// is false for size-less joins, which wait for a ready segment instead of
+// taking a dead initializer's place (review R6).
 void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& name,
                 const OpenOpts& opts, uint32_t headerBytes, uint64_t dataBytes,
-                uint32_t kindFlags, int* outSlot, bool* outOwned);
+                uint32_t kindFlags, int* outSlot, bool* outOwned, uint64_t* outDataBytes,
+                bool mayInitialize);
+
+// Post-ready geometry refresh (review R2/R3): snapshot dataBytes once,
+// validate it against the caller's cap and the REAL file size, and re-map the
+// handle so the mapping covers headerBytes + dataBytes. Returns the snapshot.
+// E_INCOMPATIBLE when the file cannot back the header's claim.
+uint64_t EnsureMappingCovers(v8::Isolate* isolate, SegmentHandle& handle, const std::string& name,
+                             uint32_t headerBytes, uint64_t maxSegmentBytes);
 
 // Grow the data region (POSIX only, §5.3): ftruncate up under the init lock
 // and update dataBytes. Returns 0 if another holder is busy (caller retries
 // the policy); throws E_GROW_UNSUPPORTED on Windows, E_SYSTEM on failure.
+// On failure the init state is restored to ready before throwing (review R8).
 uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::string& name,
-                     const OpenOpts& opts, uint32_t headerBytes, uint64_t newDataBytes);
+                     const OpenOpts& opts, uint32_t headerBytes, uint64_t newDataBytes,
+                     uint64_t maxSegmentBytes);
 
 }  // namespace membridge
 

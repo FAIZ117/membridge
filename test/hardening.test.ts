@@ -55,10 +55,11 @@ test('Corr F6: zero-length object joined size-less is recovered, not SIGBUS', { 
   const name = uniqueName();
   try {
     fs.writeFileSync(shmPath(name)!, Buffer.alloc(0));
-    // RingConsumer.open joins size-less; on a crashed producer it must get a
-    // clean error, never a crash (this used to SIGBUS on the header read).
-    assert.throws(() => RingConsumer.open(name), (e: any) =>
-      e.code === 'E_INCOMPATIBLE' || e.code === 'E_SIZE_INVALID');
+    // R6 semantics: a size-less join NEVER initializes a crashed creator's
+    // 0-byte object (that used to publish a ready 0-byte segment, and before
+    // that SIGBUS on the header read). It waits, then fails cleanly.
+    assert.throws(() => RingConsumer.open(name, { initTimeoutMs: 300 }), (e: any) =>
+      e.code === 'E_INIT_TIMEOUT');
   } finally {
     unlinkQuietly(name);
   }
@@ -377,4 +378,96 @@ test('Corr F30: reserveAsync and peekAsync work end to end', async () => {
   } finally {
     unlinkQuietly(name);
   }
+});
+
+test('R1: cross-process prefix / smaller-size opens work', () => {
+  const name = uniqueName();
+  try {
+    open(name, 8192, { mode: 'create' });
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+    const run = (code: string) =>
+      spawnSync(process.execPath, ['-e', code], {
+        env: { ...process.env, MX_NAME: name },
+        encoding: 'utf8',
+      });
+    // at-least smaller: maps the prefix over the re-mapped full object
+    const a = run(`const {open}=require(${JSON.stringify(require.resolve('../src/core'))});
+      const s=open(process.env.MX_NAME,4096,{sizePolicy:'at-least'});
+      new Uint8Array(s)[4095]=9; console.log('OK',s.byteLength);`);
+    assert.match(a.stdout, /OK 4096/, 'at-least prefix works cross-process');
+    // grow not-larger: an at-least-style window, no E_INCOMPATIBLE
+    const g = run(`const {open}=require(${JSON.stringify(require.resolve('../src/core'))});
+      const s=open(process.env.MX_NAME,4096,{sizePolicy:'grow'});
+      console.log('OK',s.byteLength);`);
+    assert.match(g.stdout, /OK 4096/, 'grow with smaller size works');
+    // exact smaller: E_SIZE_MISMATCH (not E_INCOMPATIBLE)
+    const e = run(`const {open}=require(${JSON.stringify(require.resolve('../src/core'))});
+      try { open(process.env.MX_NAME,4096); console.log('BAD ok'); }
+      catch (err) { console.log('THREW', err.code); }`);
+    assert.match(e.stdout, /THREW E_SIZE_MISMATCH/, 'exact smaller -> E_SIZE_MISMATCH');
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('R2: concurrent create/join produces no spurious E_INCOMPATIBLE', async () => {
+  const name = uniqueName();
+  const { spawn } = require('node:child_process') as typeof import('node:child_process');
+  try {
+    const joinerCode = `
+      const { open } = require(${JSON.stringify(require.resolve('../src/core'))});
+      for (let k = 0; k < 150; k++) {
+        try { open(process.env.MX_NAME, 65536, { mode: 'join' }); }
+        catch (e) {
+          if (e.code === 'E_INCOMPATIBLE') { console.log('SPURIOUS'); }
+          else if (e.code !== 'E_NOT_FOUND') { console.log('OTHER', e.code); }
+        }
+      }`;
+    const kids = [0, 1, 2, 3].map(() =>
+      spawn(process.execPath, ['-e', joinerCode],
+        { stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, MX_NAME: name } }));
+    const creator = spawn(process.execPath, ['-e', `
+      const { open, unlink } = require(${JSON.stringify(require.resolve('../src/core'))});
+      const name = process.env.MX_NAME;
+      for (let k = 0; k < 150; k++) { open(name, 65536, { mode: 'create' }); unlink(name); }
+    `], { stdio: 'ignore', env: { ...process.env, MX_NAME: name } });
+    let bad = '';
+    for (const k of kids) k.stdout.on('data', (d: Buffer) => { bad += d.toString(); });
+    await Promise.all(kids.map((k: any) => new Promise(r => k.on('exit', r))));
+    await new Promise(r => creator.on('exit', r));
+    assert.ok(!bad.includes('SPURIOUS') && !bad.includes('OTHER'),
+      `spurious failures under create/join race: ${bad.trim()}`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('R3: a grow that lost the race still returns a full window', async () => {
+  const name = uniqueName();
+  try {
+    open(name, 4096, { mode: 'create' });
+    // child grows to 1 MiB while we hold a small cached mapping
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+    const r = spawnSync(process.execPath, ['-e', `
+      const { open } = require(${JSON.stringify(require.resolve('../src/core'))});
+      open(${JSON.stringify(name)}, 1048576, { sizePolicy: 'grow' });
+    `], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    // our own grow-open: header already >= requested, so no grow runs — the
+    // mapping must still be re-mapped to cover the window (R3: used to
+    // silently return a 4096-byte SAB).
+    const big = open(name, 1048576, { sizePolicy: 'grow' });
+    assert.strictEqual(big.byteLength, 1048576, 'window covers the request');
+    new Uint8Array(big)[1048575] = 1;  // last byte backed: no SIGBUS
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('R4/R5 hostile geometry races: native view guards', () => {
+  const b = (require('../src/native') as typeof import('../src/native')).nativeOrThrow();
+  // A view shorter than the mutex layout is rejected before any slot access.
+  const short = new Int32Array(new SharedArrayBuffer(64));
+  assert.throws(() => b.mutexClaimSlot('/membridge-test-x', short), (e: any) =>
+    e.code === 'E_SIZE_INVALID');
 });

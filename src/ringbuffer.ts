@@ -329,9 +329,9 @@ export class RingConsumer {
   }
 
   /** Join as the consumer (SPSC: one live consumer per ring). */
-  static open(name: string, opts?: { winGlobal?: boolean }): RingConsumer {
+  static open(name: string, opts?: { winGlobal?: boolean; initTimeoutMs?: number }): RingConsumer {
     const b = nativeOrThrow();
-    const sab = open(name, { kind: 'ring', winGlobal: opts?.winGlobal });
+    const sab = open(name, { kind: 'ring', winGlobal: opts?.winGlobal, initTimeoutMs: opts?.initTimeoutMs });
     const capacity = sab.byteLength - RING_HEADER_BYTES;
     if (capacity < MIN_CAPACITY || (capacity & (capacity - 1)) !== 0) {
       throw new MembridgeError('E_INCOMPATIBLE', 'segment is not a membridge ring', {

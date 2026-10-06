@@ -248,29 +248,44 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       }
       if (!created && wholeObject) total = static_cast<uint64_t>(fileSize);
     } else if (created) {
-      // Creator: back the header page IMMEDIATELY so joiners can never see a
-      // sub-header-page object for long, and never map past EOF ourselves.
-      // Full sizing (+ reserve) happens in InitOrJoin once state = 1 makes us
-      // the sole, visible initializer.
-      if (::ftruncate(fd, static_cast<off_t>(headerBytes)) != 0) {
+      // Creator: size the WHOLE object in one ftruncate (review R9 — two
+      // truncates would break macOS U2, and Open's window logic assumes the
+      // mapping covers header+data). Failure unlinks the object so a bad
+      // create never strands a half-sized name (review R9).
+      if (::ftruncate(fd, static_cast<off_t>(requestedTotal)) != 0) {
         const int e = errno;
         ::close(fd);
         ::shm_unlink(obj.c_str());
         ThrowSystemError(isolate, "ftruncate", e, name);
       }
-      total = headerBytes;
+#if defined(__linux__)
+      if (opts.reserve) {
+        const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(requestedTotal));
+        if (rc != 0) {
+          ::close(fd);
+          ::shm_unlink(obj.c_str());
+          ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+        }
+      }
+#endif
+      total = requestedTotal;
     } else {
       // Joiner: wait briefly for a mid-init creator to publish the header
       // page; a creator that died before even that is taken over after the
       // grace period (everyone truncates to exactly headerBytes — idempotent,
       // no shrink war) and the §5.2 CAS serializes real initialization.
       if (fileSize < static_cast<off_t>(headerBytes)) {
+        // Grace-wait for a mid-init creator to publish the header page.
+        // Backoff poll from 50 µs (review R22: the flat 2 ms sleep put a
+        // 2 ms floor on every racing join).
         const auto graceStart = std::chrono::steady_clock::now();
+        int delayUs = 50;
         while (fileSize < static_cast<off_t>(headerBytes)) {
           if (std::chrono::steady_clock::now() - graceStart > std::chrono::milliseconds(250)) {
             break;
           }
-          ::usleep(2000);
+          ::usleep(static_cast<useconds_t>(delayUs));
+          if (delayUs < 2000) delayUs *= 2;
           if (::fstat(fd, &st) != 0) {
             const int e = errno;
             ::close(fd);
@@ -278,11 +293,21 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
           }
           fileSize = st.st_size;
         }
-        if (fileSize < static_cast<off_t>(headerBytes)) {
+        // Take over the page — GROW-ONLY (review R8): re-fstat immediately
+        // before truncating so a takeover that sized the object in between is
+        // never shrunk under a live mapping.
+        if (::fstat(fd, &st) != 0) {
+          const int e = errno;
+          ::close(fd);
+          ThrowSystemError(isolate, "fstat", e, name);
+        }
+        if (st.st_size < static_cast<off_t>(headerBytes)) {
           if (::ftruncate(fd, static_cast<off_t>(headerBytes)) != 0) {
             ThrowSystemError(isolate, "ftruncate", errno, name);
           }
           fileSize = static_cast<off_t>(headerBytes);
+        } else {
+          fileSize = st.st_size;
         }
         h.waitedForCreator = true;
       }

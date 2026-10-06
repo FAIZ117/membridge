@@ -31,6 +31,11 @@ class Registry {
   // derive per-word kernel-object names from the segment name).
   static std::shared_ptr<Mapping> FindByAddress(const void* addr);
 
+  // True when some OTHER live mapping covers the same base (a second Mapping
+  // this process opened over one segment — review F20): the attach row and
+  // any unlinkWhenUnused decision must not be made unilaterally.
+  bool OthersShareBase(const void* base, const Mapping* self);
+
   // All live mappings (debug/ops).
   std::vector<std::shared_ptr<Mapping>> Live();
 
@@ -38,6 +43,12 @@ class Registry {
   std::mutex mu_;
   std::map<std::string, std::weak_ptr<Mapping>> map_;
 };
+
+// POSIX object-identity helpers (review F16/F21). NameRefersTo compares a
+// fresh shm_open+fstat against the Mapping's recorded dev/ino (always true
+// on Windows); RecordIdentity captures them from the Mapping's fd.
+bool NameRefersTo(const std::string& name, const Mapping& m);
+void RecordIdentity(Mapping& m);
 
 }  // namespace membridge
 

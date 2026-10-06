@@ -341,7 +341,12 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   // page.
   if (opts.mode != Mode::kCreate) {
     if (auto live = Registry::Get().Find(name)) {
-      if (live->raw == opts.raw) {
+      // Review F16: another process may have unlinked and recreated the name
+      // — the cached mapping would silently split this process onto old
+      // memory. Validate the object identity (dev/ino) before reusing.
+      if (live->raw != opts.raw || !NameRefersTo(name, *live)) {
+        Registry::Get().Erase(name);
+      } else {
         uint64_t windowBytes = 0;
         if (TryReuse(isolate, live, opts, haveSize, requested, &windowBytes)) {
           args.GetReturnValue().Set(MakeWindow(isolate, live, live->headerBytes, windowBytes));
@@ -431,6 +436,7 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   m->fd = guard.h.fd;
   m->name = name;
   m->unlinkWhenUnused = opts.unlinkWhenUnused;
+  RecordIdentity(*m);
   // Only the Mapping that claimed the attach row releases it (a second
   // Mapping over the same segment in this process shares the row).
   m->attachSlot = ownsRow ? attachSlot : -1;

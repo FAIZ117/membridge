@@ -71,6 +71,10 @@ struct Mapping {
   int fd = -1;  // POSIX: kept open so `grow` can ftruncate
   int attachSlot = -1;  // claimed attach-table row, -1 = none (raw or overflow)
   bool unlinkWhenUnused = false;  // §9: the last detacher unlinks the name
+  // POSIX object identity: detects another process's unlink+recreate of the
+  // same name (review F16/F21). Zero on Windows (sections have no inode).
+  int64_t dev = 0;
+  int64_t ino = 0;
   std::atomic<int> bsCount{0};  // live BackingStores over this mapping
   std::atomic<bool> detached{false};
 #ifdef _WIN32

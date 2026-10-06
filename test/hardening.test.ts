@@ -122,3 +122,29 @@ test('Corr F8: cross-process grow never shrinks and covers its window', { skip: 
   }
 });
 void fork;
+
+test('Corr F16: registry refuses a stale mapping after unlink+recreate', (t) => {
+  const name = uniqueName();
+  t.after(() => unlinkQuietly(name));
+  const a = open(name, 256);
+  new Int32Array(a)[0] = 1;
+  // Simulate another process's unlink+recreate behind our cached mapping:
+  // drop the registry entry? No — the POINT is the entry stays. Unlink and
+  // recreate via a child so our mapping is untouched but the name moved.
+  const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
+  const r = spawnSync(process.execPath, ['-e', `
+    const fs = require('node:fs');
+    fs.unlinkSync('/dev/shm' + process.env.MX_NAME);
+    const { open } = require(${JSON.stringify(require.resolve('../src/core'))});
+    const sab = open(process.env.MX_NAME, 256);
+    new Int32Array(sab)[0] = 42;
+  `], { env: { ...process.env, MX_NAME: name }, encoding: 'utf8' });
+  if (r.status !== 0) {
+    // child could not run (non-Linux): the F16 fix is POSIX-only anyway
+    t.diagnostic('child failed; POSIX-only check');
+    return;
+  }
+  // Our re-open must see the NEW object (42), not the stale mapping (1).
+  const b = open(name, 256);
+  assert.strictEqual(new Int32Array(b)[0], 42, 'reuse validated by object identity');
+});

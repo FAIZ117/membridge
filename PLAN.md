@@ -178,6 +178,15 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   process) and a larger size is requested, a **new** `Mapping` is made and replaces the
   registry entry; SABs over the old mapping stay valid, because they hold their own reference.
   **Why:** otherwise `grow` would silently hand back the stale, smaller mapping inside one process.
+- **Registry lookup validates object identity (fix round 2026-10-06):** reuse additionally
+  compares the cached Mapping's recorded `dev`/`ino` against a fresh `shm_open`+`fstat` of the
+  name; a mismatch (another process unlinked and recreated the name) drops the entry and takes
+  the full-open path. **Why:** otherwise a long-lived process would keep handing out the old
+  mapping while fresh processes use the new object — a silent split brain (review F16). The
+  same identity check guards `unlinkWhenUnused` (only unlink when the name still refers to our
+  object, F21), and a second Mapping over the same segment (post-grow) shares the attach row —
+  only the process's last Mapping releases it (F20). Windows sections carry no inode; reuse is
+  name-keyed there and documented.
 - `~Mapping()` (unmap + release this process's attach slot) can run on **any thread**,
   because V8 may call BackingStore deleters off the main thread. Registry and header updates
   in it are therefore lock-protected / atomic.

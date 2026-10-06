@@ -95,6 +95,10 @@ struct timespec DeadlineToTimespec(double deadlineMs) {
 
 enum class Fulfill { kOk, kNotEqual, kTimedOut };
 
+inline const char* FulfillStr(Fulfill f) {
+  return f == Fulfill::kOk ? "ok" : f == Fulfill::kNotEqual ? "not-equal" : "timed-out";
+}
+
 struct WaitNode;
 
 struct Hub {
@@ -162,9 +166,7 @@ void AsyncCallback(uv_async_t* handle) {
   }
   for (auto& f : batch) {
     if (f.first->settled.exchange(true)) continue;
-    ResolveOnLoop(hub->isolate, *f.first,
-                  f.second == Fulfill::kOk ? "ok"
-                                           : f.second == Fulfill::kNotEqual ? "not-equal" : "timed-out");
+    ResolveOnLoop(hub->isolate, *f.first, FulfillStr(f.second));
   }
   // Loop pinning is done in JS (sync.ts holds a timer while waits pend):
   // uv_ref alone proved unreliable across Node versions (Node 22 runner).
@@ -760,9 +762,20 @@ void CancelIsolateWaits(v8::Isolate* isolate) {
     }
   }
   if (hub != nullptr) {
-    std::lock_guard<std::mutex> lock(hub->mu);
-    hub->closed = true;
-    hub->pending = 0;
+    std::deque<std::pair<std::shared_ptr<PromiseState>, Fulfill>> queued;
+    {
+      std::lock_guard<std::mutex> lock(hub->mu);
+      // F17: entries already delivered to the queue never get a loop callback
+      // (the loop is dying) — settle them here, on the dying isolate's JS
+      // thread, exactly like the wait-set cancellation above.
+      queued.swap(hub->queue);
+      hub->closed = true;
+      hub->pending = 0;
+    }
+    for (auto& f : queued) {
+      if (f.first->settled.exchange(true)) continue;
+      ResolveOnLoop(isolate, *f.first, FulfillStr(f.second));
+    }
     // Close the handle so the isolate's loop can shut down cleanly (worker
     // .terminate() tears the loop down; an open handle aborts the process).
     // selfKeepAlive holds the Hub until uv's close callback fires.

@@ -351,13 +351,24 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   // Registry reuse (§5.4). mode 'create' never reuses: it must reach the
   // E_EXISTS check even when a live mapping is cached. A raw/plain mismatch
   // never reuses either (review F33): the window offset differs by a header
-  // page.
+  // page. Neither does a mutex/ring kind mismatch (review F33 residual): the
+  // cross-process join path rejects it via the header kind flags, so the
+  // same-process reuse path must not silently bypass that check.
   if (opts.mode != Mode::kCreate) {
     if (auto live = Registry::Get().Find(name)) {
       // Review F16: another process may have unlinked and recreated the name
       // — the cached mapping would silently split this process onto old
       // memory. Validate the object identity (dev/ino) before reusing.
-      if (live->raw != opts.raw || !NameRefersTo(name, *live)) {
+      bool kindMismatch = false;
+      if (!live->raw && !opts.raw && kindFlags != kKindPlain && live->base != nullptr) {
+        // Parity with the full-open kind check (InitOrJoin): only a
+        // kind-SPECIFIC request (mutex/ring) compares — plain opens are
+        // kind-agnostic by design.
+        const uint32_t liveKind =
+            static_cast<uint32_t>(static_cast<Header*>(live->base)->flags) & kKindMask;
+        kindMismatch = liveKind != (kindFlags & kKindMask);
+      }
+      if (live->raw != opts.raw || kindMismatch || !NameRefersTo(name, *live)) {
         Registry::Get().Erase(name);
       } else {
         uint64_t windowBytes = 0;

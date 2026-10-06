@@ -7,7 +7,9 @@ import { test } from 'node:test';
 import { Worker } from 'node:worker_threads';
 import { spawnSync } from 'node:child_process';
 import { open, unlink } from '../src/core';
-import { assert, uniqueName, unlinkQuietly } from './helpers';
+import { Mutex } from '../src/mutex';
+import { RingProducer } from '../src/ringbuffer';
+import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core'); // tests use core directly (debug hooks are not re-exported)
 
@@ -137,4 +139,24 @@ test('unlink while SABs are alive: memory stays valid, name is gone', () => {
   unlink(name);
   assert.strictEqual(new Int32Array(sab)[0], 17, 'SAB survives unlink');
   unlinkQuietly(name);
+});
+
+// F33 residual: the same-process registry reuse path must honor the header's
+// kind flags the same way the cross-process join path does — a mutex-kind
+// segment re-opened as plain/ring is E_INCOMPATIBLE, not a silent reuse.
+test('kind mismatch on registry reuse -> E_INCOMPATIBLE (review F33)', () => {
+  const name = uniqueName();
+  try {
+    Mutex.open(name);  // creates a mutex-kind segment and caches the mapping
+    // kind-specific request over a different kind: E_INCOMPATIBLE (plain
+    // opens are kind-agnostic by design, so a plain request is NOT asserted
+    // to fail — parity with the cross-process join check).
+    assertThrowsCode(() => RingProducer.open(name, { capacity: 4096 }), 'E_INCOMPATIBLE');
+    // the original kind still opens cleanly afterwards
+    const m = Mutex.open(name);
+    m.lock();
+    m.unlock();
+  } finally {
+    unlinkQuietly(name);
+  }
 });

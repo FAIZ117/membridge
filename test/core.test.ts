@@ -247,7 +247,7 @@ test('worker_threads share one mapping (open from another isolate)', async (t) =
   const seen: { seen: number } = await new Promise((resolve, reject) => {
     const w = new Worker(code, {
       eval: true,
-      workerData: { name, pkg: require.resolve('../src/index') },
+      workerData: { name, pkg: require.resolve('../src/core') },
     });
     w.on('message', resolve);
     w.on('error', reject);

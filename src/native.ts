@@ -44,13 +44,34 @@ export interface Native {
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };
 }
 
+function packageRoot(): string {
+  // The compiled layout varies (flat dist/ for publish, dist/src/ for the
+  // test build), so walk up to the directory that actually owns the addon
+  // artifacts (prebuilds/ or build/) instead of counting directory levels.
+  let dir = __dirname;
+  for (let i = 0; i < 5; i++) {
+    const fs = require('node:fs');
+    if (
+      fs.existsSync(path.join(dir, 'package.json')) &&
+      (fs.existsSync(path.join(dir, 'prebuilds')) ||
+        fs.existsSync(path.join(dir, 'build')) ||
+        fs.existsSync(path.join(dir, 'binding.gyp')))
+    ) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.join(__dirname, '..');
+}
+
 function load(): NativeBinding | undefined {
   if (loadAttempted) return binding;
   loadAttempted = true;
   try {
-    // dist/src/native.js -> package root (binding.gyp, prebuilds/, build/Release)
     const loadAddon = require('node-gyp-build');
-    binding = loadAddon(path.join(__dirname, '..', '..')) as NativeBinding;
+    binding = loadAddon(packageRoot()) as NativeBinding;
     if (binding && typeof binding.setMembridgeErrorCtor === 'function') {
       binding.setMembridgeErrorCtor(MembridgeError);
     }

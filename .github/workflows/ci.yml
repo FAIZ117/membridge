@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install (builds the addon via node-gyp-build)
+        run: npm install
+      - name: Run the full suite
+        run: npm test
+        # Platform-specific tests skip themselves with stated reasons:
+        #   E_NO_SPACE tmpfs — needs MEMBRIDGE_TEST_TMPFS (only the ubuntu job
+        #     mounts one, below)
+        #   capacity/list   — Linux-only; other OSes assert E_UNSUPPORTED
+        #   /dev/shm byte-crafting — POSIX-only crash-state tests
+
+  tmpfs:
+    # E_NO_SPACE reserve test (§13): a dedicated small tmpfs, so the create
+    # fails at posix_fallocate time instead of OOMing the runner.
+    name: ubuntu · small-tmpfs E_NO_SPACE
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Mount a 16 MiB tmpfs
+        run: |
+          sudo mkdir -p /mnt/membridge-tmpfs
+          sudo mount -t tmpfs -o size=16m tmpfs /mnt/membridge-tmpfs
+          # bind it as the segment source: membridge uses /dev/shm, so run the
+          # test in a mount namespace where /dev/shm IS the small tmpfs
+          echo "MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs" >> "$GITHUB_ENV"
+      - run: npm install
+      - name: Run the suite inside the small-tmpfs namespace
+        run: >
+          sudo unshare --mount
+          bash -c 'mount --bind /mnt/membridge-tmpfs /dev/shm &&
+                   chmod 1777 /dev/shm &&
+                   su $SUDO_USER -c "MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs npm test"'
+
+  sanitizers:
+    # ASAN/UBSan (§12): LD_PRELOAD libasan into node with an instrumented
+    # addon build. Valgrind on V8's JIT is impractically slow — this is the
+    # memory-error gate.
+    name: ubuntu · ASAN/UBSan
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the addon with sanitizers
+        env:
+          # node-gyp honors CC/CXX (with embedded flags) from the environment
+          CC: 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer -g'
+          CXX: 'g++ -fsanitize=address,undefined -fno-omit-frame-pointer -g'
+        run: npx node-gyp rebuild
+      - run: npm run build
+      - name: Run the suite under ASAN/UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >
+          LD_PRELOAD=$(gcc -print-file-name=libasan.so)
+          node --test dist/test/*.test.js

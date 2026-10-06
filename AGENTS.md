@@ -3,8 +3,9 @@
 Cross-process shared memory for Node.js: a `SharedArrayBuffer` over OS shared
 memory (Linux/macOS/Windows), plus a crash-safe Mutex, a zero-copy RingBuffer,
 and ops utilities. Plain-V8 native addon (`node.h`, no N-API) under a TypeScript
-layer. **Status: implementation started (M1 spike landed) — [PLAN.md](./PLAN.md)
-is the spec and outranks this file on design questions.**
+layer. **Status: implemented through M7 (M8 = final verification) —
+[PLAN.md](./PLAN.md) is the spec and outranks this file on design
+questions.**
 
 ## Layout
 
@@ -43,7 +44,7 @@ The contract agents may rely on; each is verified from its milestone onward.
 | Build TypeScript | `npm run build` | M2 ✓ |
 | Run all tests | `npm test` (= build + `node --test dist/test/*.test.js`) | M2 ✓ |
 | Run one test file | `node --test dist/test/<name>.test.js` | M2 ✓ |
-| Benchmarks | `npm run bench` | M5 |
+| Benchmarks | `npm run bench` | M7 ✓ |
 | Re-run a fact probe | `node probes/<fact>.js` | M1 |
 
 ## Guardrails

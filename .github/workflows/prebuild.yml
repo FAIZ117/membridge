@@ -1,0 +1,98 @@
+name: prebuilds
+
+# Build the 18 per-ABI prebuilds (6 targets × Node 22/24/26) and assemble the
+# publish artifact exactly per the package.json `files` whitelist. The owner
+# downloads `membridge-publish` and runs `npm publish` on it (docs/release.md).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  prebuild:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64-glibc, os: ubuntu-latest, container: null }
+          - { target: linux-arm64-glibc, os: ubuntu-latest, container: null, cross: arm64 }
+          - { target: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine' }
+          - { target: darwin-arm64, os: macos-latest, container: null }
+          - { target: darwin-x64, os: macos-latest, container: null, arch: x86_64h }
+          - { target: win32-x64, os: windows-latest, container: null }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        if: ${{ matrix.container == null }}
+        with:
+          node-version: 24
+      - name: Install toolchain (musl container)
+        if: ${{ matrix.container != null }}
+        run: apk add --no-cache python3 make g++ linux-headers
+      - name: Install (typescript only; no native build here)
+        run: |
+          npm install --ignore-scripts
+          npm run build
+      - name: prebuildify (Node 22/24/26 ABIs)
+        run: >
+          npx prebuildify
+          -t 22.0.0 -t 24.0.0 -t 26.0.0
+          --strip
+          ${{ matrix.cross == 'arm64' && '--arch arm64' || '' }}
+        env:
+          # darwin-x64 keeps x86_64 compatibility via the default slice
+          CC: ${{ matrix.arch == 'x86_64h' && 'clang -arch x86_64' || '' }}
+          CXX: ${{ matrix.arch == 'x86_64h' && 'clang++ -arch x86_64' || '' }}
+      - name: Stage prebuilds
+        run: |
+          mkdir -p stage/prebuilds
+          cp -r prebuilds/* stage/prebuilds/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilds-${{ matrix.target }}
+          path: stage/prebuilds/
+
+  assemble:
+    # Merge the per-target prebuilds into one publish tarball (§12 files
+    # whitelist: dist/ esm/ prebuilds/ cc/ binding.gyp + npm auto-includes).
+    name: assemble publish artifact
+    needs: prebuild
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilds-*
+          path: artifacts/
+      - name: Merge prebuilds + build JS
+        run: |
+          mkdir -p prebuilds
+          for d in artifacts/prebuilds-*/prebuilds/*/; do
+            cp -rn "$d" prebuilds/ || true
+          done
+          find prebuilds -name '*.node' | sort
+          npm install --ignore-scripts
+          npm run build
+      - name: Sanity — every target × ABI present (6 × 3)
+        run: |
+          count=$(find prebuilds -name '*.node' | wc -l)
+          echo "prebuilds: $count"
+          test "$count" -eq 18
+      - name: Pack
+        run: npm pack --dry-run
+      - name: Assemble the publish tarball
+        run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: membridge-publish
+          path: membridge-*.tgz

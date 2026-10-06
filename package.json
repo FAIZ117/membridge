@@ -27,7 +27,10 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist/",
+    "dist/*.js",
+    "dist/*.d.ts",
+    "dist/*.js.map",
+    "dist/test/",
     "esm/",
     "prebuilds/",
     "cc/",
@@ -35,7 +38,7 @@
   ],
   "scripts": {
     "install": "node-gyp-build",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
     "test": "npm run build && node --test dist/test/*.test.js",
     "bench": "node bench/run.js"
   },

@@ -22,6 +22,11 @@ export interface Native {
   syncWait(view: Int32Array, index: number, expected: number, timeoutMs: number): string;
   syncNotify(view: Int32Array, index: number, count: number): number;
   syncWaitAsync(view: Int32Array, index: number, expected: number, timeoutMs: number): Promise<string>;
+  // §7 mutex support (CAS protocol in JS; native does liveness + teardown)
+  mutexClaimSlot(name: string, view: Int32Array): { slot: number; gen: number; token: number };
+  mutexOwnerAlive(view: Int32Array, token: number): boolean;
+  mutexTrackHeld(name: string, view: Int32Array, token: number): void;
+  mutexUntrackHeld(view: Int32Array, token: number): void;
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };

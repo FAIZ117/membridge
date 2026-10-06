@@ -8,6 +8,7 @@
         "cc/registry.cc",
         "cc/header.cc",
         "cc/wait.cc",
+        "cc/mutex.cc",
         "cc/liveness.cc"
       ],
       "cflags_cc": ["-std=c++20", "-fexceptions"],

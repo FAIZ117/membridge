@@ -6,6 +6,7 @@
 #include "membridge.h"
 #include "header.h"
 #include "liveness.h"
+#include "mutex.h"
 #include "registry.h"
 #include "segment.h"
 #include "wait.h"
@@ -630,6 +631,85 @@ void SyncWaitAsyncJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(resolver->GetPromise());
 }
 
+// ---- §7 mutex support (CAS protocol lives in JS; native does liveness) -----
+
+int32_t* DataAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
+  if (!arg->IsInt32Array()) {
+    ThrowError(isolate, "E_NAME_INVALID", "expected an Int32Array over the mutex data region");
+  }
+  v8::Local<v8::Int32Array> view = arg.As<v8::Int32Array>();
+  return static_cast<int32_t*>(view->Buffer()->Data()) + view->ByteOffset() / 4;
+}
+
+// mutexClaimSlot(view) -> { slot, gen, token }
+void MutexClaimSlotJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 1 || !args[0]->IsString()) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "mutexClaimSlot(name, view)")));
+    return;
+  }
+  v8::String::Utf8Value nameArg(isolate, args[0]);
+  int32_t* data = DataAddrOf(isolate, args[1]);
+  const uint32_t token = MutexClaimSlot(isolate, data, std::string(*nameArg, nameArg.length()));
+  v8::Local<v8::Object> o = v8::Object::New(isolate);
+  o->Set(ctx, Str(isolate, "slot"),
+         v8::Number::New(isolate, (token & kMutexTokenMask) >> 16)).Check();
+  o->Set(ctx, Str(isolate, "gen"),
+         v8::Number::New(isolate, token & kMutexGenMask)).Check();
+  o->Set(ctx, Str(isolate, "token"), v8::Number::New(isolate, token)).Check();
+  args.GetReturnValue().Set(o);
+}
+
+// mutexOwnerAlive(view, token) -> bool
+void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 2 || !args[1]->IsNumber()) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "mutexOwnerAlive(view, token)")));
+    return;
+  }
+  int32_t* data = DataAddrOf(isolate, args[0]);
+  const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
+  args.GetReturnValue().Set(v8::Boolean::New(isolate, MutexOwnerAlive(data, token)));
+}
+
+// mutexTrackHeld(name, view, token) / mutexUntrackHeld(view, token)
+void MutexTrackHeldJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 3 || !args[2]->IsNumber()) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "mutexTrackHeld(name, view, token)")));
+    return;
+  }
+  int32_t* data = DataAddrOf(isolate, args[1]);
+  const uint32_t token = static_cast<uint32_t>(args[2]->NumberValue(ctx).ToChecked());
+  const uint32_t slot = (token & kMutexTokenMask) >> 16;
+  MutexTrackHeld(isolate, data, token, static_cast<int>(slot));
+  args.GetReturnValue().Set(v8::Undefined(isolate));
+}
+
+void MutexUntrackHeldJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 2 || !args[1]->IsNumber()) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "mutexUntrackHeld(view, token)")));
+    return;
+  }
+  int32_t* data = DataAddrOf(isolate, args[0]);
+  const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
+  MutexUntrackHeld(isolate, data, token);
+  args.GetReturnValue().Set(v8::Undefined(isolate));
+}
+
 // ---- guarded trampolines ---------------------------------------------------
 // Every JS entry point catches NativeError (JS exception already pending).
 // Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
@@ -656,6 +736,10 @@ MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
 MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
 MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
 MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
+MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
+MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
+MEMBRIDGE_TRAMPOLINE(MutexTrackHeldJs2, MutexTrackHeldJs)
+MEMBRIDGE_TRAMPOLINE(MutexUntrackHeldJs2, MutexUntrackHeldJs)
 
 void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();  // F16: no Context::GetIsolate in V8 14.6
@@ -674,6 +758,10 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"syncWait", SyncWaitJs2},
       {"syncNotify", SyncNotifyJs2},
       {"syncWaitAsync", SyncWaitAsyncJs2},
+      {"mutexClaimSlot", MutexClaimSlotJs2},
+      {"mutexOwnerAlive", MutexOwnerAliveJs2},
+      {"mutexTrackHeld", MutexTrackHeldJs2},
+      {"mutexUntrackHeld", MutexUntrackHeldJs2},
   };
   for (const Reg& r : regs) {
     v8::Local<v8::Function> f =

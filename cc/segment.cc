@@ -113,6 +113,26 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
 #if defined(_WIN32)
   (void)isolate;
   const std::wstring wname = ToWide(ObjectName(name, opts.winGlobal));
+  // Review F27: join must not create. Probe for the existing section first;
+  // only create/create-or-join fall through to CreateFileMappingW.
+  if (opts.mode == Mode::kJoin) {
+    HANDLE existing = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wname.c_str());
+    if (existing == nullptr) {
+      ThrowError(isolate, "E_NOT_FOUND", "segment does not exist", name);
+    }
+    void* joined = MapViewOfFile(existing, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (joined == nullptr) {
+      const int e = static_cast<int>(GetLastError());
+      CloseHandle(existing);
+      ThrowSystemError(isolate, "MapViewOfFile", e, name);
+    }
+    h.base = joined;
+    h.mappingBytes = 0;  // whole-section view
+    h.fd = -1;
+    h.created = false;
+    h.section = existing;
+    return h;
+  }
   DWORD high = 0, low = 0;
   if (!wholeObject) {
     high = static_cast<DWORD>(requestedTotal >> 32);

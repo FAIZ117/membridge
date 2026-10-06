@@ -202,6 +202,11 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
                    "segment is not a membridge segment or has an incompatible layout version",
                    name);
       }
+      // Windows unlink marks the header (§5.4): a marked segment refuses new
+      // joins instead of silently resurrecting (review F27).
+      if (h->flags & kFlagUnlinked) {
+        ThrowError(isolate, "E_NOT_FOUND", "segment was unlinked", name);
+      }
       if (h->headerBytes != headerBytes) {
         ThrowError(isolate, "E_INCOMPATIBLE",
                    "segment uses a different header page size (" +

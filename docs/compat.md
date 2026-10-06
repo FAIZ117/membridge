@@ -13,8 +13,8 @@ after the owner pushes.
 | `reserve` (fallocate, E_NO_SPACE) | ✓ | ✗ (no-op; fallocate has no shm meaning there)¹ | ✗ (no-op)¹ |
 | `grow` size policy | ✓ (ftruncate under the init lock) | ✗ → `E_GROW_UNSUPPORTED` if U2 holds (shm objects cannot be re-`ftruncate`d) | ✗ → `E_GROW_UNSUPPORTED` (sections are fixed at `CreateFileMappingW` time) |
 | Header page + attach table | ✓ | ✓ | ✓ |
-| `sync.wait` / `notify` | ✓ shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | `os_sync` SHARED when available (U1, macOS 14.4+), else bounded poll (50 µs → 2 ms)² | named semaphores per word (U3: `WaitOnAddress` is process-private)² |
-| `sync.waitAsync` | ✓ `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | one thread per wait over `os_sync`/poll | one thread per wait over semaphores |
+| `sync.wait` / `notify` | ✓ verified: shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | implemented: `os_sync` SHARED **with timeout**, weak-linked, else bounded poll (50 µs → 2 ms) — **CI-unverified (U1)** | implemented: named semaphores per word, chunked bounded releases — **CI-unverified (U3)** |
+| `sync.waitAsync` | ✓ verified: `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | implemented: one thread per wait over `os_sync_with_timeout`/poll — **CI-unverified (U1)** | implemented: one thread per wait over semaphores — **CI-unverified (U3)** |
 | `Mutex` | ✓ | ✓ | ✓ |
 | `RingBuffer` | ✓ | ✓ | ✓ |
 | `capacity()` | ✓ (`statfs /dev/shm`) | ✗ `E_UNSUPPORTED` | ✗ `E_UNSUPPORTED` |
@@ -22,6 +22,12 @@ after the owner pushes.
 | `list()` | ✓ (magic-filtered readdir) | ✗ `E_UNSUPPORTED` (POSIX shm cannot be enumerated) | ✗ `E_UNSUPPORTED` |
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
 | Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
+
+**Correction (2026-10-06 fix round):** before this round this matrix marked the
+macOS/Windows mechanism rows ✓ from source reading only — the code did not
+even compile there (review F19) and the sync paths fell back to polling on
+macOS. The rows above now say implemented/verified honestly; the first CI run
+on those runners is the gate for flipping them to ✓.
 
 ¹ The option is accepted everywhere; on non-Linux it does nothing (lazy tmpfs
 charge is a Linux tmpfs property). `docs` say so; the create still cannot
@@ -35,7 +41,8 @@ and on timeout.
 
 | Runtime | Status |
 |---------|--------|
-| Node 22 / 24 / 26 (official builds) | ✓ — no V8 sandbox, external backing stores work (F13) |
+| Node 22 / 24 / 26 (official builds, Linux) | ✓ verified locally on every fix round |
+| Node on macOS / Windows | source compiles per the platform guards; **the runners have not built it yet** — treat every non-Linux cell above as pending the first CI run (review F19 found the pre-fix tree could not compile there at all) |
 | Electron | ✗ — the V8 sandbox rejects external backing stores (F13); unsupported by design |
 | Bun / Deno | untested — likely broken (plain-V8 addon, node.h ABI) |
 | worker_threads | ✓ — context-aware `NODE_MODULE_INIT`, process-wide native registry |

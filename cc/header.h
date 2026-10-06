@@ -12,6 +12,12 @@
 #include <atomic>
 #include <cstring>
 
+#if defined(_WIN32)
+#include <windows.h>
+#elif !defined(_WIN32)
+#include <unistd.h>  // sysconf
+#endif
+
 namespace membridge {
 
 // Header page: one page at mapping offset 0 (size = max(4096, page size)) so
@@ -66,9 +72,16 @@ inline std::atomic<int32_t>* AtomicSlotRefcount(AttachSlot* s) {
 }
 
 inline uint32_t EffectiveHeaderBytes() {
+#if defined(_WIN32)
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  const DWORD pageSize = si.dwPageSize > 0 ? si.dwPageSize : 4096;
+  return pageSize > kMinHeaderBytes ? pageSize : kMinHeaderBytes;
+#else
   const long pageSize = sysconf(_SC_PAGESIZE);
   uint32_t pagesz = pageSize > 0 ? static_cast<uint32_t>(pageSize) : 4096u;
   return pagesz > kMinHeaderBytes ? pagesz : kMinHeaderBytes;
+#endif
 }
 
 // Attach-table row ops. Claim wins a CAS on refcount 0 -> 1, then writes the

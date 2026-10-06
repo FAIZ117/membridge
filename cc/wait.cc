@@ -32,7 +32,9 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 #if defined(__linux__)
 #include <linux/futex.h>
@@ -194,6 +196,47 @@ void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
 
 // Fallback waiter thread: one per wait (futex where available, bounded poll
 // otherwise). Runs with the node already removed from g_pending.
+#if defined(__APPLE__)
+// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flag. Weak
+// imports keep the addon loadable on older macOS; when the symbols are
+// absent we degrade to the bounded-poll fallback below.
+extern "C" {
+int os_sync_wait_on_address(void* address, uint64_t value, size_t size, uint32_t flags)
+    __attribute__((weak_import));
+int os_sync_wake_by_address_shared(void* address, size_t size, uint32_t flags)
+    __attribute__((weak_import));
+}
+#ifndef OS_SYNC_WAIT_ON_ADDRESS_SHARED
+#define OS_SYNC_WAIT_ON_ADDRESS_SHARED 0x00000001
+#endif
+#endif
+
+#if defined(_WIN32)
+// Named semaphore per word (§6, U3: WaitOnAddress is process-private). The
+// waiter count lives in the semaphore permits themselves: notify releases
+// `count` permits; extra permits surface as allowed spurious wakeups —
+// every waiter re-checks the word, so correctness never depends on a wake.
+static std::wstring WordSemaphoreName(int32_t* addr) {
+  std::shared_ptr<Mapping> m = Registry::FindByAddress(addr);
+  wchar_t buf[256];
+  if (m) {
+    std::string escaped;
+    for (char c : m->name) {
+      if (c == '/') escaped += "%2F";
+      else if (c == '%') escaped += "%25";
+      else escaped += c;
+    }
+    const ptrdiff_t off = static_cast<int32_t*>(addr) - static_cast<int32_t*>(m->base) -
+                          m->headerBytes / 4;
+    _snwprintf(buf, 255, L"Local\\membridge-%hs-w%td", escaped.c_str(),
+               static_cast<ptrdiff_t>(off));
+  } else {
+    _snwprintf(buf, 255, L"Local\\membridge-anon-%p", static_cast<void*>(addr));
+  }
+  return std::wstring(buf);
+}
+#endif
+
 void WaitThreadMain(std::shared_ptr<WaitNode> node) {
 #if defined(__linux__)
   for (;;) {
@@ -263,12 +306,17 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
     }
   }
   CloseHandle(sem);
-#else
-  // macOS / other: os_sync when available (U1), else bounded exponential
-  // back-off poll (50 µs -> 2 ms), §6 fallback. Correctness comes from
-  // re-checking the word; wake latency <= 2 ms in the fallback.
-  const bool useOsSync =
-      os_sync_wait_on_address != nullptr && os_sync_wake_by_address_shared != nullptr;
+#elif defined(__APPLE__)
+  // macOS (U1, unverified locally): os_sync with bounded slices when the
+  // symbols exist (14.4+), else bounded exponential back-off poll (50 us ->
+  // 2 ms). The untimed os_sync call was a review finding (P5): a timed
+  // waitAsync could never time out without a wake.
+  const bool useTimed =
+      os_sync_wait_on_address_with_timeout != nullptr &&
+      os_sync_wake_by_address_shared != nullptr;
+  const bool usePlain =
+      !useTimed && os_sync_wait_on_address != nullptr &&
+      os_sync_wake_by_address_shared != nullptr;
   double delayUs = 50;
   for (;;) {
     if (node->cancelled) break;  // resolved by the teardown hook
@@ -276,25 +324,48 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       Deliver(node, Fulfill::kOk);
       break;
     }
-    uint32_t sliceMs = 250;
+    uint64_t sliceNs = 250ull * 1000000ull;
     if (node->hasTimeout) {
       const double rem = node->deadlineMs - NowMs();
       if (rem <= 0) {
         Deliver(node, Fulfill::kTimedOut);
         break;
       }
-      sliceMs = static_cast<uint32_t>(rem > 250 ? 250 : rem);
+      const double sliceMsD = rem > 250.0 ? 250.0 : rem;
+      sliceNs = static_cast<uint64_t>(sliceMsD * 1e6) * 1000ull;
     }
-    if (useOsSync) {
+    if (useTimed) {
+      os_sync_wait_on_address_with_timeout(
+          node->addr, static_cast<uint64_t>(static_cast<uint32_t>(node->expected)),
+          sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED, sliceNs);
+      // spurious wakes and value changes are re-checked on the next iteration
+    } else if (usePlain) {
+      // pre-14.4 os_sync has no timeout variant: poll it in short slices
       os_sync_wait_on_address(node->addr, static_cast<uint64_t>(
                                               static_cast<uint32_t>(node->expected)),
                               sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
-      // spurious wakes and value changes are re-checked on the next iteration
+      std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(sliceNs / 1000)));
+      (void)delayUs;
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
-      (void)sliceMs;
     }
+  }
+#else
+  // Other POSIX: bounded exponential back-off poll (no os_sync, no futex API).
+  double delayUs = 50;
+  for (;;) {
+    if (node->cancelled) break;
+    if (*node->addr != static_cast<int32_t>(node->expected)) {
+      Deliver(node, Fulfill::kOk);
+      break;
+    }
+    if (node->hasTimeout && NowMs() >= node->deadlineMs) {
+      Deliver(node, Fulfill::kTimedOut);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
+    if (delayUs < 2000) delayUs *= 2;
   }
 #endif
   if (node->onThread) {
@@ -441,8 +512,64 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
     if (errno == EINTR) continue;
     return WaitResult::kTimedOut;  // unexpected errno: bounded failure
   }
+#elif defined(__APPLE__)
+  // macOS (U1, unverified locally): os_sync with the timeout variant; the
+  // poll fallback stays for OSes without the symbols.
+  const bool infinite = timeoutMs != timeoutMs;
+  const double deadline = infinite ? 0 : NowMs() + timeoutMs;
+  if (os_sync_wait_on_address_with_timeout != nullptr) {
+    for (;;) {
+      if (*addr != static_cast<int32_t>(expected)) return WaitResult::kNotEqual;
+      if (!infinite) {
+        const double rem = deadline - NowMs();
+        if (rem <= 0) return WaitResult::kTimedOut;
+        const uint64_t ns = static_cast<uint64_t>(rem * 1e6) * 1000ull;
+        os_sync_wait_on_address_with_timeout(addr, expected, sizeof(int32_t),
+                                             OS_SYNC_WAIT_ON_ADDRESS_SHARED, ns);
+      } else {
+        os_sync_wait_on_address_with_timeout(
+            addr, expected, sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+            250ull * 1000000ull);
+      }
+    }
+  }
+  double delayUs = 50;
+  for (;;) {
+    if (*addr != static_cast<int32_t>(expected)) return WaitResult::kOk;
+    if (!infinite && NowMs() >= deadline) return WaitResult::kTimedOut;
+    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
+    if (delayUs < 2000) delayUs *= 2;
+  }
+#elif defined(_WIN32)
+  // Windows (U3): block on the word's named semaphore in bounded slices and
+  // re-check the word each wake (permits are the waiter bookkeeping, §6).
+  const bool infinite = timeoutMs != timeoutMs;
+  const double deadline = infinite ? 0 : NowMs() + timeoutMs;
+  HANDLE sem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, WordSemaphoreName(addr).c_str());
+  if (sem == nullptr) return WaitResult::kTimedOut;
+  WaitResult out = WaitResult::kTimedOut;
+  for (;;) {
+    if (*addr != static_cast<int32_t>(expected)) {
+      out = WaitResult::kNotEqual;
+      break;
+    }
+    DWORD slice = 250;
+    if (!infinite) {
+      const double rem = deadline - NowMs();
+      if (rem <= 0) break;
+      slice = static_cast<DWORD>(rem > 250 ? 250 : rem);
+    }
+    const DWORD wr = WaitForSingleObject(sem, slice);
+    if (wr == WAIT_OBJECT_0 && *addr != static_cast<int32_t>(expected)) {
+      out = WaitResult::kOk;
+      break;
+    }
+    if (!infinite && NowMs() >= deadline) break;
+  }
+  CloseHandle(sem);
+  return out;
 #else
-  // Polling fallback (§6): bounded exponential back-off, 50 µs -> 2 ms.
+  // Other POSIX: bounded exponential back-off poll, 50 µs -> 2 ms.
   const bool infinite = timeoutMs != timeoutMs;
   const double deadline = infinite ? 0 : NowMs() + timeoutMs;
   double delayUs = 50;
@@ -455,47 +582,6 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
 #endif
 }
 
-#if defined(__APPLE__)
-// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flag. Weak
-// imports keep the addon loadable on older macOS; when the symbols are
-// absent we degrade to the bounded-poll fallback below.
-extern "C" {
-int os_sync_wait_on_address(void* address, uint64_t value, size_t size, uint32_t flags)
-    __attribute__((weak_import));
-int os_sync_wake_by_address_shared(void* address, size_t size, uint32_t flags)
-    __attribute__((weak_import));
-}
-#ifndef OS_SYNC_WAIT_ON_ADDRESS_SHARED
-#define OS_SYNC_WAIT_ON_ADDRESS_SHARED 0x00000001
-#endif
-#endif
-
-#if defined(_WIN32)
-// Named semaphore per word (§6, U3: WaitOnAddress is process-private). The
-// waiter count lives in the semaphore permits themselves: notify releases
-// `count` permits; extra permits surface as allowed spurious wakeups —
-// every waiter re-checks the word, so correctness never depends on a wake.
-static std::wstring WordSemaphoreName(int32_t* addr) {
-  std::shared_ptr<Mapping> m = Registry::FindByAddress(addr);
-  wchar_t buf[256];
-  if (m) {
-    std::string escaped;
-    for (char c : m->name) {
-      if (c == '/') escaped += "%2F";
-      else if (c == '%') escaped += "%25";
-      else escaped += c;
-    }
-    const ptrdiff_t off = static_cast<int32_t*>(addr) - static_cast<int32_t*>(m->base) -
-                          m->headerBytes / 4;
-    _snwprintf(buf, 255, L"Local\\membridge-%hs-w%td", escaped.c_str(),
-               static_cast<ptrdiff_t>(off));
-  } else {
-    _snwprintf(buf, 255, L"Local\\membridge-anon-%p", static_cast<void*>(addr));
-  }
-  return std::wstring(buf);
-}
-#endif
-
 int SyncWake(int32_t* addr, int count) {
 #if defined(__linux__)
   // No FUTEX_PRIVATE_FLAG: shared futexes are keyed by the underlying page.
@@ -507,12 +593,22 @@ int SyncWake(int32_t* addr, int count) {
   }
   return 0;  // poll fallback: waiters re-check on their back-off schedule
 #elif defined(_WIN32)
+  // Review F28: a single huge ReleaseSemaphore saturates the semaphore at its
+  // maximum, making every later wait return immediately (hot spin). Release
+  // in bounded chunks instead; spurious over-waking is within §6's model.
   const std::wstring name = WordSemaphoreName(addr);
   HANDLE sem = OpenSemaphoreW(SEMAPHORE_MODIFY, FALSE, name.c_str());
   if (sem == nullptr) return 0;  // no waiter ever created it
-  const BOOL ok = ReleaseSemaphore(sem, count, nullptr);
+  int released = 0;
+  int remaining = count > 1024 ? 1024 : count;  // cap the default wake-all too
+  while (remaining > 0) {
+    const int chunk = remaining > 64 ? 64 : remaining;
+    if (!ReleaseSemaphore(sem, chunk, nullptr)) break;
+    released += chunk;
+    remaining -= chunk;
+  }
   CloseHandle(sem);
-  return ok ? count : 0;
+  return released;
 #else
   (void)addr;
   (void)count;

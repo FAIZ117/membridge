@@ -3,8 +3,8 @@
 Cross-process shared memory for Node.js: a `SharedArrayBuffer` over OS shared
 memory (Linux/macOS/Windows), plus a crash-safe Mutex, a zero-copy RingBuffer,
 and ops utilities. Plain-V8 native addon (`node.h`, no N-API) under a TypeScript
-layer. **Status: planning — [PLAN.md](./PLAN.md) is the spec and outranks this
-file on design questions.**
+layer. **Status: implementation started (M1 spike landed) — [PLAN.md](./PLAN.md)
+is the spec and outranks this file on design questions.**
 
 ## Layout
 

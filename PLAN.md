@@ -1,6 +1,7 @@
 # membridge — Implementation Plan (rev 2)
 
-> **Status: planning — rev 2, revised after review (2026-10-05).** Nothing is implemented yet; this repo is a skeleton.
+> **Status: implementation — rev 2 (2026-10-05), revised after review. M1 spike
+> landed: §2 reflects its results; `probes/` holds the re-runnable evidence.**
 > Name `membridge` verified free on npm (registry 404, checked 2026-10-05).
 > Every design decision below carries a **Why** so it can be challenged on its merits.
 > §11 lists what changed from rev 1 and the evidence behind each change.
@@ -41,19 +42,21 @@ page size 4096) against shmbuf 0.1.0 at
 | F9 | Liveness primitives exist on Linux: `/proc/<pid>/stat` field 22 (start time), `/proc/self/ns/pid` (pid-namespace inode). | Read both on dev machine. |
 | F10 | shmbuf's perf test times a ~61 ms run with a 10 ms poll and prints the same rate for both phases; it is not a usable regression gate. | `test/test-shmbuf.js:168-192`; local run: 61 ms elapsed. |
 | F11 | shmbuf is **not** zero-dependency: it depends on `node-addon-api` and `prebuild-install`, and its install script uses `prebuild-install --runtime napi` — wrong for a V8-ABI-bound addon. Its loader only tries `build/Release`. | shmbuf `package.json`, `lib/index.js:5`. |
-| F12 | Toolchain present: gcc/g++/make/python3; node-gyp header caches for 18.20.8, 20.19/20.20, 22.21/22.22, 24.15/24.18. **No Node 26 headers yet.** | `ls ~/.cache/node-gyp`. |
+| F12 | Toolchain present: gcc/g++ 15.3, make, python3; node-gyp header caches for 18–24. Node 26.10.0 headers are fetched on demand by node-gyp (nodejs.org reachable) and the Node 26.10.0 runtime was verified from the official tarball. | `ls ~/.cache/node-gyp`; M1 spike built and passed on 22.22.0, 24.18.0, 24.19.0, 26.10.0. |
 | F13 | Official Node builds do not enable the V8 sandbox, so external backing stores work. Electron does enable it → Electron is unsupported (README compatibility note, not a plan risk). | `node -p process.config.variables.v8_enable_sandbox` → `0` on 24.18.0; shmbuf's tests pass on it. |
-| F14 | `futex_waitv` (Linux ≥ 5.16) has **no glibc wrapper**: glibc 2.42 exports no futex symbols at all. It is reachable only as a raw syscall (`__NR_futex_waitv` = 449 in `asm-generic/unistd.h`; `struct futex_waitv` in `linux/futex.h`). | `nm -D /lib64/libc.so.6 \| grep futex` → nothing; `grep -rn futex_waitv /usr/include`. |
-| F15 | A SAB's `byteLength` always equals its BackingStore's length — a SAB cannot be a window onto a larger store. | `v8::SharedArrayBuffer::New(isolate, std::shared_ptr<BackingStore>)` takes the length from the store. |
+| F14 | `futex_waitv` (Linux ≥ 5.16) has **no glibc wrapper**: glibc 2.42 exports no futex symbols at all. It is reachable only as a raw syscall (`__NR_futex_waitv` = 449 in `asm-generic/unistd.h`; `struct futex_waitv` in `linux/futex.h`). | `nm -D /lib64/libc.so.6 \| grep futex` → nothing; `grep -rn futex_waitv /usr/include`. **M1 probe** (`probes/f14-shared-futex.js`): shared `FUTEX_WAIT`/`FUTEX_WAKE` (no `FUTEX_PRIVATE_FLAG`) wakes across processes on kernel 7.2.8; `futex_waitv` wakes cross-process with `FUTEX2_SIZE_U32` and no `FUTEX2_PRIVATE`, and returns the **index of the woken entry** (0-based), not a count — the fact the §6 multiplexer needs. |
+| F15 | A SAB's `byteLength` always equals its BackingStore's length — a SAB cannot be a window onto a larger store. | `v8::SharedArrayBuffer::New(isolate, std::shared_ptr<BackingStore>)` takes the length from the store; M1 probe exercises the `base + headerBytes` window (`probes/f2-sab-window.js`). |
+| F16 | V8 14.6 (Node 26) removed `v8::Context::GetIsolate()`. Plain-V8 addons get the isolate with `v8::Isolate::GetCurrent()` inside `NODE_MODULE_INIT` (function callbacks keep `args.GetIsolate()`). | Spike build on 26.10.0 failed with the removal; fixed in `spike/addon.cc`; full spike passes on 26.10.0. |
+| F17 | `Worker.terminate()` resolves promptly (~3 ms) while the worker is parked in `Atomics.wait` on a custom-BackingStore SAB — isolate teardown is clean, as §6's lifecycle design assumes. | `spike/u5-terminate.js` on Node 24.18.0 and 26.10.0. |
+| U4 | **Confirmed (M1):** Node 26.10.0 is the current release (checked nodejs.org/dist 2026-10-06; V8 14.6, ABI 147) and `SharedArrayBuffer::NewBackingStore(ptr, len, deleter, data)` is unchanged there. Only adaptation: F16. | M1 spike builds and passes all scripts on 26.10.0. |
+| U5 | **Confirmed (M1):** in-process `Atomics.wait`/`Atomics.notify` pair across *distinct* BackingStores covering the same mapping — same isolate (`window`) and across worker isolates (worker's own `open()`); V8 keys its waiter list by address, not by BackingStore. §5.4 keeps the per-open BackingStore design; no shared-BackingStore fallback needed. | `probes/u5-atomics-pairing.js` — waiter wakes on the first cross-store `notify` (~250 ms) in both cases. |
 
-Facts still **unverified** (the spike in M1 must confirm or refute them; the design
-has a fallback for each):
+Facts still **unverified** (need foreign runners; the design implements the
+documented fallback for each in M3 regardless — a local spike cannot check them):
 
 - U1 macOS: `os_sync_wait_on_address` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED` (macOS 14.4+) wakes across processes.
 - U2 macOS: POSIX shm names are limited to 31 chars (`PSHMNAMLEN`), and an shm object cannot be `ftruncate`d again once sized.
 - U3 Windows: `WaitOnAddress` is process-private (per Microsoft docs), so cross-process waits need named kernel objects.
-- U4 Node 26 is the current release (per Node's schedule, LTS from Oct 2026) and `NewBackingStore(ptr,len,deleter,data)` is unchanged in its V8.
-- U5 In-process `Atomics.wait`/`Atomics.notify` between two SABs whose *distinct* BackingStores cover the same memory (§5.4) still pair up — i.e. V8 keys waiters by address, not by BackingStore. If not, the registry shares one BackingStore per (name, length) instead.
 
 ## 3. Architecture overview
 

@@ -29,6 +29,16 @@ export interface Native {
   mutexUntrackHeld(view: Int32Array, token: number): void;
   // §8 ring role claims (producer slot 0 / consumer slot 1)
   ringClaimRole(name: string, view: Int32Array, isProducer: boolean): number;
+  // §9 stat support (header read without mapping the data region)
+  readHeader(name: string, maxAttach?: number): {
+    magic: number;
+    layoutVersion: number;
+    initState: number;
+    headerBytes: number;
+    flags: number;
+    dataBytes: number;
+    attach: Array<{ pid: number; threadId: number; startTime: number; pidNsInode: number; refcount: number }>;
+  };
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };

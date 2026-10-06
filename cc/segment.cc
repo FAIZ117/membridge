@@ -277,4 +277,78 @@ void CloseSegment(SegmentHandle& h) {
 #endif
 }
 
+
+void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttach,
+                HeaderInfo* out) {
+#if defined(_WIN32)
+  const std::wstring wname = ToWide(ObjectName(name, false));
+  HANDLE section = OpenFileMappingW(FILE_MAP_READ, FALSE, wname.c_str());
+  if (section == nullptr) {
+    const DWORD e = GetLastError();
+    if (e == ERROR_FILE_NOT_FOUND) {
+      ThrowError(isolate, "E_NOT_FOUND", "segment does not exist", name);
+    }
+    ThrowSystemError(isolate, "OpenFileMappingW", static_cast<int>(e), name);
+  }
+  const void* base = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);  // whole section
+  if (base == nullptr) {
+    const int e = static_cast<int>(GetLastError());
+    CloseHandle(section);
+    ThrowSystemError(isolate, "MapViewOfFile", e, name);
+  }
+  const Header* h = static_cast<const Header*>(base);
+  out->magic = h->magic;
+  out->layoutVersion = h->layoutVersion;
+  out->initState = h->initState;
+  out->headerBytes = h->headerBytes;
+  out->flags = h->flags;
+  out->dataBytes = h->dataBytes;
+  const uint32_t count = AttachSlotCount(h->headerBytes);
+  const uint32_t n = count < maxAttach ? count : maxAttach;
+  for (uint32_t i = 0; i < n; i++) {
+    out->attach.push_back(h->attachTable[i].identity);
+    out->refcounts.push_back(h->attachTable[i].refcount);
+  }
+  UnmapViewOfFile(base);
+  CloseHandle(section);
+#else
+  const std::string obj = ObjectName(name, false);
+  const int fd = ::shm_open(obj.c_str(), O_RDONLY, 0);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      ThrowError(isolate, "E_NOT_FOUND", "segment does not exist", name);
+    }
+    ThrowSystemError(isolate, "shm_open", errno, name);
+  }
+  uint8_t buf[64 * 1024];
+  ssize_t total = 0;
+  while (total < static_cast<ssize_t>(sizeof(buf))) {
+    const ssize_t n = ::pread(fd, buf + static_cast<size_t>(total),
+                              sizeof(buf) - static_cast<size_t>(total), static_cast<off_t>(total));
+    if (n <= 0) break;
+    total += n;
+  }
+  ::close(fd);
+  if (total < 32) {
+    ThrowError(isolate, "E_INCOMPATIBLE", "segment too small for a membridge header", name);
+  }
+  uint32_t headerBytes;
+  std::memcpy(&headerBytes, buf + 16, 4);
+  std::memcpy(&out->magic, buf + 0, 4);
+  std::memcpy(&out->layoutVersion, buf + 4, 4);
+  std::memcpy(&out->initState, buf + 8, 4);
+  out->headerBytes = headerBytes;
+  std::memcpy(&out->flags, buf + 20, 4);
+  std::memcpy(&out->dataBytes, buf + 24, 8);
+  const uint32_t count = AttachSlotCount(headerBytes > sizeof(buf) ? static_cast<uint32_t>(sizeof(buf)) : headerBytes);
+  const uint32_t n = count < maxAttach ? count : maxAttach;
+  for (uint32_t i = 0; i < n; i++) {
+    AttachSlot slot;
+    std::memcpy(&slot, buf + 32 + i * sizeof(AttachSlot), sizeof(AttachSlot));
+    out->attach.push_back(slot.identity);
+    out->refcounts.push_back(slot.refcount);
+  }
+#endif
+}
+
 }  // namespace membridge

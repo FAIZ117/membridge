@@ -192,6 +192,10 @@ bool ParseOpts(v8::Isolate* isolate, v8::Local<v8::Value> optsVal, OpenOpts* opt
     if (!v->IsBoolean()) return false;
     opts->winGlobal = v->BooleanValue(isolate);
   }
+  if (GetProp(isolate, ctx, o, "unlinkWhenUnused", &v) && !v->IsUndefined()) {
+    if (!v->IsBoolean()) return false;
+    opts->unlinkWhenUnused = v->BooleanValue(isolate);
+  }
   if (GetProp(isolate, ctx, o, "kind", &v) && !v->IsUndefined()) {
     if (!v->IsInt32()) return false;
     *kind = v->Int32Value(ctx).ToChecked();
@@ -400,6 +404,7 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   m->raw = opts.raw;
   m->fd = guard.h.fd;
   m->name = name;
+  m->unlinkWhenUnused = opts.unlinkWhenUnused;
   // Only the Mapping that claimed the attach row releases it (a second
   // Mapping over the same segment in this process shares the row).
   m->attachSlot = ownsRow ? attachSlot : -1;
@@ -675,7 +680,8 @@ void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   int32_t* data = DataAddrOf(isolate, args[0]);
   const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
-  args.GetReturnValue().Set(v8::Boolean::New(isolate, MutexOwnerAlive(data, token)));
+  args.GetReturnValue().Set(
+      v8::Boolean::New(isolate, MutexOwnerAlive(data, token, kMutexHeaderWords, kMutexSlotCount)));
 }
 
 // mutexTrackHeld(name, view, token) / mutexUntrackHeld(view, token)
@@ -710,6 +716,70 @@ void MutexUntrackHeldJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Undefined(isolate));
 }
 
+// ringClaimRole(name, view, isProducer) -> token
+void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  if (args.Length() < 3 || !args[0]->IsString() || !args[2]->IsBoolean()) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "ringClaimRole(name: string, view: Int32Array, isProducer: boolean)")));
+    return;
+  }
+  v8::String::Utf8Value nameArg(isolate, args[0]);
+  int32_t* data = DataAddrOf(isolate, args[1]);
+  const bool isProducer = args[2]->BooleanValue(isolate);
+  const uint32_t token = RingClaimRole(
+      isolate, std::string(*nameArg, nameArg.length()), data,
+      isProducer ? kRingProducerWord : kRingConsumerWord, isProducer ? 0 : 1);
+  args.GetReturnValue().Set(v8::Number::New(isolate, token));
+}
+
+// readHeader(name, maxAttach) -> { magic, layoutVersion, initState, headerBytes,
+// flags, dataBytes, attach: [{pid, threadId, startTime, pidNsInode, refcount}] }
+// (§9 stat; throws E_NOT_FOUND / E_INCOMPATIBLE)
+void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+  if (args.Length() < 1 || !args[0]->IsString()) {
+    isolate->ThrowException(
+        v8::Exception::TypeError(Str(isolate, "readHeader(name: string, maxAttach?: number)")));
+    return;
+  }
+  v8::String::Utf8Value nameArg(isolate, args[0]);
+  const std::string name(*nameArg, nameArg.length());
+  uint32_t maxAttach = 128;
+  if (args.Length() >= 2 && args[1]->IsNumber()) {
+    const double d = args[1]->NumberValue(ctx).ToChecked();
+    if (d >= 0 && d <= 4096) maxAttach = static_cast<uint32_t>(d);
+  }
+  HeaderInfo info;
+  ReadHeader(isolate, name, maxAttach, &info);
+  v8::Local<v8::Object> o = v8::Object::New(isolate);
+  o->Set(ctx, Str(isolate, "magic"), v8::Number::New(isolate, info.magic)).Check();
+  o->Set(ctx, Str(isolate, "layoutVersion"), v8::Number::New(isolate, info.layoutVersion)).Check();
+  o->Set(ctx, Str(isolate, "initState"), v8::Number::New(isolate, info.initState)).Check();
+  o->Set(ctx, Str(isolate, "headerBytes"), v8::Number::New(isolate, info.headerBytes)).Check();
+  o->Set(ctx, Str(isolate, "flags"), v8::Number::New(isolate, info.flags)).Check();
+  o->Set(ctx, Str(isolate, "dataBytes"), v8::Number::New(isolate, static_cast<double>(info.dataBytes))).Check();
+  v8::Local<v8::Array> rows = v8::Array::New(isolate, static_cast<int>(info.attach.size()));
+  for (size_t i = 0; i < info.attach.size(); i++) {
+    const Identity& id = info.attach[i];
+    v8::Local<v8::Object> r = v8::Object::New(isolate);
+    r->Set(ctx, Str(isolate, "pid"), v8::Number::New(isolate, id.pid)).Check();
+    r->Set(ctx, Str(isolate, "threadId"), v8::Number::New(isolate, id.threadId)).Check();
+    r->Set(ctx, Str(isolate, "startTime"),
+           v8::Number::New(isolate, static_cast<double>(id.startTime))).Check();
+    r->Set(ctx, Str(isolate, "pidNsInode"),
+           v8::Number::New(isolate, static_cast<double>(id.pidNsInode))).Check();
+    r->Set(ctx, Str(isolate, "refcount"),
+           v8::Number::New(isolate, info.refcounts[i])).Check();
+    rows->Set(ctx, static_cast<uint32_t>(i), r).Check();
+  }
+  o->Set(ctx, Str(isolate, "attach"), rows).Check();
+  args.GetReturnValue().Set(o);
+}
+
 // ---- guarded trampolines ---------------------------------------------------
 // Every JS entry point catches NativeError (JS exception already pending).
 // Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
@@ -740,6 +810,8 @@ MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
 MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
 MEMBRIDGE_TRAMPOLINE(MutexTrackHeldJs2, MutexTrackHeldJs)
 MEMBRIDGE_TRAMPOLINE(MutexUntrackHeldJs2, MutexUntrackHeldJs)
+MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
+MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
 
 void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();  // F16: no Context::GetIsolate in V8 14.6
@@ -762,6 +834,8 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"mutexOwnerAlive", MutexOwnerAliveJs2},
       {"mutexTrackHeld", MutexTrackHeldJs2},
       {"mutexUntrackHeld", MutexUntrackHeldJs2},
+      {"ringClaimRole", RingClaimRoleJs2},
+      {"readHeader", ReadHeaderJs2},
   };
   for (const Reg& r : regs) {
     v8::Local<v8::Function> f =

@@ -43,6 +43,7 @@ struct OpenOpts {
   double initTimeoutMs = 5000;
   bool raw = false;
   bool winGlobal = false;
+  bool unlinkWhenUnused = false;
   uint64_t maxSegmentBytes = kDefaultMaxSegmentBytes;
 };
 
@@ -69,6 +70,7 @@ struct Mapping {
   std::string name;
   int fd = -1;  // POSIX: kept open so `grow` can ftruncate
   int attachSlot = -1;  // claimed attach-table row, -1 = none (raw or overflow)
+  bool unlinkWhenUnused = false;  // §9: the last detacher unlinks the name
   std::atomic<int> bsCount{0};  // live BackingStores over this mapping
   std::atomic<bool> detached{false};
 #ifdef _WIN32

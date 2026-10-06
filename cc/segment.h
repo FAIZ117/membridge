@@ -6,6 +6,7 @@
 #include "membridge.h"
 
 #include <string>
+#include <vector>
 
 namespace membridge {
 
@@ -39,6 +40,20 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
 
 void CloseSegment(SegmentHandle& h);
 
-}  // namespace membridge
+// §9 stat: read the §5.2 header of `name` without mapping the data region
+// (POSIX pread; Windows read-only view). Throws E_NOT_FOUND / E_INCOMPATIBLE.
+struct HeaderInfo {
+  uint32_t magic;
+  uint32_t layoutVersion;
+  int32_t initState;
+  uint32_t headerBytes;
+  uint32_t flags;
+  uint64_t dataBytes;
+  std::vector<Identity> attach;
+  std::vector<int32_t> refcounts;
+};
+void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttach,
+                HeaderInfo* out);
 
+}  // namespace membridge
 #endif  // MEMBRIDGE_SEGMENT_H_

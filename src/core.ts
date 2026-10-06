@@ -88,6 +88,7 @@ function toNativeOpts(opts: OpenOptions): Record<string, unknown> {
   if (opts.initTimeoutMs !== undefined) o.initTimeoutMs = opts.initTimeoutMs;
   if (opts.raw !== undefined) o.raw = opts.raw;
   if (opts.winGlobal !== undefined) o.winGlobal = opts.winGlobal;
+  if (opts.unlinkWhenUnused !== undefined) o.unlinkWhenUnused = opts.unlinkWhenUnused;
   if (opts.kind !== undefined) {
     o.kind = opts.kind === 'mutex' ? 1 : opts.kind === 'ring' ? 2 : 0;
   }

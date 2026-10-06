@@ -20,6 +20,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -54,8 +55,27 @@ void Mapping::Detach() {
   auto* h = static_cast<Header*>(base);
   if (h != nullptr) {
     ReleaseAttachRow(h, attachSlot);
-    // unlinkWhenUnused (§9) is driven from the JS layer when the last local
-    // reference goes away; Detach only does the bookkeeping.
+    // §9 unlinkWhenUnused: the detach that empties the attach table unlinks
+    // the name, so late joiners cannot resurrect an abandoned segment.
+    // Best-effort: a racing creator/joiner is protected by the header magic
+    // check on its side.
+    if (unlinkWhenUnused) {
+      bool anyAttached = false;
+      const uint32_t n = AttachSlotCount(h->headerBytes);
+      for (uint32_t i = 0; i < n; i++) {
+        if (AtomicSlotRefcount(&h->attachTable[i])->load(std::memory_order_acquire) > 0) {
+          anyAttached = true;
+          break;
+        }
+      }
+      if (!anyAttached) {
+#if defined(_WIN32)
+        h->flags |= kFlagUnlinked;  // the section dies with the last handle
+#else
+        ::shm_unlink(name.c_str());  // ENOENT (already gone) is fine
+#endif
+      }
+    }
   }
   attachSlot = -1;
 }

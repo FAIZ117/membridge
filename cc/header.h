@@ -24,10 +24,23 @@ namespace membridge {
 // the data region stays page-aligned and 16 KiB pages (Apple Silicon) work.
 constexpr uint32_t kMinHeaderBytes = 4096;
 
-// initState values
+// initState values. While the segment is INITIALIZING the word also NAMES the
+// initializer: bits 8+ hold the initializer's attach-row index (review R7 —
+// the baton must be published atomically with the state so a joiner can never
+// see "initializing" without knowing exactly which row holds the initializer;
+// reading a stale `initializerSlot` field used to let two joiners take over
+// concurrently). Rows are bounded by the header page (≤ 2048), so the packed
+// value always stays a small positive i32. A bare 1 (no row bits) is only
+// produced by hand-crafted crash states; readers then fall back to the
+// `initializerSlot` field.
 constexpr int32_t kInitUninit = 0;
 constexpr int32_t kInitInitializing = 1;
 constexpr int32_t kInitReady = 2;
+constexpr int kInitSlotShift = 8;
+inline int32_t InitStatePacked(int slot) {
+  return kInitInitializing | (slot << kInitSlotShift);
+}
+inline int InitSlotOf(int32_t state) { return state >> kInitSlotShift; }
 
 struct AttachSlot {
   Identity identity;  // 24 B @0 — pid, threadId (0 here), startTime, pidNsInode

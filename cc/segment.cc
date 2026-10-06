@@ -396,7 +396,9 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   const Header* h = static_cast<const Header*>(base);
   out->magic = h->magic;
   out->layoutVersion = h->layoutVersion;
-  out->initState = h->initState;
+  // Expose the STATE bits only: while initializing the word packs the
+  // initializer's row into bits 8+ (review R7) — ops consumers expect 0/1/2.
+  out->initState = h->initState & 0xFF;
   out->headerBytes = h->headerBytes;
   out->flags = h->flags;
   out->dataBytes = h->dataBytes;
@@ -434,6 +436,7 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   std::memcpy(&out->magic, buf + 0, 4);
   std::memcpy(&out->layoutVersion, buf + 4, 4);
   std::memcpy(&out->initState, buf + 8, 4);
+  out->initState &= 0xFF;  // state bits only (row packing, review R7)
   out->headerBytes = headerBytes;
   std::memcpy(&out->flags, buf + 20, 4);
   std::memcpy(&out->dataBytes, buf + 24, 8);

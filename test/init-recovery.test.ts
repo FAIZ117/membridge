@@ -153,6 +153,34 @@ test('two sequential joiners after takeover both see a ready segment', { skip: P
   assert.strictEqual(new Int32Array(b)[1], 3);
 });
 
+// R7: the baton word names the initializer's row in bits 8+ (`1 | row<<8`).
+// A joiner must read the row from the WORD — a stale `initializerSlot` field
+// used to let two joiners take over concurrently. Craft the packed encoding
+// with the initializer in row 2 (not row 0) so only word decoding finds it.
+test('R7: packed baton word (1 | row<<8) is honored; stale field is ignored', { skip: POSIX ? false : SKIP }, async (t) => {
+  const name = makeTrackedNameLocal(t);
+  const path = shmPath(name);
+  const dead = await makeDeadIdentity();
+  const rows = [
+    { pid: 0, threadId: 0, startTime: 0, pidNsInode: 0, refcount: 0 },
+    { pid: 0, threadId: 0, startTime: 0, pidNsInode: 0, refcount: 0 },
+    { pid: dead.pid, threadId: 0, startTime: dead.startTime, pidNsInode: 0, refcount: 1 },
+  ];
+  fs.writeFileSync(
+    path!,
+    buildHeader({
+      initState: 1 | (2 << 8), // packed baton naming row 2 (review R7)
+      initializerSlot: 0x7fffffff, // stale/hostile field: must NOT be trusted
+      dataBytes: 4096,
+      attachSlots: rows,
+    }),
+  );
+  const sab = open(name, 4096);
+  assert.strictEqual(sab.byteLength, 4096);
+  new Int32Array(sab)[3] = 7;
+  assert.strictEqual(new Int32Array(open(name, 4096))[3], 7);
+});
+
 // E_NO_SPACE: only where the CI prepared a small tmpfs (§13 platform rules).
 test('E_NO_SPACE on a full small tmpfs', { skip: TMPFS ? false : SKIP_TMPFS }, (t) => {
   const name = makeTrackedNameLocal(t);

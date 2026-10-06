@@ -32,8 +32,11 @@ The flags are set/cleared by the **synchronous** `reserve`/`commit`/`peek`/
 `release` paths only. The async variants (`reserveAsync`/`peekAsync`) initially
 waited without touching the flags, so their peers never notified them and every
 async wake cost a full wait slice (review R14: async consumer 383 msgs/s with
-37% of messages over 200 ms). The async paths now poll-then-`waitAsync` on the
-peer's counter with the same set/re-check/clear pattern as the sync paths.
+37% of messages over 200 ms). **Fixed in fix round 2 after the re-verification
+confirmed the first fix had missed the async paths entirely** — they now follow
+the same set/re-check/clear pattern around their `waitAsync` waits, and a
+latency regression test asserts a parked `peekAsync` wakes in milliseconds
+when the producer commits.
 Also: a crashed waiter leaves its flag set — a busy successor that never parks
 then pays one futile wake per message until it parks once; role claims reset
 the peer's flags at takeover so the stale flag clears on handover.

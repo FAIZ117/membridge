@@ -544,3 +544,22 @@ test('R20: NaN/Infinity timeouts are rejected, not infinite hangs', async () => 
     unlinkQuietly(name);
   }
 });
+
+test('R14: peekAsync wakes in milliseconds when the producer commits', async () => {
+  const { performance } = await import('node:perf_hooks');
+  const name = uniqueName();
+  try {
+    const p = RingProducer.open(name, { capacity: 4096 });
+    const c = RingConsumer.open(name);
+    const t0 = performance.now();
+    const msgP = c.peekAsync({ timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 20));  // consumer is parked
+    p.write(Buffer.from('async wake'));
+    const msg = await msgP;
+    const ms = performance.now() - t0;
+    assert.strictEqual(Buffer.from(msg!).toString(), 'async wake');
+    assert.ok(ms < 150, `async wake took ${ms.toFixed(1)} ms (slice-bound = flagless wait)`);
+  } finally {
+    unlinkQuietly(name);
+  }
+});

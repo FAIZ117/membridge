@@ -280,19 +280,33 @@ export class RingProducer {
    * threads; resolves with the same zero-copy view. */
   async reserveAsync(n: number, opts?: ReserveOptions): Promise<Uint8Array> {
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
-    for (;;) {
-      try {
-        return this.reserve(n, { timeoutMs: 0 });  // non-blocking attempt
-      } catch (e) {
-        if (!(e instanceof MembridgeError) || e.code !== 'E_TIMEOUT') throw e;
+    let parked = false;
+    try {
+      for (;;) {
+        try {
+          return this.reserve(n, { timeoutMs: 0 });  // non-blocking attempt
+        } catch (e) {
+          if (!(e instanceof MembridgeError) || e.code !== 'E_TIMEOUT') throw e;
+        }
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+          throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
+            segmentName: this.name,
+          });
+        }
+        // Park with the flag protocol (review R14): announce, re-check, wait.
+        Atomics.store(this.view, PRODUCER_PARKED, 1);
+        parked = true;
+        const tailNow = this.tail();
+        if (tailNow !== this.tail()) continue;
+        await waitAsync(this.view, TAIL, tailNow, sliceOf(deadline));
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+          throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
+            segmentName: this.name,
+          });
+        }
       }
-      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
-          segmentName: this.name,
-        });
-      }
-      const tail = this.tail();
-      await waitAsync(this.view, TAIL, tail, sliceOf(deadline));
+    } finally {
+      if (parked) Atomics.store(this.view, PRODUCER_PARKED, 0);
     }
   }
 
@@ -434,12 +448,23 @@ export class RingConsumer {
   /** Async variant of {@link peek} (§8.2). Resolves null on timeout. */
   async peekAsync(opts?: ReserveOptions): Promise<Uint8Array | null> {
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
-    for (;;) {
-      const msg = this.peek({ timeoutMs: 0 });
-      if (msg !== null) return msg;
-      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
-      const head = this.head();
-      await waitAsync(this.view, HEAD, head, sliceOf(deadline));
+    let parked = false;
+    try {
+      for (;;) {
+        const msg = this.peek({ timeoutMs: 0 });
+        if (msg !== null) return msg;
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+        Atomics.store(this.view, CONSUMER_PARKED, 1);
+        parked = true;
+        const headNow = this.head();
+        if (headNow !== this.head()) continue;
+        await waitAsync(this.view, HEAD, headNow, sliceOf(deadline));
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+          return this.peek({ timeoutMs: 0 });  // last look before giving up
+        }
+      }
+    } finally {
+      if (parked) Atomics.store(this.view, CONSUMER_PARKED, 0);
     }
   }
 

@@ -126,7 +126,7 @@ isNative(): boolean
 | Field | Type | Purpose |
 |-------|------|---------|
 | magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
-| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. Joiners wait on it with native wait (§6). |
+| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. Joiners wait on it with native wait (§6); every transition wakes the word. **Protocol (fix round 2026-10-06):** the creator ftruncates the header page immediately after `O_EXCL`, publishes `headerBytes` + its attach row + `initializerSlot`, stores 1, and only then sizes the object fully and stores 2 — a joiner never sees a live creator at state 0. A joiner at state 0 grace-waits (250 ms in `OpenSegment` for the header page, 50 ms for the state word), then wins a 0→1 CAS to initialize. A dead initializer at state 1 is handed back through a 1→0 CAS so exactly ONE joiner wins the 0→1 CAS — no concurrent-WriteHeader war. Takeover is idempotent and rewrites every field. |
 | headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
 | flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
 | attach table | N × 32 B | One slot per attached process: identity (§7.1) + local refcount. ~120 slots with a 4 KiB page. |
@@ -151,9 +151,10 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
 - **Validation first, in JS and native:** `Number.isSafeInteger(size) && size >= 1 && size <= maxSegmentBytes`.
   Native reads the size as `double`/`int64`, never `Uint32Value()` (F5).
 - **Policies on join** (compared against `header.dataBytes`):
+  - **The mapping is the single source of truth for geometry (fix round 2026-10-06).** Joins never map more bytes than the object actually holds (`min(requested, st_size)`; whole-object joins map `st_size`), a joiner never `ftruncate`s, and every header-derived size is validated/clamped against `mappingBytes − headerBytes`: a ready join with `header.dataBytes` above that bound is `E_INCOMPATIBLE`. This is what makes a hostile or stale header unable to size a `BackingStore` past mapped memory.
   - `exact` (default): mismatch → `E_SIZE_MISMATCH` naming both sizes.
   - `at-least`: requested ≤ existing → map the requested prefix; larger → `E_SIZE_MISMATCH`. **Why:** mapping a prefix can never SIGBUS, and lets a reader map only a known header.
-  - `grow`: requested > existing → `ftruncate` up (grow-only) under the header's init lock, update `dataBytes`. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS, if U2 holds, → `E_GROW_UNSUPPORTED`. **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
+  - `grow`: requested > existing → under the header's init lock `ftruncate` to `max(requested, file size − header)` (never shrink below a concurrent grower), update `dataBytes`, and re-map so the mapping covers the new size. A grower that loses the init-lock race retries the policy against the refreshed header. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS, if U2 holds, → `E_GROW_UNSUPPORTED`. **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
 - **Reserve (Linux):** `posix_fallocate` on the data region at create; failure → `E_NO_SPACE`.
   **Why:** tmpfs charges lazily, so a full `/dev/shm` shows up as SIGBUS on first touch,
   possibly hours later. Reserving turns that into a create-time error (F7).

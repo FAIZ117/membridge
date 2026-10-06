@@ -80,7 +80,7 @@ export function capacity(): Capacity {
 export function stat(name: string): SegmentStat {
   validateName(name);
   const b = nativeOrThrow();
-  const h = b.readHeader(name, 128);
+  const h = b.readHeader(name);
   if (h.magic !== MAGIC) {
     throw new MembridgeError('E_INCOMPATIBLE', `'${name}' is not a membridge segment`, {
       segmentName: name,

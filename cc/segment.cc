@@ -7,6 +7,8 @@
 #include "header.h"
 
 #include <cerrno>
+#include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -175,25 +177,48 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
 
   uint64_t total = requestedTotal;
   {
-    // Size the mapping against the on-disk object BEFORE any page is touched:
-    // a creator that crashed before ftruncate leaves a zero-length object, and
-    // reading its header would SIGBUS. POSIX only; Windows sections are sized
-    // at CreateFileMappingW time.
+    // The MAPPING is the single source of truth for geometry (review Sec
+    // F1/F2): a joiner never maps more bytes than the object actually holds,
+    // so a hostile or stale header can never size a BackingStore past the
+    // mapping. POSIX only; Windows sections are sized at CreateFileMappingW
+    // time.
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
       const int e = errno;
       ::close(fd);
       ThrowSystemError(isolate, "fstat", e, name);
     }
-    const off_t fileSize = st.st_size;
+    off_t fileSize = st.st_size;
+
     if (opts.raw) {
-      if (!created && !wholeObject) {
+      if (created) {
+        // Raw creator: no header, no init protocol — size the whole object
+        // now (full sizing via InitOrJoin needs the header protocol).
+        if (::ftruncate(fd, static_cast<off_t>(requestedTotal)) != 0) {
+          const int e = errno;
+          ::close(fd);
+          ::shm_unlink(obj.c_str());
+          ThrowSystemError(isolate, "ftruncate", e, name);
+        }
+#if defined(__linux__)
+        if (opts.reserve) {
+          const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(requestedTotal));
+          if (rc != 0) {
+            ::close(fd);
+            ::shm_unlink(obj.c_str());
+            ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+          }
+        }
+#endif
+        // total stays requestedTotal
+      } else if (!wholeObject) {
         if (static_cast<uint64_t>(fileSize) < requestedTotal) {
           if (opts.sizePolicy == SizePolicy::kGrow) {
             // raw grow: no header/init lock exists — foreign-mode tradeoff
             if (::ftruncate(fd, static_cast<off_t>(requestedTotal)) != 0) {
               ThrowSystemError(isolate, "ftruncate", errno, name);
             }
+            fileSize = static_cast<off_t>(requestedTotal);
           } else {
             ThrowError(isolate, "E_SIZE_MISMATCH",
                        "raw segment is smaller than requested", name,
@@ -201,48 +226,52 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
           }
         }
       }
-      // total stays requestedTotal (exact/at-least/grow) or fileSize (whole)
-      if (wholeObject) total = static_cast<uint64_t>(fileSize);
-    } else {
-      if (wholeObject) {
-        total = static_cast<uint64_t>(fileSize) < headerBytes
-                    ? headerBytes
-                    : static_cast<uint64_t>(fileSize);
-      } else if (!created && fileSize < static_cast<off_t>(headerBytes)) {
-        // Creator died before even writing the header page: size the object
-        // for the takeover path (it rewrites the header; InitOrJoin's
-        // EnsureSizedOnTakeover fixes the data region when needed).
-        if (::ftruncate(fd, static_cast<off_t>(total)) != 0) {
-          ThrowSystemError(isolate, "ftruncate", errno, name);
-        }
-      }
-    }
-  }
-
-  // Size the object on create. On join, only `grow` extends it (caller runs
-  // that under the init lock). Windows needs none of this — the section is
-  // fixed at CreateFileMappingW time, which is why `grow` is POSIX-only and
-  // the size lives in the header (§5.2/§5.3).
-  if (created) {
-    if (::ftruncate(fd, static_cast<off_t>(total)) != 0) {
-      const int e = errno;
-      ::close(fd);
-      ::shm_unlink(obj.c_str());
-      ThrowSystemError(isolate, "ftruncate", e, name);
-    }
-    // Reserve (Linux): tmpfs charges lazily, so a full /dev/shm would
-    // otherwise surface as SIGBUS hours later. Reserving turns it into a
-    // create-time error (F7).
-#if defined(__linux__)
-    if (opts.reserve) {
-      const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(total));
-      if (rc != 0) {
+      if (!created && wholeObject) total = static_cast<uint64_t>(fileSize);
+    } else if (created) {
+      // Creator: back the header page IMMEDIATELY so joiners can never see a
+      // sub-header-page object for long, and never map past EOF ourselves.
+      // Full sizing (+ reserve) happens in InitOrJoin once state = 1 makes us
+      // the sole, visible initializer.
+      if (::ftruncate(fd, static_cast<off_t>(headerBytes)) != 0) {
+        const int e = errno;
         ::close(fd);
         ::shm_unlink(obj.c_str());
-        ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+        ThrowSystemError(isolate, "ftruncate", e, name);
       }
+      total = headerBytes;
+    } else {
+      // Joiner: wait briefly for a mid-init creator to publish the header
+      // page; a creator that died before even that is taken over after the
+      // grace period (everyone truncates to exactly headerBytes — idempotent,
+      // no shrink war) and the §5.2 CAS serializes real initialization.
+      if (fileSize < static_cast<off_t>(headerBytes)) {
+        const auto graceStart = std::chrono::steady_clock::now();
+        while (fileSize < static_cast<off_t>(headerBytes)) {
+          if (std::chrono::steady_clock::now() - graceStart > std::chrono::milliseconds(250)) {
+            break;
+          }
+          ::usleep(2000);
+          if (::fstat(fd, &st) != 0) {
+            const int e = errno;
+            ::close(fd);
+            ThrowSystemError(isolate, "fstat", e, name);
+          }
+          fileSize = st.st_size;
+        }
+        if (fileSize < static_cast<off_t>(headerBytes)) {
+          if (::ftruncate(fd, static_cast<off_t>(headerBytes)) != 0) {
+            ThrowSystemError(isolate, "ftruncate", errno, name);
+          }
+          fileSize = static_cast<off_t>(headerBytes);
+        }
+        h.waitedForCreator = true;
+      }
+      // Never map past EOF: sized joins map min(requested, file) (InitOrJoin
+      // re-maps after a takeover/grow extends the object); whole-object joins
+      // map exactly the file.
+      total = wholeObject ? static_cast<uint64_t>(fileSize)
+                          : std::min(requestedTotal, static_cast<uint64_t>(fileSize));
     }
-#endif
   }
 
   void* base = ::mmap(nullptr, static_cast<size_t>(total), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -277,6 +306,21 @@ void CloseSegment(SegmentHandle& h) {
 #endif
 }
 
+
+void RemapSegment(SegmentHandle& h, uint64_t newTotal) {
+#if !defined(_WIN32)
+  if (static_cast<uint64_t>(h.mappingBytes) >= newTotal) return;
+  void* fresh = ::mmap(nullptr, static_cast<size_t>(newTotal), PROT_READ | PROT_WRITE,
+                       MAP_SHARED, h.fd, 0);
+  if (fresh == MAP_FAILED) return;  // caller's policy checks still bound windows
+  ::munmap(h.base, h.mappingBytes);
+  h.base = fresh;
+  h.mappingBytes = static_cast<size_t>(newTotal);
+#else
+  (void)h;
+  (void)newTotal;
+#endif
+}
 
 void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttach,
                 HeaderInfo* out) {
@@ -340,11 +384,17 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   out->headerBytes = headerBytes;
   std::memcpy(&out->flags, buf + 20, 4);
   std::memcpy(&out->dataBytes, buf + 24, 8);
-  const uint32_t count = AttachSlotCount(headerBytes > sizeof(buf) ? static_cast<uint32_t>(sizeof(buf)) : headerBytes);
-  const uint32_t n = count < maxAttach ? count : maxAttach;
+  // Rows are bounded by the bytes ACTUALLY read (review F29: a short file
+  // must not expose uninitialized stack) and by maxAttach; empty rows are
+  // skipped natively (review P9).
+  const uint32_t byFile =
+      AttachSlotCount(headerBytes > static_cast<uint32_t>(total) ? static_cast<uint32_t>(total) : headerBytes);
+  const uint32_t n = std::min(std::min(byFile, maxAttach),
+                              static_cast<uint32_t>((total - 32) / 32));
   for (uint32_t i = 0; i < n; i++) {
     AttachSlot slot;
     std::memcpy(&slot, buf + 32 + i * sizeof(AttachSlot), sizeof(AttachSlot));
+    if (slot.refcount <= 0 || slot.identity.pid == 0) continue;  // empty row
     out->attach.push_back(slot.identity);
     out->refcounts.push_back(slot.refcount);
   }

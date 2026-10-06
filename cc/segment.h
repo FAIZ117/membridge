@@ -28,6 +28,9 @@ struct SegmentHandle {
   size_t mappingBytes = 0;
   int fd = -1;  // POSIX only; -1 on Windows
   bool created = false;
+  // POSIX: OpenSegment grace-waited for a creator that never published even
+  // the header page — InitOrJoin may take over state 0 without waiting again.
+  bool waitedForCreator = false;
 #ifdef _WIN32
   void* section = nullptr;  // HANDLE of the file mapping
 #endif
@@ -39,6 +42,11 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
                           uint32_t headerBytes, uint64_t dataBytes, uint32_t kindFlags);
 
 void CloseSegment(SegmentHandle& h);
+
+// POSIX: munmap + re-mmap `h` at `newTotal` bytes (grow/takeover extended
+// the object past the joiner's original, size-of-truth mapping). No-op when
+// the mapping already covers newTotal. Windows sections are fixed-size.
+void RemapSegment(SegmentHandle& h, uint64_t newTotal);
 
 // §9 stat: read the §5.2 header of `name` without mapping the data region
 // (POSIX pread; Windows read-only view). Throws E_NOT_FOUND / E_INCOMPATIBLE.

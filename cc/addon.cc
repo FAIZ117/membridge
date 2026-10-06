@@ -11,6 +11,7 @@
 #include "segment.h"
 #include "wait.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -329,22 +330,26 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   const uint64_t requested = haveSize ? static_cast<uint64_t>(sizeD) : 0;
 
-  // Registry reuse (§5.4). mode 'create' never reuses: it must reach the
-  // E_EXISTS check even when a live mapping is cached.
-  if (opts.mode != Mode::kCreate) {
-    if (auto live = Registry::Get().Find(name)) {
-      uint64_t windowBytes = 0;
-      if (TryReuse(isolate, live, opts, haveSize, requested, &windowBytes)) {
-        args.GetReturnValue().Set(MakeWindow(isolate, live, live->headerBytes, windowBytes));
-        return;
-      }
-    }
-  }
-
   const uint32_t headerBytes = opts.raw ? 0u : EffectiveHeaderBytes();
   uint32_t kindFlags = kKindPlain;
   if (kind == 1) kindFlags = kKindMutex;
   else if (kind == 2) kindFlags = kKindRing;
+
+  // Registry reuse (§5.4). mode 'create' never reuses: it must reach the
+  // E_EXISTS check even when a live mapping is cached. A raw/plain mismatch
+  // never reuses either (review F33): the window offset differs by a header
+  // page.
+  if (opts.mode != Mode::kCreate) {
+    if (auto live = Registry::Get().Find(name)) {
+      if (live->raw == opts.raw) {
+        uint64_t windowBytes = 0;
+        if (TryReuse(isolate, live, opts, haveSize, requested, &windowBytes)) {
+          args.GetReturnValue().Set(MakeWindow(isolate, live, live->headerBytes, windowBytes));
+          return;
+        }
+      }
+    }
+  }
 
   // Size-less open joins at the existing size (whole object); it can never
   // create. Size policy for it is "whatever exists".
@@ -368,13 +373,30 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
     InitOrJoin(isolate, guard.h, name, opts, headerBytes, initBytes, kindFlags, &attachSlot,
                &ownsRow);
 
-    // Grow (§5.3): re-enter the init lock and ftruncate up. POSIX-only; the
-    // mapping was already made at the requested size, and ftruncate makes
-    // every page of it backed.
+    // Grow (§5.3): re-enter the init lock and ftruncate up, then re-map so
+    // the mapping covers the new size. GrowSegment returns 0 when it lost the
+    // lock race — retry the policy against the refreshed header instead of
+    // returning a window past the object (review F8).
     Header* h = static_cast<Header*>(guard.h.base);
-    const uint64_t existing = HeaderDataBytes(h);
-    if (haveSize && opts.sizePolicy == SizePolicy::kGrow && requested > existing) {
-      GrowSegment(isolate, guard.h, name, opts, headerBytes, requested);
+    if (haveSize && opts.sizePolicy == SizePolicy::kGrow) {
+      const double giveUp =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count() + opts.initTimeoutMs;
+      while (HeaderDataBytes(h) < requested) {
+        const uint64_t grown = GrowSegment(isolate, guard.h, name, opts, headerBytes, requested);
+        h = static_cast<Header*>(guard.h.base);  // GrowSegment may re-map
+        if (grown == 0) {
+          const double nowMs =
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          if (nowMs >= giveUp) {
+            ThrowError(isolate, "E_INIT_TIMEOUT", "segment busy (growing) for too long", name);
+          }
+          continue;
+        }
+      }
     }
 
     const uint64_t nowExisting = HeaderDataBytes(h);
@@ -386,15 +408,19 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   // raw: OpenSegment enforced exact/at-least/grow against st_size before mmap.
 
-  // Authoritative sizes for the Mapping + window.
-  const uint64_t windowBytes =
-      haveSize ? requested
-               : (opts.raw ? guard.h.mappingBytes
-                           : HeaderDataBytes(static_cast<Header*>(guard.h.base)));
-  const uint64_t mappedDataBytes =
+  // Authoritative sizes for the Mapping + window. The mapping is the truth:
+  // every window is clamped to mappingBytes - headerBytes (review Sec F1) —
+  // InitOrJoin already validated the header against this bound, so the clamp
+  // is defense in depth.
+  const uint64_t maxWindow =
       opts.raw ? guard.h.mappingBytes
-               : (haveSize ? requested
-                           : HeaderDataBytes(static_cast<Header*>(guard.h.base)));
+               : (guard.h.mappingBytes > headerBytes ? guard.h.mappingBytes - headerBytes : 0);
+  const uint64_t headerExisting =
+      opts.raw ? 0 : HeaderDataBytes(static_cast<Header*>(guard.h.base));
+  const uint64_t wanted =
+      haveSize ? requested : (opts.raw ? guard.h.mappingBytes : headerExisting);
+  const uint64_t windowBytes = wanted > maxWindow ? maxWindow : wanted;
+  const uint64_t mappedDataBytes = windowBytes;
 
   auto m = std::make_shared<Mapping>();
   m->base = guard.h.base;
@@ -748,7 +774,7 @@ void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   v8::String::Utf8Value nameArg(isolate, args[0]);
   const std::string name(*nameArg, nameArg.length());
-  uint32_t maxAttach = 128;
+  uint32_t maxAttach = 2048;
   if (args.Length() >= 2 && args[1]->IsNumber()) {
     const double d = args[1]->NumberValue(ctx).ToChecked();
     if (d >= 0 && d <= 4096) maxAttach = static_cast<uint32_t>(d);

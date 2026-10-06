@@ -279,3 +279,102 @@ test('Corr F22: ownerDied is reported exactly once per death', async () => {
     unlinkQuietly(name);
   }
 });
+
+test('Corr F10 / Perf P2: a woken waiter does not sleep a full slice on a free lock', async () => {
+  const { Mutex } = await import('../src/mutex');
+  const name = uniqueName();
+  try {
+    const m = Mutex.open(name);
+    m.lock();
+    // Three waiters queue up while the lock is held (worker threads, since
+    // sync lock blocks this thread).
+    const { Worker } = await import('node:worker_threads');
+    const workers = [0, 1, 2].map(() => new Worker(
+      `const { parentPort, workerData } = require('worker_threads');
+       const { Mutex } = require(workerData.pkg);
+       const m = Mutex.open(workerData.name);
+       const t0 = performance.now();
+       m.lock();
+       m.unlock();
+       parentPort.postMessage(performance.now() - t0);`,
+      { eval: true, workerData: { name, pkg: require.resolve('../src/mutex') } },
+    ));
+    // release once the workers have had a beat to contend
+    await new Promise((r) => setTimeout(r, 30));
+    m.unlock();
+    const waits = await Promise.all(workers.map((w) =>
+      new Promise<number>((res) => w.on('message', (ms: number) => res(ms)))));
+    // Without the HAS_WAITERS-preserving acquire, waiters 2 and 3 paid a
+    // full 250 ms slice each (the review measured +94..100 ms). With bounded
+    // scheduling noise, every handoff should be far below a slice.
+    for (const ms of waits) {
+      assert.ok(ms < 200, `contended handoff took ${ms.toFixed(1)} ms (slice-bound = lost wakeup)`);
+    }
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('Perf P4: short timeouts are not stretched to a 250 ms slice', async () => {
+  const { Mutex } = await import('../src/mutex');
+  const name = uniqueName();
+  const { Worker } = await import('node:worker_threads');
+  const holder = new Worker(
+    `const { parentPort, workerData } = require('worker_threads');
+     const { Mutex } = require(workerData.pkg);
+     const m = Mutex.open(workerData.name);
+     m.lock();
+     parentPort.postMessage('held');
+     setInterval(() => {}, 1 << 30);`,
+    { eval: true, workerData: { name, pkg: require.resolve('../src/mutex') } },
+  );
+  try {
+    await new Promise<void>((r) => holder.on('message', () => r()));
+    const m = Mutex.open(name);
+    const t0 = performance.now();
+    assert.throws(() => m.lock({ timeoutMs: 10 }), (e: any) => e.code === 'E_TIMEOUT');
+    const ms = performance.now() - t0;
+    assert.ok(ms < 120, `lock({timeoutMs:10}) took ${ms.toFixed(1)} ms (slice floor)`);
+  } finally {
+    await holder.terminate();
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F30: ring join validates capacity and maxMessage against the header', () => {
+  const name = uniqueName();
+  try {
+    RingProducer.open(name, { capacity: 4096 });
+    assert.throws(() => RingProducer.open(name, { capacity: 8192 }), (e: any) =>
+      e.code === 'E_SIZE_MISMATCH');
+    assert.throws(
+      () => RingProducer.open(name, { capacity: 4096, maxMessage: 100 }),
+      (e: any) => e.code === 'E_SIZE_MISMATCH',
+    );
+    // joining with matching values is fine
+    RingProducer.open(name, { capacity: 4096, maxMessage: 2040 });
+    // a joiner without values adopts the header's
+    const c = RingConsumer.open(name);
+    assert.strictEqual(c.capacityBytes, 4096);
+  } finally {
+    unlinkQuietly(name);
+  }
+});
+
+test('Corr F30: reserveAsync and peekAsync work end to end', async () => {
+  const name = uniqueName();
+  try {
+    const p = RingProducer.open(name, { capacity: 4096 });
+    const c = RingConsumer.open(name);
+    const pending = c.peekAsync({ timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50)); // consumer is parked
+    const view = await p.reserveAsync(11);
+    view.set(Buffer.from('hello world'));
+    p.commit();
+    const msg = await pending;
+    assert.strictEqual(Buffer.from(msg!).toString(), 'hello world');
+    c.release();
+  } finally {
+    unlinkQuietly(name);
+  }
+});

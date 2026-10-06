@@ -332,9 +332,15 @@ check so it is never evicted; and a stale token can never win a CAS again.
 
 ### 7.3 Protocol
 
-- **Lock:** CAS `0 → myToken`. On failure: set `HAS_WAITERS`, `sync.wait(lockWord, observed)`,
-  loop. Every wait has a bounded timeout (default 250 ms) after which the owner's liveness
-  is checked. **Why a timeout at all:** a dead owner never calls `notify`.
+- **Lock:** CAS `0 → myToken` — a whole-word write, so a stale HAS_WAITERS bit a lost
+  race left behind is cleared. On failure: set `HAS_WAITERS`, **re-read the word and retry
+  immediately if it now reads free**, then `sync.wait(lockWord, observed)`; after the first
+  park, acquisition writes `myToken | HAS_WAITERS` — the bit is preserved because other
+  waiters may still be parked on the word the new owner will unlock (Drepper's mutex2; fix
+  round 2026-10-06, ADR 0005 — the bare-token acquire erased the bit and waiters slept
+  full slices on a free lock). Every wait has a bounded timeout (default 250 ms, clamped to
+  the caller's remaining timeout) after which the owner's liveness is checked.
+  **Why a timeout at all:** a dead owner never calls `notify`.
 - **Steal:** owner token → slot → identity is dead (§7.1) and slot gen matches the token
   → CAS `deadToken → myToken`, set `ownerDied = 1`. Losing the CAS just means retry.
 - **No heartbeat.** **Why:** the owner cannot update a heartbeat while inside a synchronous
@@ -369,14 +375,22 @@ Segment `kind = ring`, data region:
 
 ```
 i32 head        producer's committed byte count (free-running, wraps mod 2^32)
+i32 cParked     consumer-parked flag (padding word, head's cache line — ADR 0006)
 i32 tail        consumer's released byte count (free-running)
+i32 pParked     producer-parked flag (padding word, tail's cache line)
 i32 producer    participant token (role claim)
 i32 consumer    participant token (role claim)
 u32 capacity    power of two, 4 KiB … 1 GiB
 u32 maxMessage  ≤ capacity/2 - 8
-… padding to 64 B (head and tail on separate cache lines)
+… rest of the two cache lines as padding
 data[capacity]
 ```
+
+The parked flags (fix round 2026-10-06, ADR 0006): the waiting side sets its
+flag, re-checks, parks, and clears it on exit; the notifying side wakes only
+when the peer's flag is set — an unparked message costs zero FUTEX_WAKEs. A
+crashed waiter leaves its flag set, costing one futile wake per notify, never
+correctness.
 
 - **Free-running 32-bit counters with power-of-two capacity**: `used = (head - tail) >>> 0`.
   **Why:** no "one empty slot" waste (Lamport), and the counters stay `i32`, so they are

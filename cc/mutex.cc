@@ -312,10 +312,22 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
                        uint32_t slotsBase, uint32_t roleWordOffset, uint32_t slotIndex) {
   const Identity self = SelfIdentity();
   auto* roleWord = AtomicWord(data + roleWordOffset);
-
-  for (;;) {
+  // Review F23: bound the scan — a slot stuck RESERVED by a crashed claimer
+  // used to spin this loop at 100% CPU with the JS thread blocked forever.
+  for (int guard = 0; guard < 10000; guard++) {
     const uint32_t cur = static_cast<uint32_t>(roleWord->load(std::memory_order_acquire));
     if (cur != 0) {
+      // Same-thread re-claim (review F23): the role is OURS — a second
+      // RingProducer.open on this thread gets its own token back instead of
+      // E_ROLE_TAKEN against itself.
+      const uint32_t curSlot = (cur & kMutexTokenMask) >> 16;
+      if (curSlot == slotIndex && SlotState(data, slotsBase, slotIndex) == kMutexStateActive) {
+        const Identity id = SlotIdentity(data, slotsBase, slotIndex);
+        if (id.pid == self.pid && id.threadId == self.threadId &&
+            id.startTime == self.startTime) {
+          return cur;
+        }
+      }
       // A holder exists: live -> E_ROLE_TAKEN; dead -> clear and take over.
       if (MutexOwnerAlive(data, cur, slotsBase, 2)) {
         ThrowError(isolate, "E_ROLE_TAKEN",
@@ -383,6 +395,8 @@ uint32_t ClaimRoleSlot(v8::Isolate* isolate, const std::string& name, int32_t* d
     // Lost the role CAS (raced takeover): drop our slot claim and retry.
     CasSlotState(data, slotsBase, slotIndex, kMutexStateActive, kMutexStateFree);
   }
+  ThrowError(isolate, "E_TIMEOUT", "ring role claim made no progress (slot stuck RESERVED?)",
+             name);
 }
 
 }  // namespace

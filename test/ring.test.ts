@@ -256,10 +256,27 @@ function registerTests(): void {
     const name = uniqueName();
     try {
       const p1 = RingProducer.open(name, { capacity: 4096 });
-      assert.throws(() => RingProducer.open(name), (e: any) => e.code === 'E_ROLE_TAKEN');
+      // Same-thread re-claim returns the existing role (review F23 fix):
+      const p2 = RingProducer.open(name, { capacity: 4096 });
+      p2.write(Buffer.from('same-thread re-claim works'));
+      // ...but a DIFFERENT thread still gets E_ROLE_TAKEN while this one lives:
+      const w = new Worker(
+        `const { workerData } = require('worker_threads');
+         const { RingProducer } = require(workerData.pkg);
+         try {
+           RingProducer.open(workerData.name);
+           process.exitCode = 0; // BAD: role was taken
+         } catch (e) {
+           process.exitCode = e.code === 'E_ROLE_TAKEN' ? 11 : 12;
+         }`,
+        { eval: true, workerData: { name, pkg: require.resolve('../src/ringbuffer') } },
+      );
+      const exitCode = await new Promise<number>((res) => w.on('exit', (c) => res(c ?? -1)));
+      assert.strictEqual(exitCode, 11, 'cross-thread producer sees E_ROLE_TAKEN');
       // a consumer can coexist with the producer (SPSC is per-role)
       const c1 = RingConsumer.open(name);
-      void c1;
+      assert.strictEqual(Buffer.from(c1.read({ timeoutMs: 1000 })!).toString(),
+        'same-thread re-claim works');
       p1.write(Buffer.from('x'));
       assert.strictEqual(Buffer.from(c1.read({ timeoutMs: 1000 })!).toString(), 'x');
       // role takeover after death is covered by the mid-reserve/mid-peek tests

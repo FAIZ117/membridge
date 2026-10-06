@@ -30,7 +30,14 @@ const OWNER_DIED = 1;
 const SEQ = 2;
 const SLOTS = HEADER_WORDS;
 
-const sleepSliceMs = 250;
+// Monotonic clock (Date.now() jumps with NTP — review F35).
+const nowMs = (): number => performance.now();
+// Wait slices clamp to the remaining timeout so a lock({timeoutMs: 1}) ends
+// after ~1 ms, not one full 250 ms slice (review P4).
+const sliceOf = (deadline: number): number =>
+  Math.max(1, Math.min(sleepSliceMs, deadline - nowMs()));
+
+const sleepSliceMs = 250; // dead-owner detection cadence (§7.3)
 
 export interface LockOptions {
   /** Total time to wait before E_TIMEOUT. Default: wait indefinitely. */
@@ -104,15 +111,19 @@ export class Mutex {
 
   /** Acquire the lock, blocking. */
   lock(opts?: LockOptions): LockResult {
-    const deadline = opts?.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : Infinity;
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
+    let waited = false;  // once we have parked, acquire PRESERVES HAS_WAITERS
     for (;;) {
       const lw = this.lockWord();
       const tokenBits = lw & TOKEN_MASK;
       if (tokenBits === 0) {
-        // CAS the whole word (a stale HAS_WAITERS bit from a lost race is
-        // cleared by the acquisition itself)
-        if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
+        // Acquire with a whole-word CAS: it clears a stale HAS_WAITERS left
+        // by a lost race — but once WE have waited we keep the bit, because
+        // other waiters may still be parked on the word we are about to own
+        // (Drepper's mutex2; review F10/P2).
+        const acq = waited ? token | HAS_WAITERS : token;
+        if (Atomics.compareExchange(this.view, LOCK_WORD, lw, acq) === lw) {
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
@@ -141,19 +152,22 @@ export class Mutex {
         }
         continue; // lost the race: retry
       }
-      // Alive: set HAS_WAITERS and wait a bounded slice (deadlock detection
-      // cadence, §7.3 — a dead owner never calls notify).
+      // Alive holder: announce ourselves, then RE-READ — if the word went
+      // free between our OR and the read, retry immediately instead of
+      // sleeping on a free lock for a full slice (review F10).
       if (!(lw & HAS_WAITERS)) {
         Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
       }
       const expected = this.lockWord();
-      if (opts?.timeoutMs !== undefined && Date.now() >= deadline) {
+      if ((expected & TOKEN_MASK) === 0) {
+        waited = true;
+        continue;
+      }
+      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
         throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
-      this.b.syncWait(this.view, LOCK_WORD, expected, sleepSliceMs);
-      if (opts?.timeoutMs !== undefined && Date.now() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
-      }
+      this.b.syncWait(this.view, LOCK_WORD, expected, sliceOf(deadline));
+      waited = true;
     }
   }
 
@@ -168,7 +182,8 @@ export class Mutex {
       });
     }
     if ((lw & TOKEN_MASK) !== 0) return false;
-    if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
+    // preserve the bit: parked waiters must not lose their wake source
+    if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS)) === lw) {
       Atomics.add(this.view, SEQ, 1);
       this.held = true;
       return true;
@@ -180,13 +195,15 @@ export class Mutex {
    * never the libuv pool. Aborts with the signal between wait slices. */
   async lockAsync(opts?: LockOptions & { signal?: AbortSignal }): Promise<LockResult> {
     const signal = opts?.signal;
-    const deadline = opts?.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : Infinity;
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     const token = this.claim().token;
+    let waited = false;
     for (;;) {
       const lw = this.lockWord();
       const tokenBits = lw & TOKEN_MASK;
       if (tokenBits === 0) {
-        if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token) === lw) {
+        const acq = waited ? token | HAS_WAITERS : token;
+        if (Atomics.compareExchange(this.view, LOCK_WORD, lw, acq) === lw) {
           Atomics.add(this.view, SEQ, 1);
           this.held = true;
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
@@ -210,9 +227,16 @@ export class Mutex {
       if (!(lw & HAS_WAITERS)) {
         Atomics.or(this.view, LOCK_WORD, HAS_WAITERS);
       }
-      if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
       const expected = this.lockWord();
-      const waitP = waitAsync(this.view, LOCK_WORD, expected, sleepSliceMs);
+      if ((expected & TOKEN_MASK) === 0) {
+        waited = true;
+        continue;
+      }
+      if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
+      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+        throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
+      }
+      const waitP = waitAsync(this.view, LOCK_WORD, expected, sliceOf(deadline));
       const abortP =
         signal !== undefined
           ? new Promise<never>((_, rej) => {
@@ -224,12 +248,9 @@ export class Mutex {
                               () => signal.removeEventListener('abort', onAbort));
             })
           : null;
-      const slice = (await (abortP !== null ? Promise.race([waitP, abortP]) : waitP)) as string;
+      await (abortP !== null ? Promise.race([waitP, abortP]) : waitP);
+      waited = true;
       if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
-      if (opts?.timeoutMs !== undefined && Date.now() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
-      }
-      void slice;
     }
   }
 

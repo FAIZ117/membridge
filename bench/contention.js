@@ -36,6 +36,7 @@ async function run() {
     while (n < handoffs) {
       if (Atomics.compareExchange(i32, 1, 0, 1) === 0) {
         Atomics.store(i32, 1, 2); // token to pong
+        notify(i32, 1, 1);        // wake the parked pong (shared futex)
         wait(i32, 1, 2, 5000); // cross-process futex wait (F1: Atomics cannot)
         n++;
       }
@@ -56,16 +57,22 @@ async function run() {
 if (process.argv[2] === 'pong') {
   const [role, name, handoffsArg] = process.argv.slice(2);
   void role;
+  const sync = require('../dist/sync');
   const i32 = new Int32Array(open(name, 64));
   const handoffs = Number(handoffsArg);
   let n = 0;
-  for (;;) {
+  // Park on the token word instead of spinning (review P11: the old pong
+  // burned a core and measured a spinning counterpart).
+  while (n < handoffs) {
     if (Atomics.load(i32, 1) === 2) {
       Atomics.store(i32, 1, 0);
       notify(i32, 1, 1); // shared futex wake
       if (++n >= handoffs) process.exit(0);
+    } else {
+      sync.wait(i32, 1, 0, 1000); // park until the token flips
     }
   }
+  process.exit(0);
 }
 
 module.exports = { run };

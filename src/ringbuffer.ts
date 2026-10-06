@@ -23,6 +23,7 @@
 import { MembridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { open, type OpenOptions } from './core';
+import { waitAsync } from './sync';
 
 export const RING_HEADER_BYTES = 256;
 export const SKIP_MARKER = 0xffffffff;
@@ -37,8 +38,17 @@ const CONSUMER_TOKEN = 33;
 const CAPACITY = 34;
 const MAX_MESSAGE = 35;
 const DATA_WORD = RING_HEADER_BYTES / 4; // 64
+// Parked flags (review P3): word 1 shares head's cache line, word 17 tail's.
+// The other side notifies only when the flag is set, so an unparked
+// data-plane operation costs zero FUTEX_WAKEs. A crashed waiter leaves its
+// flag set — the cost is one extra wake, never correctness.
+const CONSUMER_PARKED = 1;   // consumer waits on HEAD
+const PRODUCER_PARKED = 17;  // producer waits on TAIL
 
 const sleepSliceMs = 250;
+const nowMs = (): number => performance.now();  // monotonic (review F35)
+const sliceOf = (deadline: number): number =>
+  Math.max(1, Math.min(sleepSliceMs, deadline - nowMs()));
 
 function align8(n: number): number {
   return (n + 7) & ~7;
@@ -121,6 +131,29 @@ export class RingProducer {
     const view = new Int32Array(sab);
     const cap = capacity ?? sab.byteLength - RING_HEADER_BYTES;
     const mm = maxMessage ?? Math.floor(cap / 2) - 8;
+    // §8.2 init: a joiner's capacity/maxMessage must match the header —
+    // validated BEFORE the role claim so a mismatch never steals the seat.
+    if (cap < MIN_CAPACITY || cap > MAX_CAPACITY || (cap & (cap - 1)) !== 0) {
+      throw new MembridgeError(
+        'E_SIZE_INVALID',
+        `ring capacity must be a power of two between ${MIN_CAPACITY} and ${MAX_CAPACITY}`,
+        { segmentName: name, requested: cap },
+      );
+    }
+    const hdrCap = Atomics.load(view, CAPACITY);
+    if (hdrCap !== 0 && hdrCap !== cap) {
+      throw new MembridgeError('E_SIZE_MISMATCH',
+        `ring capacity ${cap} does not match the existing ${hdrCap}`, {
+          segmentName: name, requested: cap, existing: hdrCap,
+        });
+    }
+    const hdrMax = Atomics.load(view, MAX_MESSAGE);
+    if (hdrMax !== 0 && hdrMax !== mm) {
+      throw new MembridgeError('E_SIZE_MISMATCH',
+        `ring maxMessage ${mm} does not match the existing ${hdrMax}`, {
+          segmentName: name, requested: mm, existing: hdrMax,
+        });
+    }
     b.ringClaimRole(name, view, true);
     const p = new RingProducer(name, view, cap, mm);
     p.claimed = true;
@@ -160,44 +193,54 @@ export class RingProducer {
         });
     }
     const framed = align8(4 + n);
-    const deadline = opts?.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : Infinity;
-    for (;;) {
-      const head = this.head();
-      const tail = this.tail();
-      const used = (head - tail) >>> 0;
-      const pos = head & (this.capacity - 1);
-      if (pos + framed <= this.capacity) {
-        if (this.capacity - used >= framed) {
-          this.pending = {
-            headSnapshot: head,
-            pos,
-            framed,
-            payload: this.data.subarray(pos + 4, pos + 4 + n),
-          };
-          return this.pending.payload;
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
+    const nonBlocking = opts?.timeoutMs === 0;
+    let parked = false;
+    try {
+      for (;;) {
+        const head = this.head();
+        const tail = this.tail();
+        const used = (head - tail) >>> 0;
+        const pos = head & (this.capacity - 1);
+        if (pos + framed <= this.capacity) {
+          if (this.capacity - used >= framed) {
+            this.pending = {
+              headSnapshot: head,
+              pos,
+              framed,
+              payload: this.data.subarray(pos + 4, pos + 4 + n),
+            };
+            return this.pending.payload;
+          }
+        } else {
+          // SKIP: advance past the end once the consumer drained up to `pos`.
+          // The marker is visible to the consumer through the head advance.
+          if (used <= pos && pos - used >= framed) {
+            Atomics.store(this.view, DATA_WORD + pos / 4, -1); // u32 SKIP_MARKER
+            Atomics.store(this.view, HEAD, head + (this.capacity - pos));
+            this.wakeConsumer();
+            continue; // re-loop: now at offset 0
+          }
         }
-      } else {
-        // SKIP: advance past the end once the consumer drained up to `pos`.
-        // The marker is visible to the consumer through the head advance.
-        if (used <= pos && pos - used >= framed) {
-          Atomics.store(this.view, DATA_WORD + pos / 4, -1); // u32 SKIP_MARKER
-          Atomics.store(this.view, HEAD, head + (this.capacity - pos));
-          this.b.syncNotify(this.view, HEAD, 1);
-          continue; // re-loop: now at offset 0
+        if (nonBlocking || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
+          throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
+            segmentName: this.name,
+          });
+        }
+        // Park on TAIL: announce, re-check, then wait (§8.2 + review P3).
+        Atomics.store(this.view, PRODUCER_PARKED, 1);
+        parked = true;
+        const tailNow = this.tail();
+        if (tailNow !== tail) continue;  // space appeared while announcing
+        this.b.syncWait(this.view, TAIL, tailNow, sliceOf(deadline));
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+          throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
+            segmentName: this.name,
+          });
         }
       }
-      if (opts?.timeoutMs !== undefined && Date.now() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
-          segmentName: this.name,
-        });
-      }
-      // wait for the consumer to release (§8.2: producer waits on tail)
-      this.b.syncWait(this.view, TAIL, tail, sleepSliceMs);
-      if (opts?.timeoutMs !== undefined && Date.now() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
-          segmentName: this.name,
-        });
-      }
+    } finally {
+      if (parked) Atomics.store(this.view, PRODUCER_PARKED, 0);
     }
   }
 
@@ -211,7 +254,19 @@ export class RingProducer {
     this.pending = null;
     Atomics.store(this.view, DATA_WORD + pos / 4, payload.length);
     Atomics.store(this.view, HEAD, headSnapshot + framed);
-    this.b.syncNotify(this.view, HEAD, 1);
+    this.wakeConsumer();
+  }
+
+  private wakeConsumer(): void {
+    if (Atomics.load(this.view, CONSUMER_PARKED) === 1) {
+      this.b.syncNotify(this.view, HEAD, 1);
+    }
+  }
+
+  private wakeProducer(): void {
+    if (Atomics.load(this.view, PRODUCER_PARKED) === 1) {
+      this.b.syncNotify(this.view, TAIL, 1);
+    }
   }
 
   /** Convenience: reserve + copy + commit (one copy). */
@@ -219,6 +274,26 @@ export class RingProducer {
     const view = this.reserve(bytes.length, opts);
     view.set(bytes);
     this.commit();
+  }
+
+  /** Async variant of {@link reserve} (§8.2): waits ride the §6 waiter
+   * threads; resolves with the same zero-copy view. */
+  async reserveAsync(n: number, opts?: ReserveOptions): Promise<Uint8Array> {
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
+    for (;;) {
+      try {
+        return this.reserve(n, { timeoutMs: 0 });  // non-blocking attempt
+      } catch (e) {
+        if (!(e instanceof MembridgeError) || e.code !== 'E_TIMEOUT') throw e;
+      }
+      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
+        throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
+          segmentName: this.name,
+        });
+      }
+      const tail = this.tail();
+      await waitAsync(this.view, TAIL, tail, sliceOf(deadline));
+    }
   }
 
   get capacityBytes(): number {
@@ -285,42 +360,57 @@ export class RingConsumer {
         segmentName: this.name,
       });
     }
-    const deadline = opts?.timeoutMs !== undefined ? Date.now() + opts.timeoutMs : Infinity;
-    for (;;) {
-      const head = this.head();
-      const tail = this.tail();
-      if (head === tail) {
-        if (opts?.timeoutMs !== undefined && Date.now() >= deadline) return null;
-        this.b.syncWait(this.view, HEAD, head, sleepSliceMs);
-        if (opts?.timeoutMs !== undefined && Date.now() >= deadline &&
-            this.head() === this.tail()) {
-          return null;
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
+    let parked = false;
+    try {
+      for (;;) {
+        const head = this.head();
+        const tail = this.tail();
+        if (head === tail) {
+          if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+          if (opts?.timeoutMs === 0) return null;
+          // Park on HEAD: announce, re-check, then wait (review P3).
+          Atomics.store(this.view, CONSUMER_PARKED, 1);
+          parked = true;
+          const headNow = this.head();
+          if (headNow !== head) continue;
+          this.b.syncWait(this.view, HEAD, headNow, sliceOf(deadline));
+          if (opts?.timeoutMs !== undefined && nowMs() >= deadline &&
+              this.head() === this.tail()) {
+            return null;
+          }
+          continue;
         }
-        continue;
+        const pos = tail & (this.capacity - 1);
+        const lenWord = Atomics.load(this.view, DATA_WORD + pos / 4);
+        if (lenWord === -1) {
+          // SKIP marker: the next message starts at the buffer boundary
+          const next = (tail & ~(this.capacity - 1)) + this.capacity;
+          Atomics.compareExchange(this.view, TAIL, tail, next);
+          this.wakeProducer();
+          continue;
+        }
+        const framed = align8(4 + lenWord);
+        if (((head - tail) >>> 0) < framed) {
+          // length visible but payload not fully committed yet
+          if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+          Atomics.store(this.view, CONSUMER_PARKED, 1);
+          parked = true;
+          const headNow = this.head();
+          if (headNow !== head) continue;
+          this.b.syncWait(this.view, HEAD, headNow, sliceOf(deadline));
+          if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+          continue;
+        }
+        this.pending = {
+          framed,
+          tailSnapshot: tail,
+          payload: this.data.subarray(pos + 4, pos + 4 + lenWord),
+        };
+        return this.pending.payload;
       }
-      const pos = tail & (this.capacity - 1);
-      const lenWord = Atomics.load(this.view, DATA_WORD + pos / 4);
-      if (lenWord === -1) {
-        // SKIP marker: the next message starts at the buffer boundary
-        const next = (tail & ~(this.capacity - 1)) + this.capacity;
-        Atomics.compareExchange(this.view, TAIL, tail, next);
-        this.b.syncNotify(this.view, TAIL, 1);
-        continue;
-      }
-      const framed = align8(4 + lenWord);
-      if (((head - tail) >>> 0) < framed) {  // unsigned: survives the 2^31 sign flip (review F1)
-        // length visible but payload not fully committed yet
-        if (opts?.timeoutMs !== undefined && Date.now() >= deadline) return null;
-        this.b.syncWait(this.view, HEAD, head, sleepSliceMs);
-        if (opts?.timeoutMs !== undefined && Date.now() >= deadline) return null;
-        continue;
-      }
-      this.pending = {
-        framed,
-        tailSnapshot: tail,
-        payload: this.data.subarray(pos + 4, pos + 4 + lenWord),
-      };
-      return this.pending.payload;
+    } finally {
+      if (parked) Atomics.store(this.view, CONSUMER_PARKED, 0);
     }
   }
 
@@ -332,7 +422,25 @@ export class RingConsumer {
     const { framed, tailSnapshot } = this.pending;
     this.pending = null;
     Atomics.compareExchange(this.view, TAIL, tailSnapshot, tailSnapshot + framed);
-    this.b.syncNotify(this.view, TAIL, 1);
+    this.wakeProducer();
+  }
+
+  private wakeProducer(): void {
+    if (Atomics.load(this.view, PRODUCER_PARKED) === 1) {
+      this.b.syncNotify(this.view, TAIL, 1);
+    }
+  }
+
+  /** Async variant of {@link peek} (§8.2). Resolves null on timeout. */
+  async peekAsync(opts?: ReserveOptions): Promise<Uint8Array | null> {
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
+    for (;;) {
+      const msg = this.peek({ timeoutMs: 0 });
+      if (msg !== null) return msg;
+      if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+      const head = this.head();
+      await waitAsync(this.view, HEAD, head, sliceOf(deadline));
+    }
   }
 
   /** Convenience: peek + copy + release. Returns null on timeout. */

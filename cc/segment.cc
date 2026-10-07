@@ -202,6 +202,14 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       ThrowSystemError(isolate, "shm_open", errno, name);
     }
   }
+  // Round-4 S4-5: every throw below must release the fd (several paths used
+  // to leak it — repeated failing opens ended in EMFILE for the process).
+  struct FdGuard {
+    int& fd;
+    ~FdGuard() {
+      if (fd >= 0) ::close(fd);
+    }
+  } fdGuard{fd};
 
   uint64_t total = requestedTotal;
   {
@@ -214,7 +222,15 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
     if (::fstat(fd, &st) != 0) {
       const int e = errno;
       ::close(fd);
+        fd = -1;
       ThrowSystemError(isolate, "fstat", e, name);
+    }
+    // Only a regular shm object is a segment (round-4 S4-2/S4-5): a FIFO,
+    // device or directory planted at the name must fail cleanly, not block,
+    // hang in a grace loop or fail deep inside ftruncate.
+    if (!S_ISREG(st.st_mode)) {
+      if (created) ::shm_unlink(obj.c_str());
+      ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a non-regular file", name);
     }
     off_t fileSize = st.st_size;
 
@@ -225,6 +241,7 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
         if (::ftruncate(fd, static_cast<off_t>(requestedTotal)) != 0) {
           const int e = errno;
           ::close(fd);
+        fd = -1;
           ::shm_unlink(obj.c_str());
           ThrowSystemError(isolate, "ftruncate", e, name);
         }
@@ -233,6 +250,7 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
           const int rc = ReserveBacking(fd, requestedTotal);
           if (rc != 0) {
             ::close(fd);
+        fd = -1;
             ::shm_unlink(obj.c_str());
             ThrowReserveError(isolate, rc, name);
           }
@@ -259,23 +277,18 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       // Creator: size the WHOLE object in one ftruncate (review R9 — two
       // truncates would break macOS U2, and Open's window logic assumes the
       // mapping covers header+data). Failure unlinks the object so a bad
-      // create never strands a half-sized name (review R9).
+      // create never strands a half-sized name (review R9). The (slow)
+      // posix_fallocate reserve runs in InitOrJoin AFTER the creator holds
+      // the init baton (round-4 E4-4: reserving here, before the baton,
+      // let a joiner's 50 ms grace expire mid-fallocate and take over a LIVE
+      // creator's segment at the joiner's size).
       if (::ftruncate(fd, static_cast<off_t>(requestedTotal)) != 0) {
         const int e = errno;
         ::close(fd);
+        fd = -1;
         ::shm_unlink(obj.c_str());
         ThrowSystemError(isolate, "ftruncate", e, name);
       }
-#if defined(__linux__)
-      if (opts.reserve) {
-        const int rc = ReserveBacking(fd, requestedTotal);
-        if (rc != 0) {
-          ::close(fd);
-          ::shm_unlink(obj.c_str());
-          ThrowReserveError(isolate, rc, name);
-        }
-      }
-#endif
       total = requestedTotal;
     } else {
       // Joiner: wait briefly for a mid-init creator to publish the header
@@ -303,12 +316,14 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
           if (::fstat(fd, &st) != 0) {
             const int e = errno;
             ::close(fd);
+        fd = -1;
             ThrowSystemError(isolate, "fstat", e, name);
           }
           fileSize = st.st_size;
         }
         if (wholeObject && fileSize < static_cast<off_t>(headerBytes)) {
           ::close(fd);
+        fd = -1;
           ThrowError(isolate, "E_INIT_TIMEOUT",
                      "segment was never initialized within " +
                          std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
@@ -320,6 +335,7 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
         if (::fstat(fd, &st) != 0) {
           const int e = errno;
           ::close(fd);
+        fd = -1;
           ThrowSystemError(isolate, "fstat", e, name);
         }
         if (st.st_size < static_cast<off_t>(headerBytes)) {
@@ -344,6 +360,7 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
   if (base == MAP_FAILED) {
     const int e = errno;
     ::close(fd);
+        fd = -1;
     if (created) ::shm_unlink(obj.c_str());
     ThrowSystemError(isolate, "mmap", e, name);
   }
@@ -351,6 +368,7 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
   h.base = base;
   h.mappingBytes = static_cast<size_t>(total);
   h.fd = fd;
+  fd = -1;  // the handle owns it now (disarms fdGuard)
   h.created = created;
   return h;
 #endif
@@ -456,12 +474,26 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   CloseHandle(section);
 #else
   const std::string obj = ObjectName(name, false);
-  const int fd = ::shm_open(obj.c_str(), O_RDONLY, 0);
+  // O_NONBLOCK: a FIFO planted in /dev/shm must not block stat()/reap()
+  // forever (round-4 S4-2); the S_ISREG check below rejects it.
+  const int fd = ::shm_open(obj.c_str(), O_RDONLY | O_NONBLOCK, 0);
   if (fd < 0) {
     if (errno == ENOENT) {
       ThrowError(isolate, "E_NOT_FOUND", "segment does not exist", name);
     }
+    if (errno == ELOOP) {
+      // a symlink at the name (glibc opens with O_NOFOLLOW): not a segment —
+      // E_INCOMPATIBLE lets reap() skip it instead of aborting (S4-7)
+      ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a symlink", name);
+    }
     ThrowSystemError(isolate, "shm_open", errno, name);
+  }
+  {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+      ::close(fd);
+      ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a non-regular file", name);
+    }
   }
   uint8_t buf[64 * 1024];
   ssize_t total = 0;

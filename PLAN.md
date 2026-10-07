@@ -126,7 +126,7 @@ isNative(): boolean
 | Field | Type | Purpose |
 |-------|------|---------|
 | magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
-| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. While INITIALIZING the word also carries the initializer's attach-row index in bits 8+ (`1 \| row<<8`) — the baton names its holder atomically, so a joiner can never read a stale row and hand the baton back while the real initializer is mid-publish (fix round 3, R7; a bare 1 from a hand-crafted crash state falls back to the `initializerSlot` field). Joiners wait on the CURRENT word value; every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, claims its attach row, wins a 0→`1\|row<<8` CAS (the initializer baton), publishes `headerBytes` + `initializerSlot`, writes the full header, then stores 2 and wakes the word; a throw between the CAS and the ready store restores 0 so another opener can take over. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8), claims its row, and wins the 0→`1\|row<<8` CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer is handed back through a packed→0 CAS so exactly ONE joiner wins the 0→`1\|row<<8` CAS — no concurrent-WriteHeader war. **Round 3 (2026-10-07):** the word also carries an **epoch** (bits 20–30, never 0) bumped on every transition into INITIALIZING and preserved by READY and by a handback to UNINIT — a joiner's handback CAS names the whole word, so after the same row is reused by a newer takeover a stale handback fails instead of handing back a LIVE baton (C16 ABA). An opener that cannot claim an attach row (table full) never takes the baton (a row-less baton cannot name its holder). Every non-ready pass of the join loop checks the `initTimeoutMs` deadline (C11). A takeover reads any surviving header **once** first: when magic/version/`headerBytes` are valid (a crashed grow, or a creator that died mid-write) it keeps the prior **kind** (a plain opener never re-kinds a mutex/ring segment; a different specific kind → `E_INCOMPATIBLE`) and keeps `dataBytes = max(requested, min(prior, file − header, cap))` — the old takeover rewrote both to the joiner's values (C12). A failed takeover releases the row it claimed, and a creator that loses the baton CAS releases its fresh row (C17). A size-less join of a never-initialized object no longer truncates it: it waits out its own `initTimeoutMs` — one budget shared by the grace wait and the init wait — then throws `E_INIT_TIMEOUT` (C23). Takeover is idempotent and rewrites every field it does not keep. |
+| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. While INITIALIZING the word also carries the initializer's attach-row index in bits 8+ (`1 \| row<<8`) — the baton names its holder atomically, so a joiner can never read a stale row and hand the baton back while the real initializer is mid-publish (fix round 3, R7; a bare 1 from a hand-crafted crash state falls back to the `initializerSlot` field). Joiners wait on the CURRENT word value; every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, claims its attach row, wins a 0→`1\|row<<8` CAS (the initializer baton), publishes `headerBytes` + `initializerSlot`, writes the full header, then stores 2 and wakes the word; a throw between the CAS and the ready store restores 0 so another opener can take over. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8), claims its row, and wins the 0→`1\|row<<8` CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer is handed back through a packed→0 CAS so exactly ONE joiner wins the 0→`1\|row<<8` CAS — no concurrent-WriteHeader war. **Round 4 (E4-4):** the creator reserves (`posix_fallocate`) only AFTER it holds the baton — reserving first let a joiner's grace expire mid-reserve and take over a live creator at the joiner's size; a takeover never writes a header smaller than the object a dead creator already sized (`dataBytes ≥ min(file − header, cap)`). **Round 3 (2026-10-07):** the word also carries an **epoch** (bits 20–30, never 0) bumped on every transition into INITIALIZING and preserved by READY and by a handback to UNINIT — a joiner's handback CAS names the whole word, so after the same row is reused by a newer takeover a stale handback fails instead of handing back a LIVE baton (C16 ABA). An opener that cannot claim an attach row (table full) never takes the baton (a row-less baton cannot name its holder). Every non-ready pass of the join loop checks the `initTimeoutMs` deadline (C11). A takeover reads any surviving header **once** first: when magic/version/`headerBytes` are valid (a crashed grow, or a creator that died mid-write) it keeps the prior **kind** (a plain opener never re-kinds a mutex/ring segment; a different specific kind → `E_INCOMPATIBLE`) and keeps `dataBytes = max(requested, min(prior, file − header, cap))` — the old takeover rewrote both to the joiner's values (C12). A failed takeover releases the row it claimed, and a creator that loses the baton CAS releases its fresh row (C17). A size-less join of a never-initialized object no longer truncates it: it waits out its own `initTimeoutMs` — one budget shared by the grace wait and the init wait — then throws `E_INIT_TIMEOUT` (C23). Takeover is idempotent and rewrites every field it does not keep. |
 | headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
 | flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
 | attach table | N × 32 B | One slot per attached process: identity (§7.1) + local refcount. ~120 slots with a 4 KiB page. |
@@ -191,7 +191,12 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   hands the row (and its `unlinkWhenUnused` decision) to a surviving Mapping of the same object,
   searched across every Mapping ever registered — not just the per-name entry a grow replaces —
   so the row is neither released early nor leaked; a kind/raw mismatch on reuse falls through to
-  a full open without evicting the valid entry. Windows sections carry no inode; reuse is
+  a full open without evicting the valid entry. **Round 4:** that list is an index keyed by object
+  identity (P4-2/P4-3 — teardown and inserts no longer scan every mapping; 10k mappings tear down
+  in ~60 ms instead of ~1 s); raw mappings live under their own registry key so a raw open never
+  displaces a typed one (E4-10); `unlinkWhenUnused` given on a reused mapping, or on a mapping that
+  does not own the row, is carried to the deciding mapping (E4-8); claims resolve their segment key
+  by name instead of scanning every mapping (P4-1). Windows sections carry no inode; reuse is
   name-keyed there and documented.
 - `~Mapping()` (unmap + release this process's attach slot) can run on **any thread**,
   because V8 may call BackingStore deleters off the main thread. Registry and header updates
@@ -280,9 +285,17 @@ loop = up to 50 ms per contended handoff). This is the foundation for everything
 - Exposed publicly (`membridge/sync`) because users building their own lock-free
   structures on a membridge SAB hit F1 just the same.
 - **Async-wait capacity (fix round 2026-10-06):** one process-wide waiter
-  budget — 127 multiplexed `futex_waitv` entries + 64 one-thread-per-wait
-  fallbacks (191); a further `waitAsync` rejects `E_TOO_MANY_WAITERS` and the
-  mux rebuilds its wait set per registration/wake. Amortizing same-word waits
+  budget — on Linux ≥ 5.16, 127 multiplexed `futex_waitv` entries + 64
+  one-thread-per-wait fallbacks (191); on macOS, Windows and older Linux only
+  the 64 thread fallbacks (round-4 P4-9). A further `waitAsync` rejects
+  `E_TOO_MANY_WAITERS` and the mux rebuilds its wait set per registration/wake.
+- **A faulting word never stalls other waits (round 4, S4-1):** `futex_waitv`
+  fails the WHOLE call when one entry's page is gone (a peer truncated its
+  segment → EFAULT). The multiplexer then delivers due timeouts and probes each
+  entry on its own (a one-entry `futex_waitv` with an expired deadline — the
+  kernel reads the word, this thread never touches the dead page); a faulting
+  entry gets a spurious wake and leaves the set. A per-wait fallback thread
+  treats EFAULT as terminal (spurious wake) instead of spinning. Amortizing same-word waits
   into one kernel entry is the known next step if servers park hundreds of
   `lockAsync` waits (review P6); documented rather than built.
 
@@ -353,8 +366,13 @@ bumping gen. **Why bump gen:** it instantly invalidates every outstanding token 
 check so it is never evicted; and a stale token can never win a CAS again.
 
 **Slot states (round 3, 2026-10-07 — supersedes the F23 pid-marker scheme; ADR 0007).** The
-slot's state word is `0` Free, `1` Active, or `(pid << 2) | 2` **Claiming** — the exclusive
-publish right, held by `pid`. A claimer wins the right with ONE CAS from the state it observed:
+slot's state word is `0` Free, `1` Active, or `(nsTag << 24) | (pid << 2) | 2` **Claiming** —
+the exclusive publish right, held by `pid` (22 bits; Linux `PID_MAX_LIMIT` is 2^22) in the pid
+namespace folded into `nsTag` (8 bits, 0 = unknown; Windows: a 30-bit pid, no tag). **Round 4
+(S4-3/E4-6):** a Claiming word is judged dead or "ours" only when its tag equals ours — a pid means
+nothing outside its own namespace, so containers sharing `/dev/shm` never recover each other's
+in-flight claims (a stuck foreign claim leaves that one slot unusable, the same never-steal rule
+as identities); thread identity and attach rows also compare the pid-namespace inode (E4-7). A claimer wins the right with ONE CAS from the state it observed:
 Free; a Claiming word whose pid is provably dead (crashed mid-publish; pid-only check, since the
 start words may still be the previous owner's); or, for a reclaim, Active **with the gen it read
 before its liveness verdict** — after winning it re-checks that gen, so a claim that slipped in
@@ -370,7 +388,9 @@ gen still matches the lock word's token is stealable (its holder freed the slot 
 token 0 (only corrupted memory can produce that) re-publishes it first. A role claim that finds a
 LIVE participant mid-claim (Claiming word, or a published slot whose role word is still 0) waits up
 to 100 ms for it to settle before answering `E_ROLE_TAKEN` — the other side may yet lose its role
-CAS. The registry's list of every Mapping (§5.4 hand-off) is pruned on each insert.
+CAS. The process-wide claim lock is released across each settle sleep (round 4 P4-4: holding it
+stalled every other claim in the process), and a whole role claim is capped at ~1 s of wall time
+(S4-11). The registry's list of every Mapping (§5.4 hand-off) is pruned on each insert.
 
 **Claim references (round 3 C1).** A thread's slot is shared by every `Mutex` instance it opens on
 the segment, but each instance registers its OWN refcounted claim reference (pinned by the
@@ -413,13 +433,18 @@ same machine and per-instance references (§8.2).
   the README says so explicitly so nobody uses it for latency-critical control loops.
   (Linux `FUTEX_LOCK_PI` would require the kernel's TID-based word format, which conflicts
   with the token design and does not exist on macOS/Windows.)
-- **API:** `Mutex.open(name)`, `lock({timeoutMs})`, `tryLock()`, `lockAsync({timeoutMs, signal})`,
+- **API:** `Mutex.open(name)`, `lock({timeoutMs})`, `tryLock()` → `{ ownerDied } | null` (round 4
+  E4-3: it consumes and reports the owner-died flag exactly like `lock()`; it used to leave it for
+  an unrelated later holder), `lockAsync({timeoutMs, signal})`,
   `unlock()`, `withLock(fn)`, `withLockAsync(fn)`. Timeout → `E_TIMEOUT` — including when
   all 64 participant slots are held by live threads on `claim()` (F37: slot exhaustion is
   the same bounded "try again later" condition, not a hang). An invalid `timeoutMs`
   (NaN, ≤ 0, > 2^31 ms) throws `E_NAME_INVALID` before any native call (review R20/R24).
   `close()` unlocks first if the instance holds the lock (a normal unlock — no `ownerDied`), drops
-  the instance's claim reference, and makes every later call throw `E_CLOSED` (round 3 C10).
+  the instance's claim reference, and makes every later call throw `E_CLOSED` (round 3 C10). A
+  `lockAsync` pending at `close()` rejects with `E_CLOSED` when it next wakes — it never acquires
+  with the dropped claim (round 4 E4-1). The death-release path publishes `ownerDied` BEFORE freeing
+  the word, so the next acquirer cannot miss it (E4-3).
 
 **Alternative considered: OS robust mutexes** (Linux `PTHREAD_MUTEX_ROBUST`, Windows named
 mutex `WAIT_ABANDONED`). Rejected as the primary mechanism: macOS has no robust mutexes
@@ -506,7 +531,11 @@ c.read()                                  // convenience = peek + copy + release
   the instance is collected; any call on a closed instance throws `E_CLOSED`. Ring
   `timeoutMs` follows the §7.3 contract except that `0` means non-blocking; NaN, negative,
   Infinity or > 2^31 → `E_NAME_INVALID` (C14: NaN used to wait forever). A consumer whose segment
-  size disagrees with the capacity word a producer recorded → `E_INCOMPATIBLE`.
+  size disagrees with the capacity word a producer recorded → `E_INCOMPATIBLE`. **One
+  reservation per instance at a time (round 4 E4-2):** a `reserveAsync` that wakes while another
+  reservation on the same producer is still uncommitted (a concurrent `reserveAsync`, or a sync
+  `reserve` whose commit spans an `await`) rejects with `E_RING_STATE` instead of overwriting it —
+  callers sharing one producer across async tasks serialize their reserve→commit sections.
 - **Crash safety by construction:** data becomes visible only through `commit()`'s store
   to `head`. A producer that dies mid-`reserve` leaves nothing visible; a consumer that dies
   mid-`peek` leaves the message unreleased, so the next consumer sees it again
@@ -520,7 +549,7 @@ c.read()                                  // convenience = peek + copy + release
 |-----|----------|-----------|
 | `capacity()` | free/total of the shm backing store (`fs.statfs('/dev/shm')`) | Linux. macOS/Windows: `E_UNSUPPORTED` (no bounded shm filesystem). |
 | `stat(name)` | header contents: kind, sizes, creator, attached identities + liveness, owner of mutex/ring roles | all |
-| `list()` | Linux: readdir `/dev/shm`, keep entries whose header has membridge magic (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
+| `list()` | Linux: readdir `/dev/shm`, open each entry `O_NONBLOCK\|O_NOFOLLOW` and keep regular files whose header has membridge magic — a FIFO or symlink any local user plants in world-writable `/dev/shm` can neither hang nor abort `list()`/`stat()`/`reap()` (round 4 S4-2/S4-7); opens of a non-regular name fail `E_INCOMPATIBLE` without leaking the fd (S4-5) (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
 | `reap({ dryRun })` | unlink segments whose every attach slot is dead and that have no `ATTACH_OVERFLOW` flag. Unknown liveness (foreign pid namespace) counts as alive. | Linux (needs `list`); `reap(name)` for a single segment on all OSes |
 | `open(..., { unlinkWhenUnused: true })` | the last process to detach (attach table becomes empty) unlinks the name | all |
 
@@ -580,7 +609,12 @@ kind/geometry + one init budget; §5.3 macOS grow refusal and precise reserve er
 hand-off and single-`lstat` identity; §7.1 macOS liveness parity and identity retry; §7.2 Claiming
 state word + process-wide claim serialization + per-instance claim references; §7.3/§8.2 `close()`
 and `E_CLOSED`; §8.1 plain-load wake rule and snapshot-before-attempt; §8.2 one live producer per
-thread and mapping.
+thread and mapping. Round 4 (2026-10-07, `docs/review/2026-10-07T1710-round4-review.md` → fixes
+in `docs/review/2026-10-07T1753-round4-fixes.md`): §5.2 reserve after the baton, takeover never
+smaller than the object; §5.4 per-object registry index, raw key, `unlinkWhenUnused` carried; §6
+per-platform waiter budget and EFAULT isolation; §7.2 pid-namespace-tagged Claiming word, claim
+lock released across settle sleeps; §7.3 `tryLock` reports `ownerDied`, `close()` vs pending
+`lockAsync`; §8.2 one reservation per instance; §9 `/dev/shm` FIFO/symlink hygiene.
 
 ## 12. Layout & build
 
@@ -683,6 +717,7 @@ primitive, the header/attach table and real crash recovery — work rev 1 had le
 - `reserve: true` by default (safety over lazy memory). Flip if sparse segments are the main use.
 - Default size policy `exact`; max segment 256 MiB.
 - Header page in every segment (breaks byte-compatibility with shmbuf; `raw: true` opts out).
-- Steal never happens across PID namespaces (safe, but a crash there needs manual `reap`).
+- Steal never happens across PID namespaces (safe, but a crash there needs manual `reap`) — this
+  includes in-flight slot claims (round 4: the Claiming word carries a pid-namespace tag).
 - RingBuffer delivery is at-least-once when a consumer crashes mid-message.
 - GitHub repo URL / CI badges are left out until you create the remote.

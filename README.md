@@ -102,7 +102,7 @@ try {
   mutex.unlock(); // E_NOT_OWNER if we don't hold it
 }
 
-mutex.tryLock();                    // false when held (does not steal)
+mutex.tryLock();                    // { ownerDied } or null when held (does not steal)
 await mutex.lockAsync({ signal });  // AbortSignal-aware, non-blocking waits
 mutex.withLock(({ ownerDied }) => { ... });
 await mutex.withLockAsync(fn, { timeoutMs: 1000 });

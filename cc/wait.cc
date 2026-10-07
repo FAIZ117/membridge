@@ -306,7 +306,15 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       Deliver(node, Fulfill::kTimedOut);
       break;
     }
-    // EINTR or other: retry with a recomputed deadline
+    if (errno != EINTR) {
+      // EFAULT (the word's page is gone — e.g. a peer truncated the segment)
+      // or any other persistent error: retrying would spin this thread at
+      // 100% CPU (round-4 S4-1). Deliver a spurious wake; the caller
+      // re-checks the word and its own deadline.
+      Deliver(node, Fulfill::kOk);
+      break;
+    }
+    // EINTR: retry with a recomputed deadline
   }
 #elif defined(_WIN32)
   // Named-semaphore wait (§6): block on the word's semaphore in bounded
@@ -411,6 +419,23 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
 }
 
 // Multiplexer thread body (Linux >= 5.16 only).
+#if defined(__linux__)
+// One-entry futex_waitv with an already-expired absolute deadline: the kernel
+// reads the word for us, so an unmapped (truncated) page reports EFAULT
+// instead of faulting this thread. Returns the errno (ETIMEDOUT = word still
+// equals `expected`, EAGAIN = it differs, EFAULT = unmapped), or 0.
+int ProbeWord(int32_t* addr, uint32_t expected) {
+  struct futex_waitv w;
+  w.val = static_cast<__u64>(expected);
+  w.uaddr = reinterpret_cast<__u64>(addr);
+  w.flags = FUTEX2_SIZE_U32;  // shared, like the multiplexer's own entries
+  w.__reserved = 0;
+  struct timespec past{0, 0};
+  long r = syscall(__NR_futex_waitv, &w, 1, 0, &past, CLOCK_MONOTONIC);
+  return r == -1 ? errno : 0;
+}
+#endif
+
 void MuxMain() {
 #if defined(__linux__)
   for (;;) {
@@ -485,10 +510,33 @@ void MuxMain() {
           }
         }
       } else if (r == -1 && errno != EINTR) {
-        // EINVAL/EFAULT/ENOMEM/…: re-snapshotting immediately would hot-spin
-        // on a persistent failure (review R21) — back off before retrying.
-        // EINTR stays prompt: a signal means something happened.
-        backoff = true;
+        // EFAULT/EINVAL/ENOMEM/…: one entry poisons the WHOLE call, so
+        // retrying the same set would never deliver anything — not even the
+        // timeouts of waits on unrelated segments (round-4 S4-1: a peer that
+        // truncated ONE segment froze every async wait in the process).
+        // Deliver what is due, then probe each entry on its own: a faulting
+        // word gets a spurious wake (§6 allows them; the caller re-checks)
+        // and leaves the set. Only an error no entry explains backs off.
+        const double now = NowMs();
+        bool progressed = false;
+        for (size_t i = 0; i < snapshot.size(); i++) {
+          const std::shared_ptr<WaitNode>& nd = snapshot[i];
+          if (nd->delivered.load() || nd->cancelled) continue;
+          if (nd->hasTimeout && nd->deadlineMs <= now) {
+            Deliver(nd, Fulfill::kTimedOut);
+            progressed = true;
+            continue;
+          }
+          const int probe = ProbeWord(nd->addr, nd->expected);
+          if (probe == EFAULT) {
+            Deliver(nd, Fulfill::kOk);
+            progressed = true;
+          } else if (probe == EAGAIN) {
+            Deliver(nd, Fulfill::kNotEqual);
+            progressed = true;
+          }
+        }
+        backoff = !progressed;
       }
       // control-word wake (r == snapshot.size()): re-snapshot and go again.
     }

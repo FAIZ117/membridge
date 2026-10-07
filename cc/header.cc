@@ -31,6 +31,7 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -83,7 +84,8 @@ int EnsureAttachedRow(Header* h, const Identity& self, bool* outOwned, uint32_t 
     AttachSlot* s = &h->attachTable[i];
     if (AtomicSlotRefcount(s)->load(std::memory_order_acquire) > 0 &&
         s->identity.pid == self.pid && s->identity.threadId == 0 &&
-        s->identity.startTime == self.startTime) {
+        s->identity.startTime == self.startTime &&
+        s->identity.pidNsInode == self.pidNsInode) {  // round-4 E4-7
       return static_cast<int>(i);
     }
   }
@@ -258,6 +260,27 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
                                                         std::memory_order_acq_rel);
     }
     if (won) {
+#if defined(__linux__)
+      if (opts.reserve) {
+        // Reserve only now that the baton names us (round-4 E4-4): joiners
+        // see a LIVE initializer and wait instead of taking over mid-reserve.
+        // A failed reserve hands the baton back, releases our row and unlinks
+        // the name — a bad create never strands a half-initialized name (R9).
+        ErrRestorer restorer;
+        restorer.handle = &handle;
+        restorer.restoreValue = InitWord(kInitUninit, 0, InitEpochOf(baton));
+        InitRowGuard rowGuard;
+        rowGuard.handle = &handle;
+        rowGuard.slot = owned ? slot : -1;
+        const int rc = ReserveBacking(handle.fd, static_cast<uint64_t>(headerBytes) + dataBytes);
+        if (rc != 0) {
+          ::shm_unlink(ObjectName(name, false).c_str());
+          ThrowReserveError(isolate, rc, name);
+        }
+        restorer.handle = nullptr;
+        rowGuard.handle = nullptr;
+      }
+#endif
       WriteHeader(h, headerBytes, dataBytes, kindFlags);
       h->initializerSlot = slot;
       *outSlot = slot;
@@ -409,6 +432,14 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       const uint64_t priorData = HeaderDataBytesOf(h);
       uint32_t kind = kindFlags;
       uint64_t finalData = dataBytes;
+      {
+        // Round-4 E4-4: never write a header smaller than the object a
+        // (dead) creator already sized — later exact joins of the creator's
+        // size would fail forever. The file is the truth, bounded by our cap.
+        uint64_t byFile = FileDataBytes(isolate, handle, name, headerBytes);
+        if (byFile > opts.maxSegmentBytes) byFile = opts.maxSegmentBytes;
+        if (byFile > finalData) finalData = byFile;
+      }
       if (priorMagic == kMagic && priorVersion == kLayoutVersion && priorHb == headerBytes) {
         const uint32_t priorKind = priorFlags & kKindMask;
         if (kindFlags != kKindPlain && priorKind != kKindPlain && priorKind != kindFlags) {

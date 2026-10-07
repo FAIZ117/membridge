@@ -70,14 +70,65 @@ void StoreSlotState(int32_t* data, uint32_t slotsBase, uint32_t slot, uint32_t v
 
 // ---- the slot machine (PLAN §7.2, round-3 C2/C3) ---------------------------
 
-inline uint32_t ClaimingWord(int32_t pid) {
-  return ((static_cast<uint32_t>(pid) & 0x3FFFFFFFu) << 2) | kMutexStateClaimingTag;
+// Claiming word layout (round-4 S4-3/E4-6):
+//   POSIX:   (nsTag8 << 24) | (pid22 << 2) | 2   — Linux pids are < 2^22
+//            (PID_MAX_LIMIT), macOS pids far below; nsTag8 folds the
+//            claimer's pid-namespace inode (0 = unknown / no namespaces).
+//   Windows: (pid30 << 2) | 2                    — no pid namespaces.
+// A pid is only meaningful inside its own namespace: containers sharing
+// /dev/shm see different pids for the same process, so a claimer in another
+// namespace must never be judged dead or "ours" from a bare pid.
+#if defined(_WIN32)
+constexpr uint32_t kClaimPidMask = 0x3FFFFFFFu;
+inline uint32_t NsTag(int64_t) { return 0; }
+inline uint32_t ClaimingNsTag(uint32_t) { return 0; }
+#else
+constexpr uint32_t kClaimPidMask = 0x3FFFFFu;
+inline uint32_t NsTag(int64_t ns) {
+  if (ns <= 0) return 0;
+  uint64_t x = static_cast<uint64_t>(ns);
+  x ^= x >> 32;
+  x ^= x >> 16;
+  x ^= x >> 8;
+  const uint32_t t = static_cast<uint32_t>(x & 0xFFu);
+  return t == 0 ? 1 : t;  // 0 is reserved for "unknown"
+}
+inline uint32_t ClaimingNsTag(uint32_t st) { return st >> 24; }
+#endif
+
+inline uint32_t ClaimingWord(const Identity& self) {
+  return (NsTag(self.pidNsInode) << 24) |
+         ((static_cast<uint32_t>(self.pid) & kClaimPidMask) << 2) | kMutexStateClaimingTag;
 }
 inline bool IsClaiming(uint32_t st) { return (st & 3u) == kMutexStateClaimingTag; }
-inline int32_t ClaimingPid(uint32_t st) { return static_cast<int32_t>(st >> 2); }
+inline int32_t ClaimingPid(uint32_t st) { return static_cast<int32_t>((st >> 2) & kClaimPidMask); }
 
+enum class ClaimerVerdict { kOurs, kDead, kLiveOrUnknown };
+
+// Who holds a Claiming word, judged ONLY within our own pid namespace. A
+// different (or unknown) namespace tag is never recovered — the same
+// never-steal-across-namespaces rule §7.1 applies to identities. Called under
+// g_claim_mu, so "ours" means stale: no thread of this process is mid-claim.
+ClaimerVerdict JudgeClaimer(uint32_t st, const Identity& self) {
+  const uint32_t ourTag = NsTag(self.pidNsInode);
+  if (ClaimingNsTag(st) != ourTag) return ClaimerVerdict::kLiveOrUnknown;
+#if !defined(_WIN32)
+  if (ourTag == 0) return ClaimerVerdict::kLiveOrUnknown;  // cannot tell namespaces apart
+#endif
+  const int32_t claimer = ClaimingPid(st);
+  if (claimer == static_cast<int32_t>(static_cast<uint32_t>(self.pid) & kClaimPidMask)) {
+    return ClaimerVerdict::kOurs;
+  }
+  return CheckPidAlive(claimer) == Liveness::kDead ? ClaimerVerdict::kDead
+                                                   : ClaimerVerdict::kLiveOrUnknown;
+}
+
+// Same OS thread of the same process instance — the pid namespace is part of
+// the identity (round-4 E4-7: two containers whose processes are both pid 1
+// with the same start tick used to read as one thread).
 bool SameThread(const Identity& a, const Identity& b) {
-  return a.pid == b.pid && a.threadId == b.threadId && a.startTime == b.startTime;
+  return a.pid == b.pid && a.threadId == b.threadId && a.startTime == b.startTime &&
+         a.pidNsInode == b.pidNsInode;
 }
 
 // Every claim in this process runs under this mutex: threads share a pid, so
@@ -89,7 +140,7 @@ std::mutex g_claim_mu;
 // Win the exclusive publish right on slot `s` from the state we observed.
 bool TakePublishRight(int32_t* data, uint32_t base, uint32_t s, uint32_t seen,
                       const Identity& self) {
-  return CasSlotState(data, base, s, seen, ClaimingWord(self.pid));
+  return CasSlotState(data, base, s, seen, ClaimingWord(self));
 }
 
 // Publish while holding the right: bump gen (never to a value that makes the
@@ -122,12 +173,8 @@ uint32_t PublishHeld(int32_t* data, uint32_t base, uint32_t s, const Identity& s
 bool TakeFreeOrAbandoned(int32_t* data, uint32_t base, uint32_t s, const Identity& self) {
   const uint32_t st = SlotState(data, base, s);
   if (st == kMutexStateFree) return TakePublishRight(data, base, s, st, self);
-  if (IsClaiming(st)) {
-    const int32_t claimer = ClaimingPid(st);
-    const bool ours = claimer == static_cast<int32_t>(static_cast<uint32_t>(self.pid) & 0x3FFFFFFFu);
-    if (ours || CheckPidAlive(claimer) == Liveness::kDead) {
-      return TakePublishRight(data, base, s, st, self);
-    }
+  if (IsClaiming(st) && JudgeClaimer(st, self) != ClaimerVerdict::kLiveOrUnknown) {
+    return TakePublishRight(data, base, s, st, self);
   }
   return false;
 }
@@ -180,7 +227,18 @@ SegKey KeyFor(int32_t* data, const std::string& name) {
   SegKey k;
   k.data = data;
   k.name = name;
-  if (const std::shared_ptr<Mapping> m = Registry::FindByAddress(data)) {
+  // Round-4 P4-1: the name lookup is O(log n); scanning every live mapping
+  // (FindByAddress) made each claim O(mappings) — 241–333 µs at 10k. The
+  // address scan stays as the fallback for a name that now refers to a
+  // different mapping (grown, or unlinked + recreated).
+  auto covers = [data](const std::shared_ptr<Mapping>& m) {
+    const char* base = static_cast<const char*>(m->base);
+    const char* p = reinterpret_cast<const char*>(data);
+    return m->base != nullptr && p >= base && p < base + m->mappingBytes;
+  };
+  std::shared_ptr<Mapping> m = Registry::Get().Find(name);
+  if (m == nullptr || !covers(m)) m = Registry::FindByAddress(data);
+  if (m != nullptr) {
     k.dev = m->dev;
     k.ino = m->ino;
   }
@@ -232,17 +290,28 @@ void AddRefLocked(v8::Isolate* isolate, HeldEntry e) {
 
 // Release the lock `h.token` holds (tolerating HAS_WAITERS) as OWNER_DIED and
 // wake one waiter. Returns false when the word no longer holds the token.
+// The flag is published BEFORE the word is freed (round-4 E4-3): the next
+// acquirer's exchange of OWNER_DIED happens after it observes the word free,
+// so it can never miss the death and leave the flag for a later holder.
 bool ReleaseLockWord(const HeldEntry& h) {
   auto* lockWord = AtomicWord(h.seg.data);
+  auto* ownerDied = AtomicWord(h.seg.data + 1);
   int32_t cur = lockWord->load(std::memory_order_acquire);
+  bool flagged = false;
   for (;;) {
     if (static_cast<uint32_t>(cur) != h.token &&
         static_cast<uint32_t>(cur) != (h.token | kMutexHasWaiters)) {
-      return false;  // no longer ours
+      // No longer ours (stolen meanwhile): withdraw a flag we set — the
+      // stealer reports the death itself.
+      if (flagged) ownerDied->store(0, std::memory_order_release);
+      return false;
+    }
+    if (!flagged) {
+      ownerDied->store(1, std::memory_order_release);
+      flagged = true;
     }
     if (lockWord->compare_exchange_strong(cur, 0, std::memory_order_acq_rel)) break;
   }
-  AtomicWord(h.seg.data + 1)->store(1, std::memory_order_release);  // ownerDied
   SyncWake(h.seg.data, 1);
   return true;
 }
@@ -432,17 +501,22 @@ namespace {
 
 uint32_t ClaimRoleLocked(v8::Isolate* isolate, const std::string& name, int32_t* data,
                          uint32_t base, uint32_t roleWordOffset, uint32_t slotIndex,
-                         bool isProducer, const Identity& self, bool* outReclaim) {
+                         bool isProducer, const Identity& self, bool* outReclaim,
+                         std::unique_lock<std::mutex>& claimLock) {
   auto* roleWord = AtomicWord(data + roleWordOffset);
   *outReclaim = false;
   // A live participant caught mid-claim (Claiming word, or published slot
   // with the role word still 0) settles within microseconds — it either wins
   // the role word or backs off. Give it a bounded window before answering
   // E_ROLE_TAKEN, instead of failing a claim the other side may yet lose
-  // (round-3 post-verification nit 2). g_claim_mu is held meanwhile, which
-  // only delays other claims in this process, never the other participant.
+  // (round-3 post-verification nit 2). g_claim_mu is RELEASED across each
+  // sleep (round-4 P4-4: holding it stalled every other claim in the process
+  // for the whole window); the loop re-reads all state after re-locking.
   using Clock = std::chrono::steady_clock;
   constexpr auto kSettleWindow = std::chrono::milliseconds(100);
+  // Whole-claim wall-clock cap (round-4 S4-11): a writer racing the slot
+  // words cannot keep this loop busy for more than ~1 s.
+  const Clock::time_point claimDeadline = Clock::now() + std::chrono::seconds(1);
   Clock::time_point settleStart{};
   bool settling = false;
   int settleDelayUs = 20;
@@ -452,12 +526,14 @@ uint32_t ClaimRoleLocked(v8::Isolate* isolate, const std::string& name, int32_t*
       settleStart = Clock::now();
     }
     if (Clock::now() - settleStart >= kSettleWindow) return false;
+    claimLock.unlock();
     std::this_thread::sleep_for(std::chrono::microseconds(settleDelayUs));
+    claimLock.lock();
     if (settleDelayUs < 1000) settleDelayUs *= 2;
     return true;
   };
   // Bounded (review F23): a wedged slot fails with E_TIMEOUT, never spins.
-  for (int guard = 0; guard < 100000; guard++) {
+  for (int guard = 0; guard < 100000 && Clock::now() < claimDeadline; guard++) {
     uint32_t cur = static_cast<uint32_t>(roleWord->load(std::memory_order_acquire));
     if (cur != 0) {
       const uint32_t curSlot = (cur & kMutexTokenMask) >> 16;
@@ -503,9 +579,7 @@ uint32_t ClaimRoleLocked(v8::Isolate* isolate, const std::string& name, int32_t*
       } else {
         haveRight = TakeDeadActive(data, base, slotIndex, self, nullptr);
       }
-    } else if (IsClaiming(st) && CheckPidAlive(ClaimingPid(st)) != Liveness::kDead &&
-               ClaimingPid(st) !=
-                   static_cast<int32_t>(static_cast<uint32_t>(self.pid) & 0x3FFFFFFFu)) {
+    } else if (IsClaiming(st) && JudgeClaimer(st, self) == ClaimerVerdict::kLiveOrUnknown) {
       if (stillSettling()) continue;
       ThrowError(isolate, "E_ROLE_TAKEN", "ring role is being claimed by a live participant",
                  name);
@@ -547,10 +621,10 @@ uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* d
   e.slot = static_cast<int>(slotIndex);
   if (!sab.IsEmpty()) e.pin = sab->GetBackingStore();
 
-  std::lock_guard<std::mutex> claim(g_claim_mu);
+  std::unique_lock<std::mutex> claim(g_claim_mu);
   bool shared = false;
   const uint32_t token = ClaimRoleLocked(isolate, name, data, kRingSlotsWordOffset, roleWord,
-                                         slotIndex, isProducer, self, &shared);
+                                         slotIndex, isProducer, self, &shared, claim);
   e.token = token;
   {
     std::lock_guard<std::mutex> lock(g_held_mu);
@@ -561,7 +635,7 @@ uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* d
 
 void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot) {
   HeldEntry dropped;
-  bool last = false;
+  bool last = false, roleStillHeld = false;
   {
     std::lock_guard<std::mutex> lock(g_held_mu);
     auto it = g_held.find(isolate);
@@ -577,8 +651,19 @@ void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot) {
         break;
       }
     }
+    if (last) {
+      // Another mapping of the SAME ring on this thread still holds the role
+      // (round-4 E4-10, parity with MutexUnregisterClaim): releasing it now
+      // would let another process take a role a live instance still uses.
+      for (const HeldEntry& h : entries) {
+        if (h.isRole && h.slot == slot && SameSegment(h.seg, dropped.seg)) {
+          roleStillHeld = true;
+          break;
+        }
+      }
+    }
   }
-  if (!last || dropped.pin == nullptr) return;  // R11: never touch unmapped memory
+  if (!last || roleStillHeld || dropped.pin == nullptr) return;  // R11: never touch unmapped memory
   std::lock_guard<std::mutex> claim(g_claim_mu);  // a release must not interleave a claim
   ReleaseRole(dropped);
 }

@@ -239,9 +239,12 @@ export class Mutex {
     }
   }
 
-  /** Acquire without blocking. Returns false when the lock is held (even by a
-   * dead owner — tryLock does not steal, §7.3). */
-  tryLock(): boolean {
+  /** Acquire without blocking. Returns `{ ownerDied }` on success, `null`
+   * when the lock is held (even by a dead owner — tryLock does not steal,
+   * §7.3). Truthiness is unchanged from the old boolean form; `ownerDied`
+   * reports a previous holder's death exactly as `lock()` does (round-4
+   * E4-3: the flag used to be left for an unrelated later `lock()`). */
+  tryLock(): LockResult | null {
     const token = this.claim().token;
     const lw = this.lockWord();
     if ((lw & TOKEN_MASK) === token) {
@@ -249,14 +252,14 @@ export class Mutex {
         segmentName: this.name,
       });
     }
-    if ((lw & TOKEN_MASK) !== 0) return false;
+    if ((lw & TOKEN_MASK) !== 0) return null;
     // preserve the bit: parked waiters must not lose their wake source
     if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS)) === lw) {
       Atomics.add(this.view, SEQ, 1);
       this.hold.held = true;
-      return true;
+      return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
     }
-    return false;
+    return null;
   }
 
   /** Acquire asynchronously; waits ride the membridge waiter threads (§6),
@@ -318,6 +321,11 @@ export class Mutex {
           : null;
       const wr = await (abortP !== null ? Promise.race([waitP, abortP]) : waitP);
       waited = true;
+      // Round-4 E4-1: close() may have run while we were parked. The claim
+      // reference (and possibly the thread's slot) is gone, so acquiring now
+      // would hold the lock with a token nobody can release — or one another
+      // process may already treat as free.
+      this.assertOpen();
       if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
       if (wr === 'timed-out') livenessCheckDue = true;  // R18: re-probe the holder
     }

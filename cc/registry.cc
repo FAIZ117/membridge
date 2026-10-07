@@ -39,6 +39,7 @@ Mapping::Mapping() = default;
 
 Mapping::~Mapping() {
   Detach();
+  Registry::Get().Forget(this);
   if (base != nullptr) {
 #if defined(_WIN32)
     UnmapViewOfFile(base);
@@ -56,7 +57,19 @@ void Mapping::Detach() {
   // an heir are released only after g_detach_mu is (round-3 C15).
   std::vector<std::shared_ptr<Mapping>> keep;
   std::lock_guard<std::mutex> lock(g_detach_mu);
-  if (raw || attachSlot < 0 || detached.exchange(true)) {
+  if (raw || detached.exchange(true)) {
+    return;
+  }
+  if (attachSlot < 0) {
+    // Not the row owner: nothing to release, but an unlinkWhenUnused request
+    // made through THIS mapping must survive it (round-4 E4-8) — hand it to
+    // a surviving mapping of the same object, which owns or will inherit the
+    // row and makes the decision.
+    if (unlinkWhenUnused) {
+      if (Mapping* heir = Registry::Get().HeirFor(this, &keep).get()) {
+        heir->unlinkWhenUnused = true;
+      }
+    }
     return;
   }
   // Review F20 / round-3 C15: other Mappings over the same segment (e.g.
@@ -160,63 +173,90 @@ Registry& Registry::Get() {
   return r;
 }
 
-std::shared_ptr<Mapping> Registry::Find(const std::string& name) {
+namespace {
+// Raw mappings live under their own key (round-4 E4-10). '\x01' cannot occur
+// in a validated segment name.
+std::string RegKey(const std::string& name, bool raw) {
+  return raw ? std::string("\x01raw:") + name : name;
+}
+}  // namespace
+
+std::shared_ptr<Mapping> Registry::Find(const std::string& name, bool raw) {
   std::lock_guard<std::mutex> lock(mu_);
-  auto it = map_.find(name);
+  auto it = map_.find(RegKey(name, raw));
   if (it == map_.end()) return nullptr;
   return it->second.lock();
 }
 
+Registry::ObjectKey Registry::KeyOf(const Mapping& m) {
+  ObjectKey k;
+#if !defined(_WIN32)
+  if (m.ino != 0) {
+    k.dev = m.dev;
+    k.ino = m.ino;
+    return k;
+  }
+#endif
+  k.name = m.name;  // Windows sections have no inode: the name decides
+  return k;
+}
+
+void Registry::PruneLocked(const ObjectKey& key) {
+  auto b = byObject_.find(key);
+  if (b == byObject_.end()) return;
+  auto& v = b->second;
+  // expired() takes no strong reference: nothing can be destroyed under mu_.
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [](const std::weak_ptr<Mapping>& w) { return w.expired(); }),
+          v.end());
+  if (v.empty()) byObject_.erase(b);
+}
+
 void Registry::Put(const std::string& name, const std::shared_ptr<Mapping>& m) {
   std::lock_guard<std::mutex> lock(mu_);
-  map_[name] = m;
-  // Prune expired entries here too (post-verification nit 3): HeirFor alone
-  // pruned, so a long-lived process that kept opening segments without ever
-  // detaching one grew this list without bound. expired() takes no strong
-  // reference, so nothing can be destroyed under mu_.
-  all_.erase(std::remove_if(all_.begin(), all_.end(),
-                            [](const std::weak_ptr<Mapping>& w) { return w.expired(); }),
-             all_.end());
-  all_.push_back(m);
+  map_[RegKey(name, m->raw)] = m;
+  // Only this object's bucket is touched (round-4 P4-3: pruning the whole
+  // list on every insert made each cold open O(mappings)).
+  const ObjectKey key = KeyOf(*m);
+  PruneLocked(key);
+  byObject_[key].push_back(m);
 }
 
 void Registry::Erase(const std::string& name) {
   std::lock_guard<std::mutex> lock(mu_);
-  map_.erase(name);
+  map_.erase(RegKey(name, false));
+  map_.erase(RegKey(name, true));
 }
 
-namespace {
-
-bool SameObject(const Mapping& a, const Mapping& b) {
-#if defined(_WIN32)
-  // Sections have no inode: a named section opened under one name is one
-  // kernel object, so the name decides.
-  return a.name == b.name;
-#else
-  if (a.ino != 0 && b.ino != 0) return a.dev == b.dev && a.ino == b.ino;
-  return a.name == b.name;  // identity never recorded (fstat failed)
-#endif
+void Registry::Forget(const Mapping* self) {
+  std::lock_guard<std::mutex> lock(mu_);
+  PruneLocked(KeyOf(*self));
 }
 
-}  // namespace
+void Registry::MarkUnlinkWhenUnused(Mapping& m) {
+  std::lock_guard<std::mutex> lock(g_detach_mu);  // Detach reads it under this lock
+  m.unlinkWhenUnused = true;
+}
+
 
 std::shared_ptr<Mapping> Registry::HeirFor(const Mapping* self,
                                            std::vector<std::shared_ptr<Mapping>>* keep) {
   std::lock_guard<std::mutex> lock(mu_);
   std::shared_ptr<Mapping> heir;
-  for (auto it = all_.begin(); it != all_.end();) {
+  auto b = byObject_.find(KeyOf(*self));
+  if (b == byObject_.end()) return heir;
+  auto& v = b->second;
+  for (auto it = v.begin(); it != v.end();) {
     std::shared_ptr<Mapping> m = it->lock();
     if (m == nullptr) {
-      it = all_.erase(it);
+      it = v.erase(it);
       continue;
     }
-    if (heir == nullptr && m.get() != self && !m->raw && !m->detached.load() &&
-        SameObject(*m, *self)) {
-      heir = m;
-    }
+    if (heir == nullptr && m.get() != self && !m->raw && !m->detached.load()) heir = m;
     keep->push_back(std::move(m));  // never destroyed under our locks
     ++it;
   }
+  if (v.empty()) byObject_.erase(b);
   return heir;
 }
 

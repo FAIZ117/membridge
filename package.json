@@ -30,7 +30,6 @@
     "dist/*.js",
     "dist/*.d.ts",
     "dist/*.js.map",
-    "dist/test/",
     "esm/",
     "prebuilds/",
     "cc/",

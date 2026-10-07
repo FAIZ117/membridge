@@ -84,9 +84,17 @@ and on timeout.
 - **Full-ring wakes**: while a peer is parked on a full/empty ring, each
   release/commit notifies until the peer runs (a plain-load flag check — an
   exchange-based "one wake per park" loses wakes, ADR 0006).
-- **Async waits are budgeted per process**: 127 multiplexed + 64 thread
-  fallbacks = 191 outstanding `waitAsync`/`lockAsync` waits, then
+- **Async waits are budgeted per process**: on Linux ≥ 5.16, 127 multiplexed +
+  64 thread fallbacks = 191 outstanding `waitAsync`/`lockAsync`/ring async
+  waits; on macOS, Windows and Linux < 5.16 only the 64 thread fallbacks. Then
   `E_TOO_MANY_WAITERS` (all segments and isolates share the budget).
+- **Containers sharing `/dev/shm`** (`--ipc=…`) are supported with one rule:
+  nothing is ever stolen or recovered across pid namespaces — a holder, or a
+  claim in flight, that dies in another container stays held until a process
+  in that namespace (or `reap`) recovers it (PLAN §7.1/§7.2).
+- **`/dev/shm` is world-writable**: `list()`/`stat()`/`reap()` skip FIFOs,
+  devices and symlinks other users plant there (no hang, no abort); opening
+  such a name fails `E_INCOMPATIBLE`.
 - `reap()` is for segments expected idle: it decides from an attach-table
   snapshot, so a joiner claiming a row mid-scan can be unlinked under (it
   keeps its mapping, POSIX-style). The same benign race exists in the last

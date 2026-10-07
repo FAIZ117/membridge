@@ -65,3 +65,23 @@ broke mutual exclusion three ways, each reproduced through the public API:
   is held meanwhile — it delays only other claims in this process.
 - No cost on the lock/unlock hot path (claims happen once per instance):
   uncontended lock+unlock 49–51 ns vs 48–59 ns at `248f731` (same session).
+
+## Amendment (2026-10-07, round 4)
+
+- **The Claiming word carries a pid-namespace tag** (S4-3/E4-6):
+  `(nsTag8 << 24) | (pid22 << 2) | 2` on POSIX. A bare pid means nothing in
+  another namespace — a claimer in a sibling container could read a live
+  claimer as dead (ESRCH) or as "ours" (both pid 1) and take the publish
+  right. A word is now judged dead or ours only when its tag equals ours;
+  otherwise it is never recovered (the §7.1 never-steal-across-namespaces
+  rule). Thread identity and attach-row matches also compare the namespace
+  inode (E4-7). Windows keeps a 30-bit pid and no tag. Residual: two distinct
+  namespaces whose inodes fold to the same 8-bit tag (1/255) fall back to the
+  pid-only judgment.
+- **The settle sleep releases `g_claim_mu`** (P4-4/S4-11) and a whole role
+  claim is capped at ~1 s of wall time. Safe because a thread sleeps only
+  while it holds no Claiming right, so "a Claiming word with our pid is
+  stale" still holds whenever the lock is held.
+- **Claims resolve their segment key by name** (P4-1): O(log n) instead of a
+  scan of every live mapping (claim p50 at 5k linked mappings: 79.5 µs →
+  3.7 µs).

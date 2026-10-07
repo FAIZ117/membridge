@@ -21,8 +21,8 @@ const OPS = require.resolve('../src/ops');
 const POSIX = process.platform !== 'win32';
 
 /** Run a node -e script; returns { status, signal, out } with trimmed stdout. */
-function runNode(code: string, flags: string[] = []): { status: number | null; signal: string | null; out: string; err: string } {
-  const r = spawnSync(process.execPath, [...flags, '-e', code], { encoding: 'utf8', timeout: 60_000 });
+function runNode(code: string, flags: string[] = [], env: NodeJS.ProcessEnv = process.env): { status: number | null; signal: string | null; out: string; err: string } {
+  const r = spawnSync(process.execPath, [...flags, '-e', code], { encoding: 'utf8', timeout: 60_000, env });
   return { status: r.status, signal: r.signal, out: (r.stdout ?? '').trim(), err: (r.stderr ?? '').trim() };
 }
 
@@ -250,6 +250,7 @@ test('C5: a throw after a winning grow releases the row through the new mapping'
        let code='none'; try{ open(${JSON.stringify(name)}, 1<<20, {sizePolicy:'grow'}); }catch(e){ code=e.code; }
        const mine=stat(${JSON.stringify(name)}).attachSlots.filter(s=>s.pid===process.pid).length;
        console.log(JSON.stringify({code, mine}));`,
+      [], { ...process.env, MEMBRIDGE_TEST_HOOKS: '1' },
     );
     assert.strictEqual(r.signal, null, `child crashed: ${r.err}`);
     assert.deepStrictEqual(lastJson(r.out), { code: 'E_SYSTEM', mine: 0 });

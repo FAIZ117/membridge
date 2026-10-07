@@ -357,7 +357,7 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
   // cross-process join path rejects it via the header kind flags, so the
   // same-process reuse path must not silently bypass that check.
   if (opts.mode != Mode::kCreate) {
-    if (auto live = Registry::Get().Find(name)) {
+    if (auto live = Registry::Get().Find(name, opts.raw)) {
       // Review F16: another process may have unlinked and recreated the name
       // — the cached mapping would silently split this process onto old
       // memory. Validate the object identity (dev/ino) before reusing.
@@ -379,6 +379,9 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
       } else {
         uint64_t windowBytes = 0;
         if (TryReuse(isolate, live, opts, haveSize, requested, &windowBytes)) {
+          // Round-4 E4-8: a reuse with { unlinkWhenUnused: true } used to drop
+          // the request — the name was never unlinked.
+          if (opts.unlinkWhenUnused) Registry::MarkUnlinkWhenUnused(*live);
           args.GetReturnValue().Set(MakeWindow(isolate, live, live->headerBytes, windowBytes));
           return;
         }
@@ -577,6 +580,14 @@ void IsNative(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 void DebugFailAfterGrow(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // Test-only fault injection (round-4 S4-14): inert unless the process was
+  // started with MEMBRIDGE_TEST_HOOKS=1, so a shipped binary cannot be made
+  // to fail opens by anything that loads the .node file directly.
+  const char* on = std::getenv("MEMBRIDGE_TEST_HOOKS");
+  if (on == nullptr || std::string(on) != "1") {
+    ThrowError(args.GetIsolate(), "E_UNSUPPORTED",
+               "test hooks are disabled (set MEMBRIDGE_TEST_HOOKS=1 in tests)");
+  }
   g_debugFailAfterGrow.store(true);
   args.GetReturnValue().Set(v8::Undefined(args.GetIsolate()));
 }

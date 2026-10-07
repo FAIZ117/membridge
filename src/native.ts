@@ -48,7 +48,8 @@ export interface Native {
   };
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
-  /** The next grow-policy open throws E_SYSTEM right after its grow re-maps. */
+  /** Test-only (needs MEMBRIDGE_TEST_HOOKS=1, else E_UNSUPPORTED): the next
+   * grow-policy open throws E_SYSTEM right after its grow re-maps. */
   debugFailAfterGrow(): void;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };
 }

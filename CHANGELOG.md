@@ -94,6 +94,36 @@ handoff and verification guide: [docs/review/2026-10-07T1349-round3-fixes.md].
 - **API**: new error code `E_CLOSED`; mutex/ring `timeoutMs` errors are
   `E_NAME_INVALID` (matching `membridge/sync` and PLAN §7.3).
 
+### Round-4 fix round (2026-10-07)
+
+Review: [docs/review/2026-10-07T1710-round4-review.md]. Fixes and verification
+guide: [docs/review/2026-10-07T1753-round4-fixes.md].
+
+- **Mutex**: `lockAsync` pending at `close()` rejects `E_CLOSED` instead of
+  acquiring with a dropped claim (E4-1); `tryLock()` now returns
+  `{ ownerDied } | null` and the death-release publishes the flag before
+  freeing the word (E4-3).
+- **Ring**: a `reserveAsync` that wakes while another reservation on the same
+  producer is uncommitted rejects `E_RING_STATE` instead of handing out the
+  same region (E4-2).
+- **Init protocol**: the creator reserves (`posix_fallocate`) only after it
+  holds the init baton, so a joiner can no longer take over a live creator
+  mid-reserve; a takeover never shrinks below the object a dead creator sized
+  (E4-4).
+- **Async waits**: one truncated segment no longer freezes every async wait in
+  the process; the fallback waiter thread no longer spins on EFAULT (S4-1).
+- **`/dev/shm` hygiene**: FIFOs and symlinks there can neither hang nor abort
+  `list()`/`stat()`/`reap()`; failed opens no longer leak fds (S4-2/S4-5/S4-7).
+- **Containers**: the in-flight slot-claim marker carries a pid-namespace tag;
+  claims are never recovered across namespaces (S4-3/E4-6/E4-7).
+- **Scalability**: claim cost no longer grows with mapped segments (P4-1);
+  registry teardown and inserts are per object, not O(mappings) (P4-2/P4-3);
+  the role-claim settle wait no longer blocks other claims (P4-4).
+- **Registry**: `unlinkWhenUnused` is honoured on reuse and non-owner
+  mappings (E4-8); a raw open no longer displaces a typed entry (E4-10).
+- **Packaging**: the fault-injection hook is inert unless
+  `MEMBRIDGE_TEST_HOOKS=1`; compiled tests are no longer shipped (S4-14).
+
 ### Release process
 
 Publishing follows the same manual pattern as `expr-eval-nextgen`: CI assembles

@@ -26,7 +26,12 @@ constexpr uint32_t kMutexDataBytes =
 // Slot state word (round-3 fix C2/C3, PLAN §7.2):
 //   0                  Free
 //   1                  Active (identity + gen published)
-//   (pid << 2) | 2     Claiming — the EXCLUSIVE publish right, held by `pid`.
+//   (nsTag << 24) | (pid << 2) | 2
+//                      Claiming — the EXCLUSIVE publish right, held by `pid`
+//                      (22 bits) in the pid namespace folded into `nsTag`
+//                      (8 bits; 0 = unknown). Windows: (pid << 2) | 2, 30-bit
+//                      pid. Only a claimer in OUR namespace is ever judged
+//                      dead or ours (round-4 S4-3).
 // A claimer wins the right with ONE CAS from the state it observed (Free, a
 // Claiming word whose pid is provably dead, or — for a reclaim — Active with
 // the gen it read before its liveness verdict). Only the holder of the right

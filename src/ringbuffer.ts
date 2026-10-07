@@ -264,14 +264,18 @@ export class RingProducer {
     }
   }
 
-  private checkReserve(n: number, timeoutMs: number | undefined, who: string): number {
-    this.assertOpen();
-    checkTimeoutMs(timeoutMs, who);
+  private assertNoPending(): void {
     if (this.pending !== null) {
       throw new MembridgeError('E_RING_STATE', 'previous reserve not committed', {
         segmentName: this.name,
       });
     }
+  }
+
+  private checkReserve(n: number, timeoutMs: number | undefined, who: string): number {
+    this.assertOpen();
+    checkTimeoutMs(timeoutMs, who);
+    this.assertNoPending();
     if (!Number.isSafeInteger(n) || n < 0) {
       throw new MembridgeError('E_SIZE_INVALID', 'message size must be a safe integer >= 0', {
         segmentName: this.name,
@@ -371,6 +375,10 @@ export class RingProducer {
         // comparing two back-to-back reads missed it and parked a full slice.
         const tailSeen = this.tail();
         this.assertOpen();
+        // Round-4 E4-2: another reserve on this instance (a concurrent
+        // reserveAsync, or a sync reserve whose commit spans an await) may
+        // have taken the region while we were parked — never overwrite it.
+        this.assertNoPending();
         const view = this.tryReserve(n, framed);
         if (view !== null) return view;
         if (opts?.timeoutMs === 0 || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
@@ -382,6 +390,7 @@ export class RingProducer {
         await waitAsync(this.view, TAIL, tailSeen, sliceOf(deadline));
         if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
           this.assertOpen();
+          this.assertNoPending();
           const last = this.tryReserve(n, framed);  // last look before giving up
           if (last !== null) return last;
           throw this.fullError('reserveAsync');

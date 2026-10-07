@@ -137,8 +137,13 @@ export function list(): string[] {
     // so the membridge magic — not a name prefix — decides (§9).
     const path = `/dev/shm/${entry}`;
     try {
-      const fd = fs.openSync(path, 'r');
+      // Non-blocking, no symlinks, regular files only (round-4 S4-2/S4-7):
+      // /dev/shm is world-writable, so any local user can plant a FIFO
+      // (a blocking open would hang list()/reap() forever) or a symlink.
+      const { O_RDONLY, O_NONBLOCK, O_NOFOLLOW } = fs.constants;
+      const fd = fs.openSync(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
       try {
+        if (!fs.fstatSync(fd).isFile()) continue;
         const probe = Buffer.alloc(8);
         const n = fs.readSync(fd, probe, 0, 8, 0);
         if (n >= 8 && probe.readUInt32LE(0) === MAGIC) {

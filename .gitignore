@@ -8,3 +8,4 @@ prebuilds/
 src/**/*.js
 src/**/*.js.map
 src/**/*.d.ts
+temp/

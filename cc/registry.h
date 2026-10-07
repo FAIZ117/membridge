@@ -31,12 +31,17 @@ class Registry {
   // derive per-word kernel-object names from the segment name).
   static std::shared_ptr<Mapping> FindByAddress(const void* addr);
 
-  // True when some OTHER live mapping in this process refers to the same
-  // segment object (review F20): the attach row and any unlinkWhenUnused
-  // decision must not be made unilaterally. Compares recorded object
-  // identity (dev/ino; same name on Windows) — NOT base pointers, which
-  // differ per mmap even for the same segment.
-  bool OthersShareSegment(const Mapping* self);
+  // Another live, not-yet-detached mapping in this process over the same
+  // segment object, or nullptr (review F20 / round-3 C15). Searches EVERY
+  // mapping ever Put — not only the current per-name entry, which a grow
+  // replaces — so the attach row is handed to a survivor instead of being
+  // released early or leaked. Compares recorded object identity (dev/ino;
+  // the name on Windows) — NOT base pointers, which differ per mmap.
+  // Every strong reference taken while scanning is moved into `keep`: the
+  // caller must destroy them only AFTER releasing its locks (dropping the
+  // last reference runs ~Mapping -> Detach, which takes the detach lock).
+  std::shared_ptr<Mapping> HeirFor(const Mapping* self,
+                                   std::vector<std::shared_ptr<Mapping>>* keep);
 
   // All live mappings (debug/ops).
   std::vector<std::shared_ptr<Mapping>> Live();
@@ -44,6 +49,7 @@ class Registry {
  private:
   std::mutex mu_;
   std::map<std::string, std::weak_ptr<Mapping>> map_;
+  std::vector<std::weak_ptr<Mapping>> all_;  // every mapping Put, pruned lazily
 };
 
 // POSIX object-identity helpers (review F16/F21). NameRefersTo compares a

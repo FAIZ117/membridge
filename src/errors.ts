@@ -16,6 +16,7 @@ export type MembridgeErrorCode =
   | 'E_TIMEOUT'
   | 'E_ROLE_TAKEN'
   | 'E_RING_STATE'
+  | 'E_CLOSED'
   | 'E_MESSAGE_TOO_LARGE'
   | 'E_TOO_MANY_WAITERS'
   | 'E_NATIVE_UNAVAILABLE'
@@ -50,6 +51,7 @@ const CODES: ReadonlySet<string> = new Set<string>([
   'E_TIMEOUT',
   'E_ROLE_TAKEN',
   'E_RING_STATE',
+  'E_CLOSED',
   'E_MESSAGE_TOO_LARGE',
   'E_TOO_MANY_WAITERS',
   'E_NATIVE_UNAVAILABLE',

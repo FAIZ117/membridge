@@ -52,6 +52,48 @@ commits closing the release blockers:
   capacity/maxMessage, `waitAsync` resolves `'not-equal'` per the §6
   contract, `stat()` liveness uses the §7.1 native check.
 
+### Round-3 fix round (2026-10-07)
+
+Re-verification: [docs/review/2026-10-07T1236-round3-reverification.md]. Fix
+handoff and verification guide: [docs/review/2026-10-07T1349-round3-fixes.md].
+
+- **Mutual exclusion restored** (C1–C4): slot and role claims take an
+  exclusive state-word right (`pid << 2 | 2`), are serialized per process, and
+  a reclaim re-validates the gen it judged; each JS instance holds its own
+  claim reference, so closing or collecting one `Mutex` never releases a lock a
+  sibling instance holds (ADR 0007).
+- **Memory safety**: the attach-row unwind after a grow resolves the header
+  from the re-mapped handle (C5); Windows `stat()` bounds its row loop by the
+  mapped view (C8); native views are checked for offset and length, and the
+  claim pin comes from the view's own buffer (C18).
+- **Ring**: async waits snapshot the counter before their attempt — no lost
+  wakeups (C6); `close()` for both roles with `E_CLOSED` (C10); a new role
+  holder clears a stale parked flag (C13); `RingProducer.open` returns the
+  thread's live producer (C24); timeouts validated (C14); `reserveAsync` no
+  longer throws per failed attempt (C19). An exchange-based wake (C20) was
+  tried and reverted — it lost wakes (ADR 0006).
+- **Init protocol**: an epoch in the init word closes the handback ABA (C16);
+  every join pass honors `initTimeoutMs` (C11); a takeover keeps a valid prior
+  header's kind and geometry (C12); failed takeovers release their row (C17);
+  size-less joins of uninitialized objects no longer truncate them and use one
+  timeout budget (C23).
+- **Identity / liveness**: failed self-identity reads are retried, not cached
+  (C9/R19); macOS liveness matches Linux (zombies, unreadable = unknown);
+  Windows `stat()`/`reap()` use the native liveness check (F34).
+- **Registry**: the attach row is handed to a surviving mapping (C15); a kind
+  mismatch no longer evicts the valid entry; Linux identity check is one
+  `lstat` (C22).
+- **Platforms**: macOS uses timed `os_sync` waits with the correct wake flags
+  and refuses `grow` with `E_GROW_UNSUPPORTED` (C7) — CI-unverified;
+  `posix_fallocate` errors map precisely (`E_NO_SPACE` only for
+  ENOSPC/EFBIG, EINTR retried) (C21).
+- **Post-verification hardening**: an own slot that would mint token 0 is
+  re-published before use; a role claim that meets a live participant
+  mid-claim waits up to 100 ms for it to settle instead of failing fast; the
+  registry's mapping list is pruned on every insert.
+- **API**: new error code `E_CLOSED`; mutex/ring `timeoutMs` errors are
+  `E_NAME_INVALID` (matching `membridge/sync` and PLAN §7.3).
+
 ### Release process
 
 Publishing follows the same manual pattern as `expr-eval-nextgen`: CI assembles

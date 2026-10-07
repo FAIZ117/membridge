@@ -58,7 +58,56 @@
 
 #include <uv.h>
 
+#if defined(__APPLE__)
+// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flags, from the
+// SDK's own header — included at FILE scope (round-3 C7: it used to sit inside
+// an anonymous namespace). The calls are runtime-guarded with
+// __builtin_available; an older SDK (no header) or OS falls back to a bounded
+// poll. Timed parks use os_sync_wait_on_address_with_timeout, so a timed wait
+// — and the 250 ms dead-owner slice that rides on it — really times out.
+#if defined(__has_include)
+#if __has_include(<os/os_sync_wait_on_address.h>)
+#include <os/clock.h>
+#include <os/os_sync_wait_on_address.h>
+#define MEMBRIDGE_HAVE_OS_SYNC 1
+#endif
+#endif
+#endif
+
 namespace membridge {
+
+#if defined(__APPLE__)
+namespace {
+// One bounded park on `addr` while it holds `expected` (macOS). Returns false
+// when os_sync is unavailable — the caller then sleeps its back-off instead.
+// Wakes, value changes and timeouts are all re-checked by the caller.
+bool OsSyncPark(int32_t* addr, uint32_t expected, double sliceMs) {
+#if defined(MEMBRIDGE_HAVE_OS_SYNC)
+  if (__builtin_available(macOS 14.4, *)) {
+    const uint64_t ns = sliceMs <= 0 ? 1000 : static_cast<uint64_t>(sliceMs * 1e6);
+    os_sync_wait_on_address_with_timeout(addr, static_cast<uint64_t>(expected), sizeof(int32_t),
+                                         OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                         OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
+    return true;
+  }
+#endif
+  (void)addr; (void)expected; (void)sliceMs;
+  return false;
+}
+
+int OsSyncWakeAll(int32_t* addr) {
+#if defined(MEMBRIDGE_HAVE_OS_SYNC)
+  if (__builtin_available(macOS 14.4, *)) {
+    const int r = os_sync_wake_by_address_all(addr, sizeof(int32_t),
+                                              OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+    return r < 0 ? 0 : 1;  // -1/ENOENT: nobody parked
+  }
+#endif
+  (void)addr;
+  return 0;  // poll fallback: waiters re-check on their back-off schedule
+}
+}  // namespace
+#endif
 
 namespace {
 
@@ -205,19 +254,6 @@ void Deliver(const std::shared_ptr<WaitNode>& node, Fulfill result) {
 
 // Fallback waiter thread: one per wait (futex where available, bounded poll
 // otherwise). Runs with the node already removed from g_pending.
-#if defined(__APPLE__)
-// U1 (unverified locally): macOS 14.4+ os_sync with the SHARED flag, via the
-// SDK's real header (review R17: hand-declared externs used a nonexistent
-// `_shared` wake export and a wrong-arity timeout call — no compile, and
-// wakes would have been no-ops). Availability is checked at runtime; on
-// older macOS the calls resolve to null and the code falls back to poll.
-#include <AvailabilityMacros.h>
-#if defined(__MAC_14_4) || MAC_OS_X_VERSION_MIN_REQUIRED >= 140400
-#include <os/os_sync_wait_on_address.h>
-#define MEMBRIDGE_HAVE_OS_SYNC 1
-#endif
-#endif
-
 #if defined(_WIN32)
 // Named semaphore per word (§6, U3: WaitOnAddress is process-private). The
 // waiter count lives in the semaphore permits themselves: notify releases
@@ -314,14 +350,9 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   }
   CloseHandle(sem);
 #elif defined(__APPLE__)
-  // macOS (U1, unverified locally): os_sync with bounded slices when the
-  // symbols exist (14.4+), else bounded exponential back-off poll (50 us ->
-  // 2 ms). The untimed os_sync call was a review finding (P5): a timed
-  // waitAsync could never time out without a wake.
-  // os_sync has NO timeout parameter: park in bounded slices and re-check
-  // the deadline ourselves (review P5: the untimed call meant a timed
-  // waitAsync could never time out without a wake).
-  const bool useOsSync = os_sync_wait_on_address != nullptr;
+  // macOS (U1, unverified locally): timed os_sync parks in bounded slices
+  // (14.4+), else a bounded exponential back-off poll (50 us -> 2 ms). Every
+  // pass re-checks cancellation, the word and the deadline.
   double delayUs = 50;
   for (;;) {
     if (node->cancelled) break;  // resolved by the teardown hook
@@ -329,26 +360,18 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       Deliver(node, Fulfill::kOk);
       break;
     }
-    uint32_t sliceMs = 250;
+    double sliceMs = 250;
     if (node->hasTimeout) {
       const double rem = node->deadlineMs - NowMs();
       if (rem <= 0) {
         Deliver(node, Fulfill::kTimedOut);
         break;
       }
-      sliceMs = static_cast<uint32_t>(rem > 250.0 ? 250.0 : rem);
+      if (rem < sliceMs) sliceMs = rem;
     }
-    if (useOsSync) {
-      os_sync_wait_on_address(node->addr, static_cast<uint64_t>(
-                                              static_cast<uint32_t>(node->expected)),
-                              sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
-      // Spurious wakes and value changes are re-checked on the next
-      // iteration; the deadline is re-checked because the park is untimed.
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-    } else {
+    if (!OsSyncPark(node->addr, static_cast<uint32_t>(node->expected), sliceMs)) {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
-      (void)sliceMs;
     }
   }
 #else
@@ -533,23 +556,30 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
     return WaitResult::kTimedOut;  // unexpected errno: bounded failure
   }
 #elif defined(__APPLE__)
-  // macOS (U1, unverified locally): os_sync has NO timeout parameter — park
-  // in bounded untimed slices and re-check the word and deadline ourselves
-  // (review P5/R17: the with-timeout call does not exist in the SDK).
+  // macOS (U1, unverified locally): timed os_sync parks (14.4+) in slices of
+  // at most 250 ms, re-checking the word and deadline each pass; older
+  // systems poll with back-off. (Round-3 C7: the untimed park never timed out
+  // without a wake, so lock timeouts and dead-owner detection hung.)
   const bool infinite = timeoutMs != timeoutMs;
   const double deadline = infinite ? 0 : NowMs() + timeoutMs;
-  const bool useOsSync = os_sync_wait_on_address != nullptr;
   double delayUs = 50;
+  bool parked = false;
   for (;;) {
-    if (*addr != static_cast<int32_t>(expected)) return WaitResult::kNotEqual;
-    if (!infinite && NowMs() >= deadline) return WaitResult::kTimedOut;
-    if (useOsSync) {
-      os_sync_wait_on_address(addr, expected, sizeof(int32_t),
-                              OS_SYNC_WAIT_ON_ADDRESS_SHARED);
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    if (*addr != static_cast<int32_t>(expected)) {
+      return parked ? WaitResult::kOk : WaitResult::kNotEqual;
+    }
+    double sliceMs = 250;
+    if (!infinite) {
+      const double rem = deadline - NowMs();
+      if (rem <= 0) return WaitResult::kTimedOut;
+      if (rem < sliceMs) sliceMs = rem;
+    }
+    if (OsSyncPark(addr, expected, sliceMs)) {
+      parked = true;
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
+      parked = true;
     }
   }
 #elif defined(_WIN32)
@@ -600,13 +630,10 @@ int SyncWake(int32_t* addr, int count) {
   return static_cast<int>(
       syscall(SYS_futex, addr, FUTEX_WAKE, static_cast<uint32_t>(count), nullptr, nullptr, 0));
 #elif defined(__APPLE__)
-  if (os_sync_wake_by_address_all != nullptr) {
-    // macOS exports _all (no _shared): it may wake waiters on ANY value
-    // change — spurious wakes are within §6's model, and every waiter
-    // re-checks the word.
-    return os_sync_wake_by_address_all(addr, sizeof(int32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED);
-  }
-  return 0;  // poll fallback: waiters re-check on their back-off schedule
+  // os_sync has wake-one and wake-all; `count` > 1 maps to all — extra wakes
+  // are within §6's spurious-wake model (every waiter re-checks the word).
+  (void)count;
+  return OsSyncWakeAll(addr);
 #elif defined(_WIN32)
   // Review F28: a single huge ReleaseSemaphore saturates the semaphore at its
   // maximum, making every later wait return immediately (hot spin). Release

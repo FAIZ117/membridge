@@ -113,7 +113,7 @@ inline uint64_t HeaderDataBytesOf(Header* h) {
 }
 
 bool IsReady(Header* h) {
-  return AtomicInitState(h)->load(std::memory_order_acquire) == kInitReady;
+  return InitStateOf(AtomicInitState(h)->load(std::memory_order_acquire)) == kInitReady;
 }
 
 inline double SteadyMs() {
@@ -146,10 +146,8 @@ void EnsureSized(v8::Isolate* isolate, SegmentHandle& handle, const std::string&
   }
 #if defined(__linux__)
   if (reserve) {
-    const int rc = ::posix_fallocate(handle.fd, 0, static_cast<off_t>(target));
-    if (rc != 0) {
-      ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
-    }
+    const int rc = ReserveBacking(handle.fd, target);
+    if (rc != 0) ThrowReserveError(isolate, rc, name);
   }
 #endif
   RemapSegment(handle, target);
@@ -162,13 +160,27 @@ struct ErrRestorer {
   // restore depends on where the baton was taken from: a takeover winner
   // restores UNINIT (the header may be half-written — another joiner must be
   // able to take over), a grower restores READY (the old header is intact).
-  std::atomic<int32_t>* word = nullptr;
+  // The word is resolved from the HANDLE at unwind (round-3: EnsureSized may
+  // re-map, so a pointer captured up front could go stale).
+  SegmentHandle* handle = nullptr;
   int32_t restoreValue = kInitReady;
   ~ErrRestorer() {
-    if (word != nullptr) {
-      word->store(restoreValue, std::memory_order_release);
-      SyncWake(reinterpret_cast<int32_t*>(word), 2147483647);
+    if (handle != nullptr) {
+      Header* h = AsHeader(handle->base);
+      AtomicInitState(h)->store(restoreValue, std::memory_order_release);
+      SyncWake(&h->initState, 2147483647);
     }
+  }
+};
+
+// Releases a freshly claimed attach row when an initializer throws (round-3
+// C17: a failed takeover used to leak its row for the process's lifetime,
+// blocking unlinkWhenUnused and reap). Resolves the header from the handle.
+struct InitRowGuard {
+  SegmentHandle* handle = nullptr;
+  int slot = -1;
+  ~InitRowGuard() {
+    if (handle != nullptr && slot >= 0) ReleaseAttachRow(AsHeader(handle->base), slot);
   }
 };
 
@@ -196,6 +208,26 @@ uint64_t EnsureMappingCovers(v8::Isolate* isolate, SegmentHandle& handle, const 
   return dataBytes;
 }
 
+namespace {
+
+// Data size the real object backs beyond the header page (POSIX: st_size;
+// Windows: the mapped view).
+uint64_t FileDataBytes(v8::Isolate* isolate, SegmentHandle& handle, const std::string& name,
+                       uint32_t headerBytes) {
+#if defined(_WIN32)
+  (void)isolate; (void)name;
+  return handle.mappingBytes > headerBytes ? handle.mappingBytes - headerBytes : 0;
+#else
+  struct stat st{};
+  if (::fstat(handle.fd, &st) != 0) ThrowSystemError(isolate, "fstat", errno, name);
+  return static_cast<uint64_t>(st.st_size) > headerBytes
+             ? static_cast<uint64_t>(st.st_size) - headerBytes
+             : 0;
+#endif
+}
+
+}  // namespace
+
 void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& name,
                 const OpenOpts& opts, uint32_t headerBytes, uint64_t dataBytes,
                 uint32_t kindFlags, int* outSlot, bool* outOwned, uint64_t* outDataBytes,
@@ -216,24 +248,31 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
     bool owned = false;
     const int slot = EnsureAttachedRow(h, self, &owned,
                                        RowCountBounded(headerBytes, handle.mappingBytes));
-    h->initializerSlot = slot;
-    int32_t expected0 = kInitUninit;
-    if (!AtomicInitState(h)->compare_exchange_strong(expected0, InitStatePacked(slot),
-                                                     std::memory_order_acq_rel)) {
-      // A joiner's grace takeover won the word (creator was >250 ms pre-row).
-      // The joiner owns initialization now; fall through to the joiner loop
-      // and behave like any other joiner against our own object.
-    } else {
+    int32_t observed = AtomicInitState(h)->load(std::memory_order_acquire);
+    int32_t baton = 0;
+    bool won = false;
+    if (slot >= 0 && InitStateOf(observed) == kInitUninit) {
+      h->initializerSlot = slot;
+      baton = InitStatePacked(slot, observed);
+      won = AtomicInitState(h)->compare_exchange_strong(observed, baton,
+                                                        std::memory_order_acq_rel);
+    }
+    if (won) {
       WriteHeader(h, headerBytes, dataBytes, kindFlags);
-      if (slot < 0) h->flags |= kFlagAttachOverflow;
       h->initializerSlot = slot;
       *outSlot = slot;
       *outOwned = owned;
       *outDataBytes = dataBytes;
-      AtomicInitState(h)->store(kInitReady, std::memory_order_release);
+      AtomicInitState(h)->store(InitWord(kInitReady, 0, InitEpochOf(baton)),
+                                std::memory_order_release);
       SyncWake(&h->initState, 2147483647);
       return;
     }
+    // A joiner's grace takeover won the word (creator was >250 ms pre-row).
+    // The joiner owns initialization now; behave like any other joiner
+    // against our own object. A row we claimed fresh is surplus — release it
+    // so the joiner path claims (and a Mapping owns) exactly one (C17).
+    if (owned) ReleaseAttachRow(h, slot);
   }
 
   if (opts.raw) {
@@ -241,13 +280,25 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
     return;
   }
 
-  const double deadline = SteadyMs() + opts.initTimeoutMs;
-  const double startMs = SteadyMs();
+  // One budget for the whole open: OpenSegment's grace wait counts (C23).
+  const double startMs = handle.waitStartMs > 0 ? handle.waitStartMs : SteadyMs();
+  const double deadline = startMs + opts.initTimeoutMs;
+  auto throwInitTimeout = [&]() {
+    ThrowError(isolate, "E_INIT_TIMEOUT",
+               "segment did not reach a ready state within " +
+                   std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
+               name);
+  };
+  auto parkOn = [&](int32_t word, double maxMs) {
+    const double remaining = deadline - SteadyMs();
+    if (remaining <= 0) throwInitTimeout();
+    SyncWait(&h->initState, static_cast<uint32_t>(word), remaining > maxMs ? maxMs : remaining);
+  };
 
   for (;;) {
-    int32_t state = AtomicInitState(h)->load(std::memory_order_acquire);
+    const int32_t state = AtomicInitState(h)->load(std::memory_order_acquire);
 
-    if (state == kInitReady) {
+    if (InitStateOf(state) == kInitReady) {
       // ---- read the geometry ONCE into locals; never re-read it ----
       const uint32_t hb = h->headerBytes;
       const uint32_t magic = h->magic;
@@ -280,11 +331,7 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       // mapping covers header + data (a joiner that arrived mid-create and
       // mapped only the header page widens here — review R1/R2).
 #if !defined(_WIN32)
-      struct stat st{};
-      if (::fstat(handle.fd, &st) != 0) {
-        ThrowSystemError(isolate, "fstat", errno, name);
-      }
-      if (static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(headerBytes) + hdrData) {
+      if (FileDataBytes(isolate, handle, name, headerBytes) < hdrData) {
         ThrowError(isolate, "E_INCOMPATIBLE",
                    "segment header describes more data than the segment holds", name);
       }
@@ -301,19 +348,17 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       return;
     }
 
-    if (state == kInitUninit) {
+    // Every non-ready pass honours the deadline (round-3 C11: the lost-CAS and
+    // handback paths used to `continue` unchecked, so a writer that kept
+    // forging a dead baton spun a sized opener past initTimeoutMs).
+    if (SteadyMs() >= deadline) throwInitTimeout();
+
+    if (InitStateOf(state) == kInitUninit) {
       if (!mayInitialize) {
         // Size-less joins never initialize (review R6): a 0-byte crashed
         // creator's object must not become a ready 0-byte segment. A sized
         // opener elsewhere can still initialize it; wait, then time out.
-        if (SteadyMs() >= deadline) {
-          ThrowError(isolate, "E_INIT_TIMEOUT",
-                     "segment did not reach a ready state within " +
-                         std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
-                     name);
-        }
-        const double remaining = deadline - SteadyMs();
-        SyncWait(&h->initState, kInitUninit, remaining > 250.0 ? 250.0 : remaining);
+        parkOn(state, 250.0);
         continue;
       }
       // Either a live creator between shm_open and its INITIALIZING store
@@ -321,55 +366,93 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       // a brief grace unless OpenSegment already grace-waited for the header
       // page, then win the 0 -> 1 CAS — exactly one initializer proceeds.
       if (!handle.waitedForCreator && SteadyMs() - startMs < 50.0) {
-        SyncWait(&h->initState, kInitUninit, 10.0);
+        parkOn(state, 10.0);
         continue;
       }
       // Claim our attach row BEFORE winning the baton (review R7): the CAS
       // below publishes the row index INSIDE the state word, so no joiner can
       // ever observe "initializing" without knowing exactly which row holds
-      // the initializer — the stale-field takeover race is closed by
-      // construction. Losing the CAS only costs a fresh row, released below.
+      // the initializer. Without a row (attach table full) we cannot name
+      // ourselves, so we never take the baton — wait for another opener
+      // (round-3 C16: a row-less bare baton was judged dead mid-initialization).
       bool owned = false;
       const int slot = EnsureAttachedRow(h, self, &owned,
                                          RowCountBounded(headerBytes, handle.mappingBytes));
-      const int32_t packed = slot >= 0 ? InitStatePacked(slot) : kInitInitializing;
-      int32_t expected0 = kInitUninit;
-      if (AtomicInitState(h)->compare_exchange_strong(expected0, packed,
-                                                      std::memory_order_acq_rel)) {
-        ErrRestorer restorer;
-        restorer.word = AtomicInitState(h);
-        restorer.restoreValue = kInitUninit;  // a failed takeover must hand the baton back
-        // Publish ourselves BEFORE any slow work (review R7): other joiners
-        // at state 1 must see a live initializer and wait.
-        h->headerBytes = headerBytes;
-        std::atomic_thread_fence(std::memory_order_release);
-        h->initializerSlot = slot;
-        EnsureSized(isolate, handle, name, headerBytes, dataBytes, false);
-        h = AsHeader(handle.base);  // EnsureSized may have re-mapped
-        WriteHeader(h, headerBytes, dataBytes, kindFlags);
-        if (slot < 0) h->flags |= kFlagAttachOverflow;
-        h->initializerSlot = slot;
-        *outSlot = slot;
-        *outOwned = owned;
-        *outDataBytes = dataBytes;
-        restorer.word = nullptr;  // committed: the store below publishes
-        AtomicInitState(h)->store(kInitReady, std::memory_order_release);
-        SyncWake(&h->initState, 2147483647);
-        return;
+      if (slot < 0) {
+        parkOn(state, 250.0);
+        continue;
       }
-      // Lost the CAS: someone else holds the baton. A row we claimed fresh is
-      // surplus now; a reused process row must stay (refcount is per process).
-      if (owned) ReleaseAttachRow(h, slot);
-      continue;  // someone else is initializing
+      const int32_t baton = InitStatePacked(slot, state);
+      int32_t expected = state;
+      if (!AtomicInitState(h)->compare_exchange_strong(expected, baton,
+                                                       std::memory_order_acq_rel)) {
+        // Lost the CAS: someone else holds the baton. A row we claimed fresh
+        // is surplus; a reused process row must stay (refcount is per process).
+        if (owned) ReleaseAttachRow(h, slot);
+        continue;
+      }
+      ErrRestorer restorer;
+      restorer.handle = &handle;
+      // A failed takeover hands the baton back (epoch preserved).
+      restorer.restoreValue = InitWord(kInitUninit, 0, InitEpochOf(baton));
+      InitRowGuard rowGuard;
+      rowGuard.handle = &handle;
+      rowGuard.slot = owned ? slot : -1;
+
+      // Read whatever header survives ONCE, before rewriting anything (C12):
+      // a crashed GROW (or a creator that died mid-WriteHeader) leaves a valid
+      // header whose kind and geometry are not ours to discard.
+      const uint32_t priorMagic = h->magic;
+      const uint32_t priorVersion = h->layoutVersion;
+      const uint32_t priorHb = h->headerBytes;
+      const uint32_t priorFlags = h->flags;
+      const uint64_t priorData = HeaderDataBytesOf(h);
+      uint32_t kind = kindFlags;
+      uint64_t finalData = dataBytes;
+      if (priorMagic == kMagic && priorVersion == kLayoutVersion && priorHb == headerBytes) {
+        const uint32_t priorKind = priorFlags & kKindMask;
+        if (kindFlags != kKindPlain && priorKind != kKindPlain && priorKind != kindFlags) {
+          ThrowError(isolate, "E_INCOMPATIBLE",
+                     "segment kind mismatch (opened as " +
+                         std::to_string((kindFlags & kKindMask) >> 8) + ")",
+                     name);
+        }
+        if (kindFlags == kKindPlain) kind = priorKind;
+        // The prior size is a HINT bounded by the real object and our cap.
+        uint64_t bounded = priorData;
+        const uint64_t byFile = FileDataBytes(isolate, handle, name, headerBytes);
+        if (bounded > byFile) bounded = byFile;
+        if (bounded > opts.maxSegmentBytes) bounded = opts.maxSegmentBytes;
+        if (bounded > finalData) finalData = bounded;
+      }
+
+      // Publish ourselves BEFORE any slow work (review R7).
+      h->headerBytes = headerBytes;
+      std::atomic_thread_fence(std::memory_order_release);
+      h->initializerSlot = slot;
+      EnsureSized(isolate, handle, name, headerBytes, finalData, false);
+      h = AsHeader(handle.base);  // EnsureSized may have re-mapped
+      WriteHeader(h, headerBytes, finalData, kind);
+      h->initializerSlot = slot;
+      *outSlot = slot;
+      *outOwned = owned;
+      *outDataBytes = finalData;
+      restorer.handle = nullptr;  // committed: the store below publishes
+      rowGuard.handle = nullptr;  // the caller adopts the row
+      AtomicInitState(h)->store(InitWord(kInitReady, 0, InitEpochOf(baton)),
+                                std::memory_order_release);
+      SyncWake(&h->initState, 2147483647);
+      return;
     }
 
-    // state == INITIALIZING: the word names the initializer (review R7 —
-    // bits 8+ are its attach row). A bare 1 (hand-crafted crash state) falls
-    // back to the initializerSlot field.
-    const int initSlot =
-        state > kInitInitializing ? InitSlotOf(state) : h->initializerSlot;
-    const uint32_t hb1 = h->headerBytes;  // local read (review R23)
-    const uint32_t n = RowCountBounded(hb1, handle.mappingBytes);
+    // INITIALIZING: the word names the initializer (review R7). Legacy /
+    // hand-crafted words (no row bits, epoch 0) fall back to the field.
+    const int initSlot = (InitSlotOf(state) == 0 && InitEpochOf(state) == 0)
+                             ? h->initializerSlot
+                             : InitSlotOf(state);
+    // Rows bounded by OUR validated headerBytes and the mapping — never the
+    // shared field, which a takeover rewrites just after its CAS (C16).
+    const uint32_t n = RowCountBounded(headerBytes, handle.mappingBytes);
     bool initAlive = false;
     if (initSlot >= 0 && static_cast<uint32_t>(initSlot) < n &&
         AtomicSlotRefcount(&h->attachTable[initSlot])->load(std::memory_order_acquire) > 0) {
@@ -377,32 +460,22 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
     }
     if (initAlive || !mayInitialize) {
       // !mayInitialize: a takeover would rewrite geometry we cannot validate
-      // (size-less) — wait for a ready state instead (review R6).
-      if (SteadyMs() >= deadline) {
-        ThrowError(isolate, "E_INIT_TIMEOUT",
-                   "segment initializer did not finish within " +
-                       std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
-                   name);
-      }
-      const double remaining = deadline - SteadyMs();
-      // Wait on the CURRENT word value: it is the packed baton (state bits +
-      // row), so parking on it wakes exactly when the initializer commits,
-      // fails, or a takeover hands the baton back.
-      SyncWait(&h->initState, state, remaining > 250.0 ? 250.0 : remaining);
+      // (size-less) — wait for a ready state instead (review R6). Park on the
+      // CURRENT word: it wakes exactly when the initializer commits, fails,
+      // or a takeover hands the baton back.
+      parkOn(state, 250.0);
       continue;
     }
 
     // Dead or absent initializer (review F5/F26): hand the baton back through
-    // UNINIT so exactly one joiner wins the 0 -> packed CAS — no concurrent
-    // WriteHeader war, no shrink races between takeover sizes. The CAS target
-    // is the whole packed word: only a handback of THIS initializer's baton
-    // can win.
-    if (AtomicInitState(h)->compare_exchange_strong(state, kInitUninit,
-                                                    std::memory_order_acq_rel)) {
+    // UNINIT (epoch preserved) so exactly one joiner wins the next CAS. The
+    // CAS names the whole word — row AND epoch — so only a handback of THIS
+    // baton can win, even if the row was since reused by a newer takeover.
+    int32_t expected = state;
+    if (AtomicInitState(h)->compare_exchange_strong(
+            expected, InitWord(kInitUninit, 0, InitEpochOf(state)), std::memory_order_acq_rel)) {
       SyncWake(&h->initState, 2147483647);
     }
-    // CAS failure means the initializer finished (state moved to ready) or
-    // another takeover already reset it: loop and re-read.
   }
 }
 
@@ -413,6 +486,14 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
   (void)handle; (void)opts; (void)headerBytes; (void)newDataBytes; (void)maxSegmentBytes;
   ThrowError(isolate, "E_GROW_UNSUPPORTED",
              "grow is a POSIX-only policy: Windows sections are fixed at CreateFileMappingW time",
+             name);
+#elif defined(__APPLE__)
+  // §5.3 / AGENTS.md guardrail 6 (fact U2): a macOS shm object cannot be
+  // ftruncate'd a second time, so grow is refused up front with the
+  // documented code instead of failing inside EnsureSized as E_SYSTEM.
+  (void)handle; (void)opts; (void)headerBytes; (void)newDataBytes; (void)maxSegmentBytes;
+  ThrowError(isolate, "E_GROW_UNSUPPORTED",
+             "grow is unsupported on macOS: a POSIX shm object cannot be resized after creation",
              name);
 #else
   Header* h = AsHeader(handle.base);
@@ -425,28 +506,42 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
   bool owned = false;
   const int slot = EnsureAttachedRow(h, self, &owned,
                                      RowCountBounded(headerBytes, handle.mappingBytes));
-  const int32_t packed = slot >= 0 ? InitStatePacked(slot) : kInitInitializing;
-  int32_t state = AtomicInitState(h)->load(std::memory_order_acquire);
-  while (state == kInitReady &&
-         !AtomicInitState(h)->compare_exchange_weak(state, packed,
-                                                    std::memory_order_acq_rel)) {
+  if (slot < 0) {
+    // Without a row we cannot name ourselves in the baton (C16).
+    ThrowError(isolate, "E_INIT_TIMEOUT",
+               "attach table is full: cannot take the init baton to grow", name);
   }
-  if (state != kInitReady) {
+  int32_t state = AtomicInitState(h)->load(std::memory_order_acquire);
+  int32_t baton = 0;
+  bool won = false;
+  while (InitStateOf(state) == kInitReady) {
+    baton = InitStatePacked(slot, state);
+    if (AtomicInitState(h)->compare_exchange_weak(state, baton, std::memory_order_acq_rel)) {
+      won = true;
+      break;
+    }
+  }
+  if (!won) {
     if (owned) ReleaseAttachRow(h, slot);  // surplus row: we did not win the baton
     const double deadline = SteadyMs() + opts.initTimeoutMs;
     for (;;) {
       if (IsReady(h)) return 0;
-      if (SteadyMs() >= deadline) {
+      const double remaining = deadline - SteadyMs();
+      if (remaining <= 0) {
         ThrowError(isolate, "E_INIT_TIMEOUT", "segment busy (initializing/growing) for too long",
                    name);
       }
       const int32_t cur = AtomicInitState(h)->load(std::memory_order_acquire);
-      SyncWait(&h->initState, cur, 50.0);
+      SyncWait(&h->initState, static_cast<uint32_t>(cur), remaining > 50.0 ? 50.0 : remaining);
     }
   }
 
   ErrRestorer restorer;
-  restorer.word = AtomicInitState(h);  // grow failure restores the intact READY header
+  restorer.handle = &handle;  // grow failure restores the intact READY header
+  restorer.restoreValue = InitWord(kInitReady, 0, InitEpochOf(baton));
+  InitRowGuard rowGuard;
+  rowGuard.handle = &handle;
+  rowGuard.slot = owned ? slot : -1;
 
   // Record ourselves in the field too (byte contract / ops visibility); the
   // word above is the authoritative baton (review F26/R7).
@@ -455,14 +550,7 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
   // Never shrink below the REAL file (review F8/R10): the floor comes from
   // st_size — not the shared header — and is bounded by the caller's cap so a
   // racing writer cannot make us ftruncate to an attacker-chosen size.
-  struct stat st{};
-  if (::fstat(handle.fd, &st) != 0) {
-    ThrowSystemError(isolate, "fstat", errno, name);
-  }
-  const uint64_t byFile =
-      static_cast<uint64_t>(st.st_size) > headerBytes
-          ? static_cast<uint64_t>(st.st_size) - headerBytes
-          : 0;
+  const uint64_t byFile = FileDataBytes(isolate, handle, name, headerBytes);
   uint64_t finalBytes = newDataBytes > byFile ? newDataBytes : byFile;
   if (finalBytes > maxSegmentBytes) finalBytes = maxSegmentBytes;
   // EnsureSized ftruncates (only up) and re-maps so the mapping covers it.
@@ -470,8 +558,10 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
   h = AsHeader(handle.base);  // EnsureSized may have re-mapped
   const uint32_t kindBits = h->flags & kKindMask;
   WriteHeader(h, headerBytes, finalBytes, kindBits);
-  restorer.word = nullptr;  // committed
-  AtomicInitState(h)->store(kInitReady, std::memory_order_release);
+  restorer.handle = nullptr;  // committed
+  rowGuard.handle = nullptr;  // the caller adopts (or already owns) the row
+  AtomicInitState(h)->store(InitWord(kInitReady, 0, InitEpochOf(baton)),
+                            std::memory_order_release);
   SyncWake(&h->initState, 2147483647);  // review P10: wake joiners
   return finalBytes;
 #endif

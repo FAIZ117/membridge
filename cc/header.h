@@ -24,23 +24,42 @@ namespace membridge {
 // the data region stays page-aligned and 16 KiB pages (Apple Silicon) work.
 constexpr uint32_t kMinHeaderBytes = 4096;
 
-// initState values. While the segment is INITIALIZING the word also NAMES the
-// initializer: bits 8+ hold the initializer's attach-row index (review R7 —
-// the baton must be published atomically with the state so a joiner can never
-// see "initializing" without knowing exactly which row holds the initializer;
-// reading a stale `initializerSlot` field used to let two joiners take over
-// concurrently). Rows are bounded by the header page (≤ 2048), so the packed
-// value always stays a small positive i32. A bare 1 (no row bits) is only
-// produced by hand-crafted crash states; readers then fall back to the
-// `initializerSlot` field.
+// initState word (waitable i32). Layout:
+//   bits 0-7    state: 0 UNINIT, 1 INITIALIZING, 2 READY
+//   bits 8-19   initializer's attach row while INITIALIZING (review R7 — the
+//               baton is published atomically with the state, so a joiner can
+//               never see "initializing" without knowing which row holds it)
+//   bits 20-30  epoch: bumped (never to 0) on every transition INTO
+//               INITIALIZING and preserved by READY and by a handback to
+//               UNINIT (round-3 C16). A joiner's handback CAS names the whole
+//               word, so after the same row is reused by a newer takeover the
+//               stale CAS fails instead of handing back a LIVE baton (ABA).
+// Rows are bounded by the header page (<= 2047 at 64 KiB pages). Epoch 0 with
+// no row bits only appears in hand-crafted/legacy crash states; readers then
+// fall back to the `initializerSlot` field.
 constexpr int32_t kInitUninit = 0;
 constexpr int32_t kInitInitializing = 1;
 constexpr int32_t kInitReady = 2;
 constexpr int kInitSlotShift = 8;
-inline int32_t InitStatePacked(int slot) {
-  return kInitInitializing | (slot << kInitSlotShift);
+constexpr int kInitEpochShift = 20;
+constexpr uint32_t kInitSlotMask = 0xFFFu;
+constexpr uint32_t kInitEpochMask = 0x7FFu;
+inline int32_t InitStateOf(int32_t w) { return w & 0xFF; }
+inline int InitSlotOf(int32_t w) { return static_cast<int>((static_cast<uint32_t>(w) >> kInitSlotShift) & kInitSlotMask); }
+inline uint32_t InitEpochOf(int32_t w) { return (static_cast<uint32_t>(w) >> kInitEpochShift) & kInitEpochMask; }
+inline int32_t InitWord(int32_t state, int slot, uint32_t epoch) {
+  return static_cast<int32_t>(static_cast<uint32_t>(state) |
+                              ((static_cast<uint32_t>(slot) & kInitSlotMask) << kInitSlotShift) |
+                              ((epoch & kInitEpochMask) << kInitEpochShift));
 }
-inline int InitSlotOf(int32_t state) { return state >> kInitSlotShift; }
+inline uint32_t NextInitEpoch(int32_t observed) {
+  const uint32_t e = (InitEpochOf(observed) + 1) & kInitEpochMask;
+  return e == 0 ? 1 : e;
+}
+// The baton for `slot`, taken from the observed word.
+inline int32_t InitStatePacked(int slot, int32_t observed) {
+  return InitWord(kInitInitializing, slot, NextInitEpoch(observed));
+}
 
 struct AttachSlot {
   Identity identity;  // 24 B @0 — pid, threadId (0 here), startTime, pidNsInode

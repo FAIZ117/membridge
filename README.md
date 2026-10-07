@@ -106,13 +106,19 @@ mutex.tryLock();                    // false when held (does not steal)
 await mutex.lockAsync({ signal });  // AbortSignal-aware, non-blocking waits
 mutex.withLock(({ ownerDied }) => { ... });
 await mutex.withLockAsync(fn, { timeoutMs: 1000 });
+mutex.close();                      // unlocks if held; later calls throw E_CLOSED
 Mutex.unlink('/my-mutex');
 ```
 
 - Single 32-bit token word: lock, unlock, and stealing a dead holder's lock
   are each one CAS. **No heartbeat** — a holder stuck in synchronous code
   cannot be falsely stolen, and a SIGKILLed holder is recovered on the next
-  contender's liveness check (~250 ms worst case).
+  contender's liveness check (its first contended pass; at worst one 250 ms
+  wait slice later).
+- Each `Mutex` instance is an independent handle: closing or dropping one
+  never releases a lock held through another instance (instances on one
+  thread share the thread's participant slot, so `lock()` on a second
+  instance while the first holds is `E_DEADLOCK`).
 - Re-entrant locking throws `E_DEADLOCK`. Up to 64 live participant threads;
   slots of dead participants are reclaimed automatically.
 - No priority inheritance, no fairness guarantee — don't use it for
@@ -135,6 +141,7 @@ const msg = c.peek({ timeoutMs: 1000 }); // view into shared memory, or null
 consume(msg);
 c.release();                          // only now does the producer reclaim
 const copy = c.read();                // convenience: peek + copy + release
+c.close(); p.close();                 // release the roles; later calls throw E_CLOSED
 ```
 
 - Framing: `u32 length + payload`, 8-byte aligned; a message that would
@@ -143,8 +150,13 @@ const copy = c.read();                // convenience: peek + copy + release
 - Crash safety by construction: nothing is visible before `commit()`; a
   consumer that dies mid-`peek` leaves the message for the next consumer
   (at-least-once delivery).
-- SPSC enforced with role claims: a second `producer()` throws
-  `E_ROLE_TAKEN`; after a producer dies, the next one takes over.
+- SPSC enforced with role claims: another thread or process opening a role
+  that a live participant holds gets `E_ROLE_TAKEN`; after the holder dies (or
+  closes / is garbage-collected), the next one takes over. On the same thread,
+  `RingProducer.open` returns the producer already open for that ring, and a
+  second consumer is `E_ROLE_TAKEN` until the first is closed.
+- Timeouts: `0` means non-blocking; otherwise a finite number of ms up to
+  2^31 (`E_NAME_INVALID` for NaN, negative or larger values).
 
 ### `membridge` — ops
 
@@ -162,7 +174,7 @@ open(name, n, { unlinkWhenUnused: true }); // last detacher unlinks
 ## Errors
 
 Everything throws `MembridgeError` with a `code` (`E_SIZE_MISMATCH`,
-`E_ROLE_TAKEN`, `E_DEADLOCK`, `E_NO_SPACE`, `E_TOO_MANY_WAITERS`, …) and
+`E_ROLE_TAKEN`, `E_DEADLOCK`, `E_NO_SPACE`, `E_TOO_MANY_WAITERS`, `E_CLOSED`, …) and
 structured fields (`segmentName`, `requested`, `existing`, `syscall`,
 `errno`). The full list lives in [PLAN.md §10](./PLAN.md).
 

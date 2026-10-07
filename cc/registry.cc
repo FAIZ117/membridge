@@ -8,10 +8,13 @@
 
 #include "registry.h"
 
+#include <cerrno>
+
 #include "header.h"
 #include "liveness.h"
 #include "segment.h"
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,14 +52,25 @@ Mapping::~Mapping() {
 }
 
 void Mapping::Detach() {
+  // Declared BEFORE the lock: strong references collected while looking for
+  // an heir are released only after g_detach_mu is (round-3 C15).
+  std::vector<std::shared_ptr<Mapping>> keep;
   std::lock_guard<std::mutex> lock(g_detach_mu);
   if (raw || attachSlot < 0 || detached.exchange(true)) {
     return;
   }
-  // Review F20: a second Mapping over the same segment (e.g. after grow)
-  // shares the attach row — only the last one in THIS process may release
-  // it and decide unlinkWhenUnused. Compared by object identity, not base.
-  if (Registry::Get().OthersShareSegment(this)) {
+  // Review F20 / round-3 C15: other Mappings over the same segment (e.g.
+  // after a grow) share this process's single attach row. Hand the row —
+  // and the unlinkWhenUnused decision — to a survivor; only the LAST mapping
+  // of the segment in this process releases it. (The old code dropped the
+  // row without handing it on, so when the owner detached first the row
+  // leaked and unlinkWhenUnused never fired.)
+  if (Mapping* heir = Registry::Get().HeirFor(this, &keep).get()) {
+    if (heir->attachSlot < 0) {
+      heir->attachSlot = attachSlot;
+      heir->attachSlotCount = attachSlotCount;
+    }
+    heir->unlinkWhenUnused = heir->unlinkWhenUnused || unlinkWhenUnused;
     attachSlot = -1;
     return;
   }
@@ -102,6 +116,22 @@ bool NameRefersTo(const std::string& name, const Mapping& m) {
   return true;
 #else
   if (m.ino == 0) return true;  // identity never recorded: cannot judge
+#if defined(__linux__)
+  // Round-3 C22: glibc resolves shm names under /dev/shm, so ONE lstat gives
+  // the same answer as shm_open + fstat + close (three syscalls on every
+  // registry reuse). lstat, not stat: a symlink planted at the name reports
+  // its own inode and never matches (shm_open would refuse it — O_NOFOLLOW).
+  // Unexpected errors fall through to the portable path below.
+  {
+    const std::string path = "/dev/shm" + name;  // name starts with '/'
+    struct stat lst{};
+    if (::lstat(path.c_str(), &lst) == 0) {
+      return static_cast<int64_t>(lst.st_dev) == m.dev &&
+             static_cast<int64_t>(lst.st_ino) == m.ino;
+    }
+    if (errno == ENOENT) return false;  // name gone: nobody can join through it
+  }
+#endif
   const int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
   if (fd < 0) return false;  // name gone: nobody else can join through it
   struct stat st{};
@@ -140,6 +170,14 @@ std::shared_ptr<Mapping> Registry::Find(const std::string& name) {
 void Registry::Put(const std::string& name, const std::shared_ptr<Mapping>& m) {
   std::lock_guard<std::mutex> lock(mu_);
   map_[name] = m;
+  // Prune expired entries here too (post-verification nit 3): HeirFor alone
+  // pruned, so a long-lived process that kept opening segments without ever
+  // detaching one grew this list without bound. expired() takes no strong
+  // reference, so nothing can be destroyed under mu_.
+  all_.erase(std::remove_if(all_.begin(), all_.end(),
+                            [](const std::weak_ptr<Mapping>& w) { return w.expired(); }),
+             all_.end());
+  all_.push_back(m);
 }
 
 void Registry::Erase(const std::string& name) {
@@ -147,30 +185,39 @@ void Registry::Erase(const std::string& name) {
   map_.erase(name);
 }
 
-bool Registry::OthersShareSegment(const Mapping* self) {
-  std::lock_guard<std::mutex> lock(mu_);
-  for (auto it = map_.begin(); it != map_.end(); ++it) {
-    if (auto m = it->second.lock()) {
-      if (m.get() == self) continue;
-      // Review F20: same segment = same object identity, not the same base
-      // address — two Mappings over one segment map it at different
-      // addresses, so a base compare missed them and each side believed it
-      // was the last holder (double row release, premature unlink).
+namespace {
+
+bool SameObject(const Mapping& a, const Mapping& b) {
 #if defined(_WIN32)
-      // Sections have no inode: a named section opened under one name is
-      // one kernel object, so the registry key (name) decides.
-      if (m->name == self->name) return true;
+  // Sections have no inode: a named section opened under one name is one
+  // kernel object, so the name decides.
+  return a.name == b.name;
 #else
-      if (self->ino != 0 && m->ino != 0) {
-        if (m->dev == self->dev && m->ino == self->ino) return true;
-      } else if (m->name == self->name) {
-        // Identity never recorded (fstat failed): fall back to the name.
-        return true;
-      }
+  if (a.ino != 0 && b.ino != 0) return a.dev == b.dev && a.ino == b.ino;
+  return a.name == b.name;  // identity never recorded (fstat failed)
 #endif
+}
+
+}  // namespace
+
+std::shared_ptr<Mapping> Registry::HeirFor(const Mapping* self,
+                                           std::vector<std::shared_ptr<Mapping>>* keep) {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::shared_ptr<Mapping> heir;
+  for (auto it = all_.begin(); it != all_.end();) {
+    std::shared_ptr<Mapping> m = it->lock();
+    if (m == nullptr) {
+      it = all_.erase(it);
+      continue;
     }
+    if (heir == nullptr && m.get() != self && !m->raw && !m->detached.load() &&
+        SameObject(*m, *self)) {
+      heir = m;
+    }
+    keep->push_back(std::move(m));  // never destroyed under our locks
+    ++it;
   }
-  return false;
+  return heir;
 }
 
 std::shared_ptr<Mapping> Registry::FindByAddress(const void* addr) {

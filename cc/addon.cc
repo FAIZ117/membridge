@@ -240,9 +240,9 @@ struct SegmentGuard {
 
 // ---- open ------------------------------------------------------------------
 
-uint64_t HeaderDataBytes(Header* h) {
-  return *reinterpret_cast<std::atomic<uint64_t>*>(&h->dataBytes);
-}
+// Undocumented test hook: the next grow-policy open throws right after its
+// grow re-mapped the handle (exercises the attach-row unwind path, C5).
+std::atomic<bool> g_debugFailAfterGrow{false};
 
 [[noreturn]] void ThrowSizeMismatch(v8::Isolate* isolate, const std::string& name,
                                     uint64_t requested, uint64_t existing) {
@@ -284,7 +284,9 @@ bool TryReuse(v8::Isolate* isolate, const std::shared_ptr<Mapping>& m, const Ope
   // Review R3/R5: the live header may describe a segment grown past what the
   // CACHED mapping covers — reuse is only valid when the mapping itself can
   // hold the window. Otherwise fall through to a full open, which re-maps.
-  if (want > m->mappingBytes - m->headerBytes) return false;
+  // Underflow-safe (round-3 C18: a Windows VirtualQuery failure can leave
+  // mappingBytes below headerBytes).
+  if (m->mappingBytes < m->headerBytes || want > m->mappingBytes - m->headerBytes) return false;
   *windowBytes = want;
   return true;
 }
@@ -368,8 +370,12 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
             static_cast<uint32_t>(static_cast<Header*>(live->base)->flags) & kKindMask;
         kindMismatch = liveKind != (kindFlags & kKindMask);
       }
-      if (live->raw != opts.raw || kindMismatch || !NameRefersTo(name, *live)) {
-        Registry::Get().Erase(name);
+      if (!NameRefersTo(name, *live)) {
+        Registry::Get().Erase(name);  // the name now refers to another object
+      } else if (live->raw != opts.raw || kindMismatch) {
+        // Fall through to a full open, which reports the mismatch — but keep
+        // the VALID entry (round-3 C15/T9: erasing it here made the next
+        // matching open build a duplicate Mapping of the same segment).
       } else {
         uint64_t windowBytes = 0;
         if (TryReuse(isolate, live, opts, haveSize, requested, &windowBytes)) {
@@ -403,14 +409,21 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
     // Review R23: a policy throw after InitOrJoin claimed a row used to leak
     // the row for the process's lifetime. This guard releases it on unwind;
     // disarmed once the Mapping adopts the row.
+    // Round-3 C5: the guard resolves the header from the HANDLE at unwind —
+    // GrowSegment / EnsureMappingCovers below may re-map it, and a pointer
+    // captured here would then release the row through unmapped memory. The
+    // guard is destroyed before `guard` (reverse declaration order), so the
+    // handle's current mapping is still live when it runs.
     struct RowGuard {
-      Header* hdr;
+      const SegmentHandle& h;
       int slot;
       bool armed = true;
       ~RowGuard() {
-        if (armed && hdr != nullptr && slot >= 0) ReleaseAttachRow(hdr, slot);
+        if (armed && h.base != nullptr && slot >= 0) {
+          ReleaseAttachRow(static_cast<Header*>(h.base), slot);
+        }
       }
-    } rowGuard{static_cast<Header*>(guard.h.base), ownsRow ? attachSlot : -1};
+    } rowGuard{guard.h, ownsRow ? attachSlot : -1};
 
     if (haveSize && opts.sizePolicy == SizePolicy::kGrow) {
       const double giveUpAt =
@@ -436,6 +449,11 @@ void Open(const v8::FunctionCallbackInfo<v8::Value>& args) {
       // waited) exits the loop without our own re-map — refresh the geometry
       // ONCE more and re-map to cover it.
       existing = EnsureMappingCovers(isolate, guard.h, name, headerBytes, opts.maxSegmentBytes);
+      if (g_debugFailAfterGrow.exchange(false)) {
+        // Test hook (round-3 C5): any throw after the grow re-mapped the
+        // handle must unwind the attach-row guard through the NEW mapping.
+        ThrowError(isolate, "E_SYSTEM", "injected failure after grow (test hook)", name);
+      }
     }
 
     if (haveSize && opts.sizePolicy == SizePolicy::kExact && existing != requested) {
@@ -556,6 +574,11 @@ void Close(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 void IsNative(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Boolean::New(args.GetIsolate(), true));
+}
+
+void DebugFailAfterGrow(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  g_debugFailAfterGrow.store(true);
+  args.GetReturnValue().Set(v8::Undefined(args.GetIsolate()));
 }
 
 void DebugRegistryHas(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -729,14 +752,28 @@ int32_t* DataAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg, size_t minBy
     ThrowError(isolate, "E_NAME_INVALID", "expected an Int32Array over the mutex data region");
   }
   v8::Local<v8::Int32Array> view = arg.As<v8::Int32Array>();
-  // Review R5: a view shorter than the layout the native side assumes lets
-  // slot/lock accesses run past the SAB (and possibly the mapping).
-  if (view->Buffer()->ByteLength() < minBytes) {
+  // Review R5 / round-3 C18: the VIEW (offset + length) must cover the layout
+  // the native side touches — a short or offset view would let slot/lock
+  // accesses run past the SAB (and possibly the mapping).
+  const size_t off = view->ByteOffset();
+  const size_t len = view->ByteLength();
+  if (off % 4 != 0 || len < minBytes || off + len > view->Buffer()->ByteLength()) {
     ThrowError(isolate, "E_SIZE_INVALID",
                "view is smaller than the layout requires (" + std::to_string(minBytes) +
                    " bytes)");
   }
-  return static_cast<int32_t*>(view->Buffer()->Data()) + view->ByteOffset() / 4;
+  return static_cast<int32_t*>(view->Buffer()->Data()) + off / 4;
+}
+
+// The SAB behind a validated view: its BackingStore is the native entry's pin
+// (round-3 C18 — the pin used to be a separate JS argument that could belong
+// to a different buffer than the view).
+v8::Local<v8::SharedArrayBuffer> SabOf(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
+  v8::Local<v8::Value> b = arg.As<v8::Int32Array>()->Buffer();
+  if (!b->IsSharedArrayBuffer()) {
+    ThrowError(isolate, "E_NAME_INVALID", "expected a view over a SharedArrayBuffer");
+  }
+  return b.As<v8::SharedArrayBuffer>();
 }
 
 // mutexClaimSlot(view) -> { slot, gen, token }
@@ -751,8 +788,10 @@ void MutexClaimSlotJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   v8::String::Utf8Value nameArg(isolate, args[0]);
   int32_t* data = DataAddrOf(isolate, args[1], kMutexDataBytes);
-  const uint32_t token = MutexClaimSlot(isolate, data, std::string(*nameArg, nameArg.length()));
-  // Register with the SAB's BackingStore pin (review R11/R12).
+  // One call claims the slot AND registers this instance's claim reference,
+  // pinned by the view's own SAB (review R11/R12, round-3 C1/C18).
+  const uint32_t token = MutexClaimSlot(isolate, data, std::string(*nameArg, nameArg.length()),
+                                        SabOf(isolate, args[1]));
   v8::Local<v8::Object> o = v8::Object::New(isolate);
   o->Set(ctx, Str(isolate, "slot"),
          v8::Number::New(isolate, (token & kMutexTokenMask) >> 16)).Check();
@@ -776,6 +815,23 @@ void MutexOwnerAliveJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   const uint32_t token = static_cast<uint32_t>(args[1]->NumberValue(ctx).ToChecked());
   args.GetReturnValue().Set(
       v8::Boolean::New(isolate, MutexOwnerAlive(data, token, kMutexHeaderWords, kMutexSlotCount)));
+}
+
+// sameMemory(a, b) -> bool: both views start at the same address — the JS
+// layer uses it to hand out one live RingProducer per thread and mapping
+// (round-3 C24) without exposing addresses.
+void SameMemoryJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  v8::Isolate* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
+  if (args.Length() < 2 || !args[0]->IsInt32Array() || !args[1]->IsInt32Array()) {
+    isolate->ThrowException(v8::Exception::TypeError(Str(isolate, "sameMemory(a, b)")));
+    return;
+  }
+  auto addr = [](v8::Local<v8::Value> v) {
+    v8::Local<v8::Int32Array> t = v.As<v8::Int32Array>();
+    return static_cast<char*>(t->Buffer()->Data()) + t->ByteOffset();
+  };
+  args.GetReturnValue().Set(v8::Boolean::New(isolate, addr(args[0]) == addr(args[1])));
 }
 
 // checkLiveness(pid, startTime, pidNsInode) -> 'alive'|'dead'|'unknown' (§9)
@@ -816,46 +872,36 @@ MEMBRIDGE_TRAMPOLINE(UnlinkJs, Unlink)
 MEMBRIDGE_TRAMPOLINE(CloseJs, Close)
 MEMBRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
 MEMBRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
+MEMBRIDGE_TRAMPOLINE(DebugFailAfterGrowJs, DebugFailAfterGrow)
 MEMBRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
 MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
 MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
 MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
 MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
-// mutexRegisterPin(name, view, slot, token, sab) — attach the SAB pin to an
-// already-claimed entry (called by the JS layer right after claim).
-void MutexRegisterPinJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  v8::Isolate* isolate = args.GetIsolate();
-  v8::HandleScope scope(isolate);
-  v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
-  if (args.Length() < 5 || !args[4]->IsSharedArrayBuffer()) {
-    isolate->ThrowException(v8::Exception::TypeError(
-        Str(isolate, "mutexRegisterPin(name, view, slot, token, sab)")));
-    return;
-  }
-  int32_t* data = DataAddrOf(isolate, args[1], kMutexDataBytes);
-  const int slot = args[2]->Int32Value(ctx).ToChecked();
-  const uint32_t token = static_cast<uint32_t>(args[3]->NumberValue(ctx).ToChecked());
-  MutexRegisterClaim(isolate, data, token, slot, args[4].As<v8::SharedArrayBuffer>());
-  args.GetReturnValue().Set(v8::Undefined(isolate));
-}
-
-// mutexUnregisterClaim(view, slot) — JS Mutex collected: drop entry + pin.
+// mutexUnregisterClaim(view, slot, wasHeld) — a JS Mutex instance was
+// collected or closed: drop its claim reference; release the lock only if
+// THAT instance held it (round-3 C1).
 void MutexUnregisterClaimJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
   v8::HandleScope scope(isolate);
   v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
-  if (args.Length() < 2) {
-    isolate->ThrowException(
-        v8::Exception::TypeError(Str(isolate, "mutexUnregisterClaim(view, slot)")));
+  if (args.Length() < 3 || !args[1]->IsInt32() || !args[2]->IsBoolean()) {
+    isolate->ThrowException(v8::Exception::TypeError(
+        Str(isolate, "mutexUnregisterClaim(view, slot, wasHeld)")));
     return;
   }
   int32_t* data = DataAddrOf(isolate, args[0], kMutexDataBytes);
-  MutexUnregisterClaim(isolate, data, args[1]->Int32Value(ctx).ToChecked());
+  const int slot = args[1]->Int32Value(ctx).ToChecked();
+  if (slot < 0 || slot >= static_cast<int>(kMutexSlotCount)) {
+    ThrowError(isolate, "E_NAME_INVALID", "slot out of range");
+  }
+  MutexUnregisterClaim(isolate, data, slot, args[2]->BooleanValue(isolate));
   args.GetReturnValue().Set(v8::Undefined(isolate));
 }
 
-// mutexUnregisterRole(view, slot) — collected RingConsumer (review R15b):
-// clear the role word + free the role slot so a replacement can open.
+// mutexUnregisterRole(view, slot) — a ring instance was collected or closed:
+// drop its role reference; the last one clears the role word and frees the
+// role slot so a replacement can open (review R15b).
 void MutexUnregisterRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
   v8::HandleScope scope(isolate);
@@ -865,13 +911,13 @@ void MutexUnregisterRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
         v8::Exception::TypeError(Str(isolate, "mutexUnregisterRole(view, slot)")));
     return;
   }
-  int32_t* data = DataAddrOf(isolate, args[0], 256);  // ring header words
-  MutexUnregisterRole(isolate, data, args[1]->Int32Value(ctx).ToChecked());
+  int32_t* data = DataAddrOf(isolate, args[0], kRingHeaderBytes);
+  const int slot = args[1]->Int32Value(ctx).ToChecked();
+  if (slot != 0 && slot != 1) ThrowError(isolate, "E_NAME_INVALID", "role slot out of range");
+  MutexUnregisterRole(isolate, data, slot);
   args.GetReturnValue().Set(v8::Undefined(isolate));
 }
 
-// mutexAttachPin(view, slot, sab) — re-register the pin on a live Mutex whose
-// SAB we now hold (used after claim when the JS layer has the instance).
 // ringClaimRole(name, view, isProducer) -> token
 void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::Isolate* isolate = args.GetIsolate();
@@ -883,11 +929,11 @@ void RingClaimRoleJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   v8::String::Utf8Value nameArg(isolate, args[0]);
   const bool isProducer = args[2]->BooleanValue(isolate);
-  int32_t* data = DataAddrOf(isolate, args[1], 256);  // ring header words
+  int32_t* data = DataAddrOf(isolate, args[1], kRingHeaderBytes);
   const uint32_t token = RingClaimRole(
       isolate, std::string(*nameArg, nameArg.length()), data,
       isProducer ? kRingProducerWord : kRingConsumerWord, isProducer ? 0 : 1,
-      isProducer);
+      isProducer, SabOf(isolate, args[1]));
   args.GetReturnValue().Set(v8::Number::New(isolate, token));
 }
 
@@ -937,10 +983,10 @@ void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
 MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
-MEMBRIDGE_TRAMPOLINE(MutexRegisterPinJs2, MutexRegisterPinJs)
 MEMBRIDGE_TRAMPOLINE(MutexUnregisterClaimJs2, MutexUnregisterClaimJs)
 MEMBRIDGE_TRAMPOLINE(MutexUnregisterRoleJs2, MutexUnregisterRoleJs)
 MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
+MEMBRIDGE_TRAMPOLINE(SameMemoryJs2, SameMemoryJs)
 MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
 MEMBRIDGE_TRAMPOLINE(CheckLivenessJsBridge2, CheckLivenessJsBridge)
 
@@ -957,16 +1003,17 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
       {"close", CloseJs},
       {"isNative", IsNativeJs},
       {"debugRegistryHas", DebugRegistryHasJs},
+      {"debugFailAfterGrow", DebugFailAfterGrowJs},
       {"selfIdentity", SelfIdentityJs2},
       {"syncWait", SyncWaitJs2},
       {"syncNotify", SyncNotifyJs2},
       {"syncWaitAsync", SyncWaitAsyncJs2},
       {"mutexClaimSlot", MutexClaimSlotJs2},
       {"mutexOwnerAlive", MutexOwnerAliveJs2},
-      {"mutexRegisterPin", MutexRegisterPinJs2},
       {"mutexUnregisterClaim", MutexUnregisterClaimJs2},
       {"mutexUnregisterRole", MutexUnregisterRoleJs2},
       {"ringClaimRole", RingClaimRoleJs2},
+      {"sameMemory", SameMemoryJs2},
       {"readHeader", ReadHeaderJs2},
       {"checkLiveness", CheckLivenessJsBridge2},
   };

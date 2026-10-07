@@ -432,10 +432,13 @@ test('R2: concurrent create/join produces no spurious E_INCOMPATIBLE', async () 
       const name = process.env.MX_NAME;
       for (let k = 0; k < 150; k++) { open(name, 65536, { mode: 'create' }); unlink(name); }
     `], { stdio: 'ignore', env: { ...process.env, MX_NAME: name } });
+    // Exit promises are taken at spawn time: attaching the creator's listener
+    // only after the joiners finished missed an already-fired 'exit' and hung
+    // the suite whenever the creator finished first (round-3 fix round).
+    const exits = [...kids, creator].map((k: any) => new Promise(r => k.on('exit', r)));
     let bad = '';
     for (const k of kids) k.stdout.on('data', (d: Buffer) => { bad += d.toString(); });
-    await Promise.all(kids.map((k: any) => new Promise(r => k.on('exit', r))));
-    await new Promise(r => creator.on('exit', r));
+    await Promise.all(exits);
     assert.ok(!bad.includes('SPURIOUS') && !bad.includes('OTHER'),
       `spurious failures under create/join race: ${bad.trim()}`);
   } finally {
@@ -538,9 +541,9 @@ test('R20: NaN/Infinity timeouts are rejected, not infinite hangs', async () => 
   const name = uniqueName();
   try {
     const m = Mutex.open(name);
-    assert.throws(() => m.lock({ timeoutMs: NaN }), (e: any) => e.code === 'E_SIZE_INVALID');
-    assert.throws(() => m.lock({ timeoutMs: Infinity }), (e: any) => e.code === 'E_SIZE_INVALID');
-    assert.throws(() => m.lock({ timeoutMs: -5 }), (e: any) => e.code === 'E_SIZE_INVALID');
+    assert.throws(() => m.lock({ timeoutMs: NaN }), (e: any) => e.code === 'E_NAME_INVALID');
+    assert.throws(() => m.lock({ timeoutMs: Infinity }), (e: any) => e.code === 'E_NAME_INVALID');
+    assert.throws(() => m.lock({ timeoutMs: -5 }), (e: any) => e.code === 'E_NAME_INVALID');
   } finally {
     unlinkQuietly(name);
   }

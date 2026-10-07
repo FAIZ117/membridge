@@ -99,12 +99,10 @@ export function stat(name: string): SegmentStat {
     // §7.1 liveness through the native check (review F34: the old JS path was
     // a bare kill(pid,0) — no zombie detection, no start-time match, and
     // Windows always said alive).
-    let alive: boolean | 'unknown';
-    if (process.platform === 'win32') {
-      alive = 'unknown'; // OpenProcess liveness lands with the Windows CI pass
-    } else {
-      alive = livenessOf(row.pid, row.startTime, row.pidNsInode);
-    }
+    // Every platform has a native §7.1 check (Windows: OpenProcess +
+    // GetExitCodeProcess + creation time) — round-3 F34: Windows used to be
+    // hard-coded 'unknown', so reap() could never collect there.
+    const alive = livenessOf(row.pid, row.startTime, row.pidNsInode);
     attachSlots.push({
       pid: row.pid,
       startTime: row.startTime,

@@ -126,7 +126,7 @@ isNative(): boolean
 | Field | Type | Purpose |
 |-------|------|---------|
 | magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
-| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. While INITIALIZING the word also carries the initializer's attach-row index in bits 8+ (`1 \| row<<8`) — the baton names its holder atomically, so a joiner can never read a stale row and hand the baton back while the real initializer is mid-publish (fix round 3, R7; a bare 1 from a hand-crafted crash state falls back to the `initializerSlot` field). Joiners wait on the CURRENT word value; every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, claims its attach row, wins a 0→`1\|row<<8` CAS (the initializer baton), publishes `headerBytes` + `initializerSlot`, writes the full header, then stores 2 and wakes the word; a throw between the CAS and the ready store restores 0 so another opener can take over. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8), claims its row, and wins the 0→`1\|row<<8` CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer is handed back through a packed→0 CAS so exactly ONE joiner wins the 0→`1\|row<<8` CAS — no concurrent-WriteHeader war. Takeover is idempotent and rewrites every field. |
+| initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. While INITIALIZING the word also carries the initializer's attach-row index in bits 8+ (`1 \| row<<8`) — the baton names its holder atomically, so a joiner can never read a stale row and hand the baton back while the real initializer is mid-publish (fix round 3, R7; a bare 1 from a hand-crafted crash state falls back to the `initializerSlot` field). Joiners wait on the CURRENT word value; every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, claims its attach row, wins a 0→`1\|row<<8` CAS (the initializer baton), publishes `headerBytes` + `initializerSlot`, writes the full header, then stores 2 and wakes the word; a throw between the CAS and the ready store restores 0 so another opener can take over. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8), claims its row, and wins the 0→`1\|row<<8` CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer is handed back through a packed→0 CAS so exactly ONE joiner wins the 0→`1\|row<<8` CAS — no concurrent-WriteHeader war. **Round 3 (2026-10-07):** the word also carries an **epoch** (bits 20–30, never 0) bumped on every transition into INITIALIZING and preserved by READY and by a handback to UNINIT — a joiner's handback CAS names the whole word, so after the same row is reused by a newer takeover a stale handback fails instead of handing back a LIVE baton (C16 ABA). An opener that cannot claim an attach row (table full) never takes the baton (a row-less baton cannot name its holder). Every non-ready pass of the join loop checks the `initTimeoutMs` deadline (C11). A takeover reads any surviving header **once** first: when magic/version/`headerBytes` are valid (a crashed grow, or a creator that died mid-write) it keeps the prior **kind** (a plain opener never re-kinds a mutex/ring segment; a different specific kind → `E_INCOMPATIBLE`) and keeps `dataBytes = max(requested, min(prior, file − header, cap))` — the old takeover rewrote both to the joiner's values (C12). A failed takeover releases the row it claimed, and a creator that loses the baton CAS releases its fresh row (C17). A size-less join of a never-initialized object no longer truncates it: it waits out its own `initTimeoutMs` — one budget shared by the grace wait and the init wait — then throws `E_INIT_TIMEOUT` (C23). Takeover is idempotent and rewrites every field it does not keep. |
 | headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
 | flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
 | attach table | N × 32 B | One slot per attached process: identity (§7.1) + local refcount. ~120 slots with a 4 KiB page. |
@@ -154,8 +154,8 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   - **The mapping is the single source of truth for geometry (fix round 2, review R1–R5).** Joins initially map `min(requested, st_size)` — never past EOF — and the header's geometry (magic, version, kind, `headerBytes`, `dataBytes`) is read **once into locals**, validated (including `dataBytes ≤ MEMBRIDGE_MAX_SEGMENT_BYTES` and `st_size ≥ header + dataBytes`), after which the handle is re-fstat'd and **re-mapped to cover `headerBytes + dataBytes`** before any window is issued. The caller never re-reads geometry from shared memory afterwards; the registry's reuse path refuses a cached mapping that cannot cover the window (falling back to a full open); a window that cannot cover `requested` throws `E_SIZE_MISMATCH` instead of being silently clamped; and native entry points that assume a layout (`mutexClaimSlot`, `ringClaimRole`) length-check the view first. This is what makes a hostile, stale, or mid-race header unable to size a `BackingStore` past mapped memory while ordinary prefix/smaller opens still succeed.
   - `exact` (default): mismatch → `E_SIZE_MISMATCH` naming both sizes.
   - `at-least`: requested ≤ existing → map the requested prefix; larger → `E_SIZE_MISMATCH`. **Why:** mapping a prefix can never SIGBUS, and lets a reader map only a known header.
-  - `grow`: requested > existing → under the header's init lock `ftruncate` to `max(requested, file size − header)` (never shrink below a concurrent grower), update `dataBytes`, and re-map so the mapping covers the new size. A grower that loses the init-lock race retries the policy against the refreshed header. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS, if U2 holds, → `E_GROW_UNSUPPORTED`. **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
-- **Reserve (Linux):** `posix_fallocate` on the data region at create; failure → `E_NO_SPACE`.
+  - `grow`: requested > existing → under the header's init lock `ftruncate` to `max(requested, file size − header)` (never shrink below a concurrent grower), update `dataBytes`, and re-map so the mapping covers the new size. A grower that loses the init-lock race retries the policy against the refreshed header. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS → `E_GROW_UNSUPPORTED` (U2: an shm object cannot be resized after creation; the code refuses up front rather than failing inside a second `ftruncate` — round 3). **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
+- **Reserve (Linux):** `posix_fallocate` on the data region at create; `ENOSPC`/`EFBIG` → `E_NO_SPACE`, `EINTR` is retried, any other errno → `E_SYSTEM` naming `posix_fallocate` (round 3 C21: every failure used to read as "out of space").
   **Why:** tmpfs charges lazily, so a full `/dev/shm` shows up as SIGBUS on first touch,
   possibly hours later. Reserving turns that into a create-time error (F7).
   **Cost:** memory is committed up front; set `reserve: false` for sparse use.
@@ -179,13 +179,19 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   registry entry; SABs over the old mapping stay valid, because they hold their own reference.
   **Why:** otherwise `grow` would silently hand back the stale, smaller mapping inside one process.
 - **Registry lookup validates object identity (fix round 2026-10-06):** reuse additionally
-  compares the cached Mapping's recorded `dev`/`ino` against a fresh `shm_open`+`fstat` of the
-  name; a mismatch (another process unlinked and recreated the name) drops the entry and takes
+  compares the cached Mapping's recorded `dev`/`ino` against the name's current identity (Linux:
+  one `lstat` of `/dev/shm/<name>`, the directory glibc resolves shm names in — a planted
+  symlink reports its own inode and never matches; elsewhere a fresh `shm_open`+`fstat`; round 3
+  C22 cut the three-syscall check to one); a mismatch (another process unlinked and recreated the name) drops the entry and takes
   the full-open path. **Why:** otherwise a long-lived process would keep handing out the old
   mapping while fresh processes use the new object — a silent split brain (review F16). The
   same identity check guards `unlinkWhenUnused` (only unlink when the name still refers to our
   object, F21), and a second Mapping over the same segment (post-grow) shares the attach row —
-  only the process's last Mapping releases it (F20). Windows sections carry no inode; reuse is
+  only the process's last Mapping releases it (F20). **Round 3 (C15):** a detaching Mapping
+  hands the row (and its `unlinkWhenUnused` decision) to a surviving Mapping of the same object,
+  searched across every Mapping ever registered — not just the per-name entry a grow replaces —
+  so the row is neither released early nor leaked; a kind/raw mismatch on reuse falls through to
+  a full open without evicting the valid entry. Windows sections carry no inode; reuse is
   name-keyed there and documented.
 - `~Mapping()` (unmap + release this process's attach slot) can run on **any thread**,
   because V8 may call BackingStore deleters off the main thread. Registry and header updates
@@ -300,8 +306,12 @@ succeed and match — state `Z`/`X` (zombie) counts as **dead** (a zombie answer
 as alive and would keep a holder unstealable forever; fix round 2026-10-06), a start-time
 mismatch counts as dead (pid recycled), and an unreadable stat (hidepid) counts as **unknown →
 never steal**. An identity whose start time was never recorded (`-1`) is never stealable either.
-Windows `OpenProcess`+`GetExitCodeProcess`. Self-identity (startTime, pid-ns inode) is cached
-per thread and refreshed when the pid changes; a claim with an unrecordable identity throws
+macOS applies the same rules through `proc_pidinfo` (round 3 F4/F7 parity: unreadable → unknown,
+`SZOMB` → dead, microsecond start time). Windows `OpenProcess`+`GetExitCodeProcess`+creation time;
+`stat()`/`reap()` use this native check on every platform (F34). Self-identity (startTime, pid-ns
+inode) is cached per thread and refreshed when the pid changes; a value that could not be read is
+retried on every call, never cached (round 3 C9 — the old cache marked the entry fresh even when the
+read failed); a claim with an unrecordable identity throws
 `E_SYSTEM` rather than stamping a slot that later misjudges its live owner.
 
 **Worker death inside a live process:** the addon registers an env-cleanup hook per
@@ -336,26 +346,39 @@ exhaust the 64-slot table under churn. A thread that finds no free slot scans fo
 one whose identity fails the §7.1 liveness check **and whose token is not the current
 `lockWord` value** — a dead *holder's* slot is freed by the steal path first (the
 contender steals the lock into its own already-claimed slot, after which the dead slot is unreferenced)
-— and claims it with a single CAS on `slot.gen`, bumping gen. **Why CAS on gen:**
-bumping gen instantly invalidates every outstanding token pointing there (the same
-mechanism that makes stealing safe); a live owner's slot always passes the liveness
+— and claims it by winning the slot's publish right (one CAS on the state word from Active,
+validated against the gen read before the liveness verdict — see "Slot states" below), then
+bumping gen. **Why bump gen:** it instantly invalidates every outstanding token pointing there
+(the same mechanism that makes stealing safe); a live owner's slot always passes the liveness
 check so it is never evicted; and a stale token can never win a CAS again.
 
-**Slot states (fix round 3, F23).** A slot has exactly two states: `Active`
-(published) and `Free` (state word 0). There is no RESERVED state — the claimer's
-**pid word doubles as the publish-claim marker**: a virgin slot reads pid 0, a slot
-mid-publish reads the reserver's pid with state still Free, and release zeroes the
-pid BEFORE the Free CAS, so the invariant is `Free ⇒ pid 0 (virgin) or pid =
-crashed reserver`. A mid-publish slot whose pid is provably dead (pid-only check:
-ESRCH or zombie — no startTime comparison, the start words may still belong to the
-previous owner) is recovered by CASing the pid to the claimer's. A recycled pid
-reads alive, leaving that one slot unusable until process exit — accepted (the
-same liveness-at-read-time risk the Active reclaim carries). A pid-CAS-won claim
-and a gen-CAS-won reclaim each hold an exclusive publish right; the publish's gen
-bump is attempted exactly once and a loser rescans, so two racers can never both
-publish (that would mint two tokens for one slot). Ring roles (§8) share this
-machine; a consumer additionally releases its role when the JS instance is
-collected or `close()`d (R15b) so a replacement can open without a thread exit.
+**Slot states (round 3, 2026-10-07 — supersedes the F23 pid-marker scheme; ADR 0007).** The
+slot's state word is `0` Free, `1` Active, or `(pid << 2) | 2` **Claiming** — the exclusive
+publish right, held by `pid`. A claimer wins the right with ONE CAS from the state it observed:
+Free; a Claiming word whose pid is provably dead (crashed mid-publish; pid-only check, since the
+start words may still be the previous owner's); or, for a reclaim, Active **with the gen it read
+before its liveness verdict** — after winning it re-checks that gen, so a claim that slipped in
+between makes it back off instead of overwriting a live identity (round 3 C3: the publish used to
+re-read gen fresh). Only the right's holder writes gen (bumped, never to a value that makes token
+0) and the identity, then release-stores Active. Readers never judge a Claiming slot (owner
+liveness reports "alive, retry"), and a dead verdict is only acted on if the slot's state and gen
+are unchanged afterwards. **Within one process every claim runs under a process-wide mutex:**
+threads share a pid, so no shared word can tell two of them apart (round 3 C2/C4: two workers
+published into one slot, and two threads could both become the ring consumer). A Free slot whose
+gen still matches the lock word's token is stealable (its holder freed the slot without releasing
+— that token can never be presented again). A thread re-using its own slot whose gen would mint
+token 0 (only corrupted memory can produce that) re-publishes it first. A role claim that finds a
+LIVE participant mid-claim (Claiming word, or a published slot whose role word is still 0) waits up
+to 100 ms for it to settle before answering `E_ROLE_TAKEN` — the other side may yet lose its role
+CAS. The registry's list of every Mapping (§5.4 hand-off) is pruned on each insert.
+
+**Claim references (round 3 C1).** A thread's slot is shared by every `Mutex` instance it opens on
+the segment, but each instance registers its OWN refcounted claim reference (pinned by the
+instance's SAB BackingStore). When an instance is collected or `close()`d, the lock is released
+only if **that instance** held it (as `OWNER_DIED` + wake when collected — nobody can unlock it
+anymore); a sibling instance's hold is never touched (the old code released the lock a sibling
+held, breaking mutual exclusion). The last reference frees the thread's slot. Ring roles use the
+same machine and per-instance references (§8.2).
 
 ### 7.3 Protocol
 
@@ -395,6 +418,8 @@ collected or `close()`d (R15b) so a replacement can open without a thread exit.
   all 64 participant slots are held by live threads on `claim()` (F37: slot exhaustion is
   the same bounded "try again later" condition, not a hang). An invalid `timeoutMs`
   (NaN, ≤ 0, > 2^31 ms) throws `E_NAME_INVALID` before any native call (review R20/R24).
+  `close()` unlocks first if the instance holds the lock (a normal unlock — no `ownerDied`), drops
+  the instance's claim reference, and makes every later call throw `E_CLOSED` (round 3 C10).
 
 **Alternative considered: OS robust mutexes** (Linux `PTHREAD_MUTEX_ROBUST`, Windows named
 mutex `WAIT_ABANDONED`). Rejected as the primary mechanism: macOS has no robust mutexes
@@ -427,7 +452,15 @@ The parked flags (fix round 2026-10-06, ADR 0006): the waiting side sets its
 flag, re-checks, parks, and clears it on exit; the notifying side wakes only
 when the peer's flag is set — an unparked message costs zero FUTEX_WAKEs. A
 crashed waiter leaves its flag set, costing one futile wake per notify, never
-correctness.
+correctness; a fresh role holder clears its own flag when it claims the role (round 3 C13). The
+notifier checks the flag with a plain **load**, never an exchange-to-0: a notifier's check is not
+tied to the counter value it published, so a late exchange from an earlier commit can consume the
+peer's NEW park announcement (its wake spent before the peer slept) and the next commit then wakes
+nobody — a full wait slice (round 3 C20, tried and reverted; reproduced by `test/round3.test.ts`).
+The accepted cost is about one wake per release while the peer is parked on a full ring. Every
+waiter — sync and async — snapshots the counter **before** its non-blocking attempt and re-checks
+against that snapshot after announcing (round 3 C6: the async paths compared two back-to-back
+reads and missed a release landing in between).
 
 - **Free-running 32-bit counters with power-of-two capacity**: `used = (head - tail) >>> 0`.
   **Why:** no "one empty slot" waste (Lamport), and the counters stay `i32`, so they are
@@ -464,7 +497,16 @@ c.read()                                  // convenience = peek + copy + release
   again before `release`/`commit` → `E_RING_STATE`.
 - **Blocking:** producer waits on `tail` when full; consumer waits on `head` when empty (§6).
 - **SPSC enforced:** `producer()`/`consumer()` claim the role with a CAS on the role word.
-  A live holder → `E_ROLE_TAKEN`; a dead holder (§7.1) is replaced.
+  A live holder → `E_ROLE_TAKEN`; a dead holder (§7.1) is replaced. **Round 3 (C10/C24):**
+  `RingProducer.open` on a thread that already has a live producer for the same mapping returns
+  **that instance** (two producer objects on one thread each kept their own pending reserve, so
+  interleaved async reserve/commit corrupted the ring); a second live consumer on the same thread
+  is `E_ROLE_TAKEN` (it could double-process a message). Both roles have `close()` (an
+  uncommitted reserve is dropped; an open peek is abandoned → redelivered) and are released when
+  the instance is collected; any call on a closed instance throws `E_CLOSED`. Ring
+  `timeoutMs` follows the §7.3 contract except that `0` means non-blocking; NaN, negative,
+  Infinity or > 2^31 → `E_NAME_INVALID` (C14: NaN used to wait forever). A consumer whose segment
+  size disagrees with the capacity word a producer recorded → `E_INCOMPATIBLE`.
 - **Crash safety by construction:** data becomes visible only through `commit()`'s store
   to `head`. A producer that dies mid-`reserve` leaves nothing visible; a consumer that dies
   mid-`peek` leaves the message unreleased, so the next consumer sees it again
@@ -503,7 +545,8 @@ different memory. Ref-counting in the attach table plus `reap()` covers both cas
 `E_NAME_INVALID` · `E_SIZE_INVALID` · `E_SIZE_MISMATCH` · `E_EXISTS` · `E_NOT_FOUND` ·
 `E_INCOMPATIBLE` · `E_INIT_TIMEOUT` · `E_NO_SPACE` · `E_GROW_UNSUPPORTED` · `E_NOT_OWNER` ·
 `E_DEADLOCK` · `E_TIMEOUT` · `E_ROLE_TAKEN` · `E_RING_STATE` · `E_MESSAGE_TOO_LARGE` ·
-`E_TOO_MANY_WAITERS` · `E_NATIVE_UNAVAILABLE` · `E_UNSUPPORTED` · `E_SYSTEM` (wraps errno/GetLastError with the syscall name).
+`E_TOO_MANY_WAITERS` · `E_NATIVE_UNAVAILABLE` · `E_UNSUPPORTED` · `E_CLOSED` (a call on a
+`Mutex`/`RingProducer`/`RingConsumer` instance after its `close()`; round 3) · `E_SYSTEM` (wraps errno/GetLastError with the syscall name).
 
 ## 11. Changes from rev 1 and why
 
@@ -527,6 +570,17 @@ different memory. Ref-counting in the attach table plus `reap()` covers both cas
 | Node 18/20/22/24, win/mac smoke | Node 22/24/26, all three OSes fully tested | 18 and 20 are EOL; 26 is current (U4); win/mac behave most differently |
 | Valgrind + ASAN | ASAN/UBSan only (LD_PRELOAD libasan into node) | Valgrind on V8's JIT is impractically slow and noisy |
 | `tsc` dual CJS + ESM builds | CJS build + thin ESM wrapper | Two module copies would mean two JS-side registries in one process |
+
+**Fix rounds after rev 2.** Review-driven corrections are recorded inline in the sections they
+change (marked "fix round 2026-10-06", "round 3", with review IDs), the reasoning in ADRs 0005–0007,
+and the evidence in `docs/review/`. Round 3 (2026-10-07,
+`docs/review/2026-10-07T1236-round3-reverification.md` → fixes in
+`docs/review/2026-10-07T1349-round3-fixes.md`): §5.2 init word epoch + takeover keeps prior
+kind/geometry + one init budget; §5.3 macOS grow refusal and precise reserve errors; §5.4 attach-row
+hand-off and single-`lstat` identity; §7.1 macOS liveness parity and identity retry; §7.2 Claiming
+state word + process-wide claim serialization + per-instance claim references; §7.3/§8.2 `close()`
+and `E_CLOSED`; §8.1 plain-load wake rule and snapshot-before-attempt; §8.2 one live producer per
+thread and mapping.
 
 ## 12. Layout & build
 

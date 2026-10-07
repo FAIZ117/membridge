@@ -41,8 +41,25 @@ the same set/re-check/clear pattern around their `waitAsync` waits, and a
 latency regression test asserts a parked `peekAsync` wakes in milliseconds
 when the producer commits.
 Also: a crashed waiter leaves its flag set — a busy successor that never parks
-then pays one futile wake per message until it parks once; role claims reset
-the peer's flags at takeover so the stale flag clears on handover.
+then pays one futile wake per message until it parks once.
+
+**Correction (round 3, 2026-10-07):** the sentence that used to end this
+paragraph — "role claims reset the peer's flags at takeover" — described code
+that never landed (re-verification C13). Round 3 implements it: a fresh role
+holder clears its OWN parked flag when it claims the role. The async re-check
+in that fix also compared the counter with itself (C6); waiters now snapshot
+the counter before their non-blocking attempt and re-check against the
+snapshot.
+
+**Plain load, not exchange (round 3 C20, tried and reverted).** Clearing the
+peer's flag with an exchange-to-0 when notifying looks like it caps a full ring
+at one wake per park, but it loses wakes: a notifier's flag check is not tied to
+the counter value it published, so a late exchange from an EARLIER commit can
+consume the peer's NEW park announcement — its wake spent before the peer
+slept — and the next commit then sees the flag clear and wakes nobody (a full
+250 ms slice; reproduced by `test/round3.test.ts`, 2–5 stalls per 8×20k
+messages). Notifiers therefore load the flag; the waiter alone clears it. The
+accepted cost is roughly one wake per release while the peer is parked.
 
 ## Consequences
 

@@ -31,6 +31,10 @@ struct SegmentHandle {
   // POSIX: OpenSegment grace-waited for a creator that never published even
   // the header page — InitOrJoin may take over state 0 without waiting again.
   bool waitedForCreator = false;
+  // Steady-clock ms at which OpenSegment started waiting for a creator (0 =
+  // it did not wait). InitOrJoin's initTimeoutMs deadline starts here, so the
+  // grace wait and the init wait share ONE budget (round-3 C23).
+  double waitStartMs = 0;
 #ifdef _WIN32
   void* section = nullptr;  // HANDLE of the file mapping
 #endif
@@ -46,6 +50,13 @@ void CloseSegment(SegmentHandle& h);
 // POSIX: munmap + re-mmap `h` at `newTotal` bytes (grow/takeover extended
 // the object past the joiner's original, size-of-truth mapping). No-op when
 // the mapping already covers newTotal. Windows sections are fixed-size.
+#if defined(__linux__)
+// posix_fallocate with EINTR retry (round-3 C21). Returns 0 or an errno.
+int ReserveBacking(int fd, uint64_t bytes);
+// ENOSPC/EFBIG -> E_NO_SPACE; anything else -> E_SYSTEM (posix_fallocate).
+[[noreturn]] void ThrowReserveError(v8::Isolate* isolate, int rc, const std::string& name);
+#endif
+
 void RemapSegment(SegmentHandle& h, uint64_t newTotal);
 
 // §9 stat: read the §5.2 header of `name` without mapping the data region

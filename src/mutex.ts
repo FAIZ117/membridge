@@ -40,11 +40,14 @@ const sliceOf = (deadline: number): number =>
 const sleepSliceMs = 250; // dead-owner detection cadence (§7.3)
 
 // R20: NaN/Infinity/negative timeouts used to slip through as an infinite
-// park with no liveness re-check.
+// park with no liveness re-check. Same contract as membridge/sync (PLAN §7.3):
+// finite, > 0 and <= 2^31 ms, else E_NAME_INVALID before any native call.
+const MAX_TIMEOUT_MS = 2 ** 31;
 function checkTimeoutMs(timeoutMs: number | undefined, who: string): void {
-  if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
-    throw new MembridgeError('E_SIZE_INVALID',
-      `${who}: timeoutMs must be a finite positive number (got ${timeoutMs})`);
+  if (timeoutMs !== undefined &&
+      (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS)) {
+    throw new MembridgeError('E_NAME_INVALID',
+      `${who}: timeoutMs must be a finite number in (0, ${MAX_TIMEOUT_MS}] (got ${timeoutMs})`);
   }
 }
 
@@ -77,11 +80,20 @@ function selfIdentityWords(): { pid: number; tid: number; start: number; ns: num
   return { pid: id.pid, tid: id.threadId, start: id.startTime, ns: id.pidNsInode };
 }
 
-// R12: when a Mutex instance is collected, drop its native entry (and the
-// BackingStore pin that keeps an unlinked segment's pages + fd alive).
-const claimRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number }>((v) => {
+// Per-instance hold state, shared with the finalizer's held value (it must
+// not reference the instance itself). Round-3 C1: the native claim is
+// refcounted per instance, and a collected instance releases the lock only if
+// IT held it — two instances on one thread share the token, not the hold.
+interface HoldState {
+  held: boolean;
+}
+
+// R12: when a Mutex instance is collected, drop its claim reference (and, at
+// the last one, the BackingStore pin that keeps an unlinked segment's pages +
+// fd alive and this thread's slot).
+const claimRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number; state: HoldState }>((v) => {
   try {
-    nativeOrThrow().mutexUnregisterClaim(v.data, v.slot);
+    nativeOrThrow().mutexUnregisterClaim(v.data, v.slot, v.state.held);
   } catch {
     // isolate tearing down: the env hook covers the remainder
   }
@@ -92,8 +104,8 @@ export class Mutex {
   private readonly view: Int32Array;
   private readonly b: ReturnType<typeof nativeOrThrow>;
   private claimed: Slot | null = null;
-  private held = false;
-  private registered = false;
+  private readonly hold: HoldState = { held: false };
+  private closed = false;
 
   private constructor(name: string, view: Int32Array) {
     this.name = name;
@@ -115,26 +127,38 @@ export class Mutex {
   }
 
   private claim(): Slot {
+    this.assertOpen();
     if (this.claimed !== null) return this.claimed;
+    // One native call claims the thread's slot and registers THIS instance's
+    // claim reference, pinned by the view's own SAB (R11/R12, round-3 C1).
     const r = this.b.mutexClaimSlot(this.name, this.view);
     this.claimed = { slot: r.slot, gen: r.gen, token: r.token };
-    if (!this.registered) {
-      // R11/R12: pin the SAB's own BackingStore with the native entry, and
-      // unregister when this instance is collected (or closed).
-      this.b.mutexRegisterPin(this.name, this.view, r.slot, r.token,
-        this.view.buffer as SharedArrayBuffer);
-      claimRegistry.register(this, { data: this.view, slot: r.slot }, this);
-      this.registered = true;
-    }
+    claimRegistry.register(this, { data: this.view, slot: r.slot, state: this.hold }, this);
     return this.claimed;
   }
 
-  /** Release this instance's native claim (pin + teardown entry). Idempotent. */
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new MembridgeError('E_CLOSED', 'mutex instance is closed', { segmentName: this.name });
+    }
+  }
+
+  /** Release this instance: unlocks first if it holds the lock (a normal
+   * unlock — no ownerDied), then drops its claim reference. Idempotent; any
+   * later call on the instance throws E_CLOSED (round-3 C10). */
   close(): void {
-    if (this.claimed !== null && this.registered) {
+    if (this.closed) return;
+    if (this.hold.held) {
+      try {
+        this.unlock();
+      } catch {
+        // stolen after owner death: nothing of ours left to release
+      }
+    }
+    this.closed = true;
+    if (this.claimed !== null) {
       claimRegistry.unregister(this);
-      this.b.mutexUnregisterClaim(this.view, this.claimed.slot);
-      this.registered = false;
+      this.b.mutexUnregisterClaim(this.view, this.claimed.slot, false);
     }
   }
 
@@ -167,7 +191,7 @@ export class Mutex {
         const acq = waited ? token | HAS_WAITERS : token;
         if (Atomics.compareExchange(this.view, LOCK_WORD, lw, acq) === lw) {
           Atomics.add(this.view, SEQ, 1);
-          this.held = true;
+          this.hold.held = true;
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
         }
         continue;
@@ -189,7 +213,7 @@ export class Mutex {
         );
         if (stolen === lw) {
           Atomics.add(this.view, SEQ, 1);
-          this.held = true;
+          this.hold.held = true;
           return { ownerDied: true };
         }
         continue; // lost the race: retry
@@ -229,7 +253,7 @@ export class Mutex {
     // preserve the bit: parked waiters must not lose their wake source
     if (Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS)) === lw) {
       Atomics.add(this.view, SEQ, 1);
-      this.held = true;
+      this.hold.held = true;
       return true;
     }
     return false;
@@ -251,7 +275,7 @@ export class Mutex {
         const acq = waited ? token | HAS_WAITERS : token;
         if (Atomics.compareExchange(this.view, LOCK_WORD, lw, acq) === lw) {
           Atomics.add(this.view, SEQ, 1);
-          this.held = true;
+          this.hold.held = true;
           return { ownerDied: Atomics.exchange(this.view, OWNER_DIED, 0) === 1 };
         }
         continue;
@@ -265,7 +289,7 @@ export class Mutex {
         const stolen = Atomics.compareExchange(this.view, LOCK_WORD, lw, token | (lw & HAS_WAITERS));
         if (stolen === lw) {
           Atomics.add(this.view, SEQ, 1);
-          this.held = true;
+          this.hold.held = true;
           return { ownerDied: true };
         }
         continue;
@@ -301,7 +325,8 @@ export class Mutex {
 
   /** Release. Throws E_NOT_OWNER when this instance does not hold the lock. */
   unlock(): void {
-    if (!this.held || this.claimed === null) {
+    this.assertOpen();
+    if (!this.hold.held || this.claimed === null) {
       throw new MembridgeError('E_NOT_OWNER', 'mutex is not locked by this instance', {
         segmentName: this.name,
       });
@@ -311,13 +336,13 @@ export class Mutex {
       const lw = this.lockWord();
       if ((lw & TOKEN_MASK) !== token) {
         // our unlock raced a steal: the stealer owns it now
-        this.held = false;
+        this.hold.held = false;
         throw new MembridgeError('E_NOT_OWNER', 'mutex was stolen after owner death', {
           segmentName: this.name,
         });
       }
       if (Atomics.compareExchange(this.view, LOCK_WORD, lw, 0) === lw) {
-        this.held = false;
+        this.hold.held = false;
         if (lw & HAS_WAITERS) {
           this.b.syncNotify(this.view, LOCK_WORD, 1);
         }

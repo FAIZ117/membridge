@@ -11,10 +11,10 @@ after the owner pushes.
 |---------|-------|-------|---------|
 | `open` / join / sizes / policies | ✓ | ✓ | ✓ |
 | `reserve` (fallocate, E_NO_SPACE) | ✓ | ✗ (no-op; fallocate has no shm meaning there)¹ | ✗ (no-op)¹ |
-| `grow` size policy | ✓ (ftruncate under the init lock) | ✗ → `E_GROW_UNSUPPORTED` if U2 holds (shm objects cannot be re-`ftruncate`d) | ✗ → `E_GROW_UNSUPPORTED` (sections are fixed at `CreateFileMappingW` time) |
+| `grow` size policy | ✓ (ftruncate under the init lock) | ✗ → `E_GROW_UNSUPPORTED` (U2: shm objects cannot be re-`ftruncate`d; refused up front since round 3) | ✗ → `E_GROW_UNSUPPORTED` (sections are fixed at `CreateFileMappingW` time) |
 | Header page + attach table | ✓ | ✓ | ✓ |
-| `sync.wait` / `notify` | ✓ verified: shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | implemented (R17): `os_sync_wait_on_address`/`os_sync_wake_by_address_all` when the SDK declares them (macOS ≥ 14.4), untimed parks in bounded slices with deadline re-check; else bounded poll (50 µs) — **CI-unverified (U1)** | implemented: named semaphores per word, chunked bounded releases — **CI-unverified (U3)** |
-| `sync.waitAsync` | ✓ verified: `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | implemented (R17): wait thread over untimed `os_sync_wait_on_address` slices / poll — **CI-unverified (U1)** | implemented: one thread per wait over semaphores — **CI-unverified (U3)** |
+| `sync.wait` / `notify` | ✓ verified: shared futex (F14: raw syscall, no `FUTEX_PRIVATE_FLAG`) | implemented (round 3 C7): `os_sync_wait_on_address_with_timeout` (`OS_CLOCK_MACH_ABSOLUTE_TIME`, slices ≤ 250 ms with word/deadline re-check) and `os_sync_wake_by_address_all` (`OS_SYNC_WAKE_BY_ADDRESS_SHARED`), runtime-guarded with `__builtin_available(macOS 14.4)`; older SDK/OS → bounded poll (50 µs → 2 ms) — **CI-unverified (U1)** | implemented: named semaphores per word, chunked bounded releases — **CI-unverified (U3)** |
+| `sync.waitAsync` | ✓ verified: `futex_waitv` multiplexer (kernel ≥ 5.16), else one thread per wait | implemented (round 3 C7): wait thread over timed `os_sync` slices / poll — **CI-unverified (U1)** | implemented: one thread per wait over semaphores — **CI-unverified (U3)** |
 | `Mutex` | ✓ | ✓ | ✓ |
 | `RingBuffer` | ✓ | ✓ | ✓ |
 | `capacity()` | ✓ (`statfs /dev/shm`) | ✗ `E_UNSUPPORTED` | ✗ `E_UNSUPPORTED` |
@@ -22,6 +22,15 @@ after the owner pushes.
 | `list()` | ✓ (magic-filtered readdir) | ✗ `E_UNSUPPORTED` (POSIX shm cannot be enumerated) | ✗ `E_UNSUPPORTED` |
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
 | Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
+
+**Correction (round 3, 2026-10-07):** the round-2 text below claimed "untimed
+parks in bounded slices" — an untimed `os_sync` park is not bounded, so on macOS
+lock timeouts, the 250 ms dead-owner slice and initializer-death checks never
+fired without a wake (C7). The SDK header was also included inside an anonymous
+namespace. Both fixed; still **CI-unverified**. macOS liveness now matches Linux
+(`proc_pidinfo` unreadable → unknown, `SZOMB` → dead), and Windows `stat()`/
+`reap()` use the native OpenProcess check instead of always reporting
+`'unknown'` (F34). Windows `stat()` bounds its row loop by the mapped view (C8).
 
 **Correction (2026-10-06 fix round 2):** the macOS sync paths no longer fake
 weak-import declarations of `os_sync` symbols that may not exist (R17) — they
@@ -62,6 +71,19 @@ and on timeout.
   not use it for latency-critical control loops.
 - `MEMBRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB) caps segment sizes; a ring's
   capacity counts against it (`E_SIZE_INVALID` above the cap, §8.1).
+- **`close()` releases a handle**: `Mutex`, `RingProducer` and `RingConsumer`
+  instances are also released when garbage-collected, but call `close()` for
+  deterministic hand-over — a second live consumer on one thread is
+  `E_ROLE_TAKEN` until the first is closed or collected. `RingProducer.open` on
+  a thread that already has a live producer for the same mapping returns that
+  instance. Calls on a closed instance throw `E_CLOSED`.
+- **Contended mutex profile** (ADR 0005): the always-OR wake protocol costs
+  ≈1 FUTEX_WAKE per contended unlock and ~14% throughput at zero think time,
+  in exchange for no slice-bound handoffs; newcomers can still barge (no
+  fairness, §7.3), so tail waits of tens of ms under saturation are expected.
+- **Full-ring wakes**: while a peer is parked on a full/empty ring, each
+  release/commit notifies until the peer runs (a plain-load flag check — an
+  exchange-based "one wake per park" loses wakes, ADR 0006).
 - **Async waits are budgeted per process**: 127 multiplexed + 64 thread
   fallbacks = 191 outstanding `waitAsync`/`lockAsync` waits, then
   `E_TOO_MANY_WAITERS` (all segments and isolates share the budget).

@@ -23,40 +23,49 @@ constexpr uint32_t kMutexSlotWords = 8;    // identity 6 words + gen + state
 constexpr uint32_t kMutexDataBytes =
     (kMutexHeaderWords + kMutexSlotCount * kMutexSlotWords) * 4;  // 2064
 
-// Slot states (review F23): there is no RESERVED state. A slot mid-publish
-// reads state Free with a NON-ZERO pid word — the pid doubles as the publish-
-// claim marker (a virgin slot reads pid 0), and it is recoverable exactly when
-// that pid is provably dead. Release zeroes the pid BEFORE the state CAS, so
-// the invariant is: state Free ⇒ pid 0 (virgin) or pid = crashed reserver.
+// Slot state word (round-3 fix C2/C3, PLAN §7.2):
+//   0                  Free
+//   1                  Active (identity + gen published)
+//   (pid << 2) | 2     Claiming — the EXCLUSIVE publish right, held by `pid`.
+// A claimer wins the right with ONE CAS from the state it observed (Free, a
+// Claiming word whose pid is provably dead, or — for a reclaim — Active with
+// the gen it read before its liveness verdict). Only the holder of the right
+// writes gen and identity; readers never trust a Claiming slot's identity.
+// Within one process all claims are serialized by a process-wide mutex, so
+// two threads (which share a pid) can never both hold the right.
 constexpr uint32_t kMutexStateFree = 0;
 constexpr uint32_t kMutexStateActive = 1;
+constexpr uint32_t kMutexStateClaimingTag = 2;  // low two bits of a Claiming word
 
 // token = (slotIndex << 16) | gen15; bit 31 = HAS_WAITERS
 constexpr uint32_t kMutexHasWaiters = 0x80000000u;
 constexpr uint32_t kMutexTokenMask = 0x7FFFFFFFu;
 constexpr uint32_t kMutexGenMask = 0x00007FFFu;
 
-// Claim (or re-claim) a participant slot for the calling OS thread. Reuses
-// this thread's live slot when one exists; otherwise takes a free slot or
-// reclaims one whose identity fails the §7.1 liveness check and whose token
-// is not the current lockWord value (gen bump invalidates stale tokens).
-// Returns the token, or 0 when no slot is available (all 64 live).
-uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& name);
+// Claim (or re-claim) a participant slot for the calling OS thread and
+// register ONE claim reference for the calling JS instance (round-3 C1): the
+// native entry is refcounted per (isolate, data, slot), and its pin is the
+// SAB's own BackingStore (taken from the view — never a separate argument).
+// Reuses this thread's live slot when one exists; otherwise takes a free slot
+// or reclaims one whose identity fails the §7.1 liveness check and whose
+// token is not the current lockWord value (gen bump invalidates stale tokens).
+// Throws E_TIMEOUT when no slot is available (all 64 live).
+uint32_t MutexClaimSlot(v8::Isolate* isolate, int32_t* data, const std::string& name,
+                        v8::Local<v8::SharedArrayBuffer> sab);
 
-// True when the token's owner slot exists, its gen matches, and its identity
-// is alive (unknown liveness counts as alive — never steal across pid
-// namespaces, §7.1). A gen mismatch (stale token) also reports alive: the
-// real holder's unlock path fixes the word.
+// True when the token's owner may still be alive (never steal). False only
+// when the slot was reclaimed or freed since the token was issued, or its
+// identity is provably dead. A slot mid-claim reports alive (retry later).
 bool MutexOwnerAlive(int32_t* data, uint32_t token, uint32_t slotsWordOffset,
                      uint32_t slotCount);
 
-// Claim-time registration (review P1/F2/F14): registers (data, token, pin)
-// with the isolate's env-cleanup hook — zero native calls per lock/unlock.
-// Teardown releases anything still held (as OWNER_DIED + wake) and frees
-// this thread's participant slots in every claimed segment.
-void MutexRegisterClaim(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
-                        v8::Local<v8::SharedArrayBuffer> sab);
-void MutexUnregisterClaim(v8::Isolate* isolate, int32_t* data, int slot);
+// Drop ONE claim reference (a JS Mutex instance was collected or closed).
+// `releaseHeld`: the dropped instance itself held the lock — release it as
+// OWNER_DIED + wake (nobody can unlock it anymore). Only that instance's own
+// hold is ever released (round-3 C1: a sibling instance on the same thread
+// shares the token but not the hold). At refcount 0 the entry, its pin and
+// this thread's slot are released.
+void MutexUnregisterClaim(v8::Isolate* isolate, int32_t* data, int slot, bool releaseHeld);
 
 // Free this thread's slot(s) in `data` (graceful close; slots of dead threads
 // are reclaimed on demand anyway).
@@ -67,20 +76,21 @@ void MutexReleaseThreadSlots(int32_t* data);
 // layout as the mutex) at kRingSlotsWordOffset; role word 0 = producer's
 // token, 1 = consumer's. Claiming takes the role's own slot (producer -> 0,
 // consumer -> 1): live holder -> E_ROLE_TAKEN; dead holder -> replaced with a
-// gen bump; fresh segment -> plain claim.
+// gen bump; fresh segment -> plain claim. Same slot machine and process-wide
+// serialization as the mutex. The role entry is refcounted per JS instance
+// like a mutex claim; the role is released (word cleared, slot freed) when
+// the last reference drops or the thread tears down.
 constexpr uint32_t kRingSlotsWordOffset = 36;  // byte 144 (two 32 B slots)
 constexpr uint32_t kRingProducerWord = 32;     // byte 128
 constexpr uint32_t kRingConsumerWord = 33;     // byte 132
+constexpr uint32_t kRingHeaderBytes = 256;
 
 uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* data,
-                       uint32_t roleWord, uint32_t slotIndex, bool isProducer);
+                       uint32_t roleWord, uint32_t slotIndex, bool isProducer,
+                       v8::Local<v8::SharedArrayBuffer> sab);
 
-void MutexTrackRole(v8::Isolate* isolate, int32_t* data, uint32_t token, int slot,
-                    uint32_t roleWordOffset);
-
-// Collected RingConsumer (FinalizationRegistry / close(), review R15b):
-// clear the role word if it still holds the instance's token and free the
-// role's slot, so a replacement consumer can open without a thread exit.
+// A ring instance was collected or close()d: drop one role reference; at 0
+// clear the role word (if it still holds our token) and free the role slot.
 void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot);
 
 }  // namespace membridge

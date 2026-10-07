@@ -33,7 +33,8 @@ async function run() {
   // 2) crash recovery latency: the holder is SIGKILLed while holding; the
   // parent's lock() recovers via the steal path. (lock() blocks the calling
   // thread, so the kill happens before it — the measured window is from the
-  // SIGKILL to the acquired lock, dominated by one 250 ms detection slice.)
+  // SIGKILL to the acquired lock; lock() probes the holder's liveness on its
+  // first contended pass, so a dead holder is stolen immediately — ~0 ms.)
   {
     const child = fork(__filename, ['hold', NAME], { stdio: 'ignore' });
     await new Promise((resolve) => {

@@ -59,3 +59,12 @@ two tokens for one slot. A recycled pid reads alive, leaving one slot unusable
 until process exit — the same accepted liveness-at-read-time risk the Active
 reclaim carries. Ring roles share the machine, and a collected consumer
 releases its role (R15b) so a replacement can open on the same thread.
+
+## Amendment (2026-10-07, round 3) — superseded by ADR 0007
+
+The pid-marker slot machine above lost mutual exclusion: threads of one process
+share a pid (C2), the publish re-read gen after the liveness verdict (C3), and a
+single native claim entry served every instance on a thread (C1). ADR 0007
+replaces it: the state word carries an exclusive Claiming right (`pid << 2 | 2`),
+claims are serialized per process, and each JS instance holds its own claim
+reference.

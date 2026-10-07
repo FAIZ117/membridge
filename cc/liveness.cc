@@ -106,11 +106,19 @@ Identity SelfIdentity() {
     cache.startValid = false;
     cache.start = -1;
     cache.ns = -1;
+  }
+  // Round-3 C9: retry whatever is still unknown on EVERY call — recording
+  // pid/tid above used to mark the entry fresh even when the reads failed,
+  // so the "not cached" retry never happened and a transient EMFILE pinned
+  // startTime=-1 on the thread for good.
+  if (!cache.startValid) {
     int64_t start = -1;
     if (ReadProcStat(pid, &start, nullptr)) {
       cache.start = start;
       cache.startValid = true;
     }
+  }
+  if (cache.ns <= 0) {
     const int64_t ns = ReadPidNsInode(0);
     if (ns > 0) cache.ns = ns;  // -1 (unreadable) stays uncached
   }
@@ -175,39 +183,60 @@ Liveness CheckPidAlive(int32_t pid) {
 
 #elif defined(__APPLE__)
 
+namespace {
+
+#ifndef SZOMB
+#define SZOMB 5  // <sys/proc.h>: process exited, not yet reaped
+#endif
+
+// One proc_pidinfo read: start time (µs — second granularity would let a pid
+// recycled within the same second look like the original) and zombie state.
+bool ReadBsdInfo(int32_t pid, int64_t* outStartUs, bool* outZombie) {
+  proc_bsdinfo info{};
+  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) return false;
+  *outStartUs = static_cast<int64_t>(info.pbi_start_tvsec) * 1000000 +
+                static_cast<int64_t>(info.pbi_start_tvusec);
+  *outZombie = info.pbi_status == SZOMB;
+  return true;
+}
+
+}  // namespace
+
 Identity SelfIdentity() {
   Identity id;
   id.pid = static_cast<int32_t>(getpid());
   id.threadId = static_cast<int32_t>(syscall(SYS_thread_selfid));
   int64_t start = -1;
-  proc_bsdinfo info{};
-  if (proc_pidinfo(id.pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info)) {
-    start = static_cast<int64_t>(info.pbi_start_tvsec);
-  }
-  (void)start;
+  bool zombie = false;
+  if (!ReadBsdInfo(id.pid, &start, &zombie)) start = -1;  // claims refuse -1 (§7.1)
   id.startTime = start;
   id.pidNsInode = -1;  // no pid namespaces on macOS
   return id;
 }
 
+// Same rules as Linux (round-3 F4/F7 parity): ESRCH = dead; an unreadable
+// process = unknown (never steal — the start-time guard cannot run); a
+// zombie = dead (it answers kill(pid,0) until reaped); start mismatch = dead.
 Liveness CheckLiveness(const Identity& id) {
   if (id.pid <= 0) return Liveness::kDead;
-  if (kill(static_cast<pid_t>(id.pid), 0) == 0 || errno != ESRCH) {
-    proc_bsdinfo info{};
-    if (proc_pidinfo(id.pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info) &&
-        static_cast<int64_t>(info.pbi_start_tvsec) != id.startTime) {
-      return Liveness::kDead;  // pid reused
-    }
-    return Liveness::kAlive;
-  }
-  return Liveness::kDead;
+  if (id.startTime < 0) return Liveness::kUnknown;
+  if (kill(static_cast<pid_t>(id.pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
+  int64_t start = -1;
+  bool zombie = false;
+  if (!ReadBsdInfo(id.pid, &start, &zombie)) return Liveness::kUnknown;
+  if (zombie) return Liveness::kDead;
+  if (start != id.startTime) return Liveness::kDead;  // pid reused
+  return Liveness::kAlive;
 }
 
 
 Liveness CheckPidAlive(int32_t pid) {
   if (pid <= 0) return Liveness::kUnknown;
   if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
-  return Liveness::kAlive;
+  int64_t start = -1;
+  bool zombie = false;
+  if (!ReadBsdInfo(pid, &start, &zombie)) return Liveness::kUnknown;
+  return zombie ? Liveness::kDead : Liveness::kAlive;
 }
 
 #elif defined(_WIN32)

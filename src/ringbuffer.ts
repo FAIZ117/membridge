@@ -46,23 +46,42 @@ const CONSUMER_SLOT = 1;  // role slot index (producer 0, consumer 1)
 const CONSUMER_PARKED = 1;   // consumer waits on HEAD
 const PRODUCER_PARKED = 17;  // producer waits on TAIL
 
+const PRODUCER_SLOT = 0;
+
 const sleepSliceMs = 250;
 const nowMs = (): number => performance.now();  // monotonic (review F35)
 const sliceOf = (deadline: number): number =>
   Math.max(1, Math.min(sleepSliceMs, deadline - nowMs()));
 
-// R15b: when a RingConsumer is collected (or closed), release its role so a
-// replacement consumer can open on this thread without waiting for thread
-// exit. Producer roles are deliberately NOT GC-released: a collected
-// producer's role must stay held, because a replacement producer joining
-// while a live sibling still writes would break SPSC.
-const consumerRoleRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number }>((v) => {
+// Same timeout contract as membridge/sync and Mutex (PLAN §7.3/§8.2), except
+// that 0 is valid here and means "non-blocking". NaN used to wait forever
+// (round-3 C14).
+const MAX_TIMEOUT_MS = 2 ** 31;
+function checkTimeoutMs(timeoutMs: number | undefined, who: string): void {
+  if (timeoutMs !== undefined &&
+      (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMEOUT_MS)) {
+    throw new MembridgeError('E_NAME_INVALID',
+      `${who}: timeoutMs must be a finite number in [0, ${MAX_TIMEOUT_MS}] (got ${timeoutMs})`);
+  }
+}
+
+// R15b + round-3 C10/C24: when a ring instance (producer or consumer) is
+// collected, drop its role reference so a replacement can open on this thread
+// without waiting for thread exit. Producers no longer need to stay pinned:
+// RingProducer.open hands out the thread's live instance for a mapping, so
+// there is never a live sibling whose writes a replacement could interleave.
+const roleRegistry = new FinalizationRegistry<{ data: Int32Array; slot: number }>((v) => {
   try {
     nativeOrThrow().mutexUnregisterRole(v.data, v.slot);
   } catch {
     // isolate tearing down: the env-cleanup hook covers the remainder
   }
 });
+
+// One live producer instance per (thread, name, mapping) — round-3 C24: two
+// producer objects on one thread each kept their own pending reserve, so
+// interleaved async reserve/commit corrupted the ring.
+const liveProducers = new Map<string, WeakRef<RingProducer>>();
 
 function align8(n: number): number {
   return (n + 7) & ~7;
@@ -114,7 +133,7 @@ export class RingProducer {
   private readonly capacity: number;
   private readonly maxMessage: number;
   private readonly b: ReturnType<typeof nativeOrThrow>;
-  private claimed = false;
+  private closed = false;
   private pending: Reserved | null = null;
 
   private constructor(name: string, view: Int32Array, capacity: number, maxMessage: number) {
@@ -168,14 +187,47 @@ export class RingProducer {
           segmentName: name, requested: mm, existing: hdrMax,
         });
     }
+    // This thread's live producer for the same mapping IS the producer.
+    const live = liveProducers.get(name)?.deref();
+    if (live !== undefined && !live.closed && b.sameMemory(live.view, view)) {
+      if (live.capacity !== cap || live.maxMessage !== mm) {
+        throw new MembridgeError('E_SIZE_MISMATCH',
+          'ring capacity/maxMessage differ from the producer already open on this thread', {
+            segmentName: name, requested: cap, existing: live.capacity,
+          });
+      }
+      return live;
+    }
     b.ringClaimRole(name, view, true);
+    // A fresh role holder is not parked: clear a flag a crashed predecessor
+    // left set, or every consumer release would pay a futile FUTEX_WAKE
+    // (round-3 C13 — R15a never landed before).
+    Atomics.store(view, PRODUCER_PARKED, 0);
     const p = new RingProducer(name, view, cap, mm);
-    p.claimed = true;
+    roleRegistry.register(p, { data: view, slot: PRODUCER_SLOT }, p);
+    liveProducers.set(name, new WeakRef(p));
     if (capacity !== undefined && Atomics.load(view, CAPACITY) === 0) {
       Atomics.store(view, CAPACITY, cap);
       Atomics.store(view, MAX_MESSAGE, mm);
     }
     return p;
+  }
+
+  /** Release the producer role (idempotent). An uncommitted reserve is
+   * dropped (nothing becomes visible). Any later call throws E_CLOSED. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.pending = null;
+    roleRegistry.unregister(this);
+    if (liveProducers.get(this.name)?.deref() === this) liveProducers.delete(this.name);
+    this.b.mutexUnregisterRole(this.view, PRODUCER_SLOT);
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new MembridgeError('E_CLOSED', 'ring producer is closed', { segmentName: this.name });
+    }
   }
 
   private head(): number {
@@ -188,6 +240,33 @@ export class RingProducer {
   /** Two-phase write: returns a Uint8Array view straight into shared memory.
    * Call {@link commit} to publish. Throws E_RING_STATE if already reserved. */
   reserve(n: number, opts?: ReserveOptions): Uint8Array {
+    const framed = this.checkReserve(n, opts?.timeoutMs, 'reserve');
+    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
+    let parked = false;
+    try {
+      for (;;) {
+        const tailSeen = this.tail();
+        const view = this.tryReserve(n, framed);
+        if (view !== null) return view;
+        if (opts?.timeoutMs === 0 || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
+          throw this.fullError('reserve');
+        }
+        // Park on TAIL: announce, re-check against the value the failed
+        // attempt saw, then wait on it (§8.2 + review P3).
+        Atomics.store(this.view, PRODUCER_PARKED, 1);
+        parked = true;
+        if (this.tail() !== tailSeen) continue;  // space appeared meanwhile
+        this.b.syncWait(this.view, TAIL, tailSeen, sliceOf(deadline));
+        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) throw this.fullError('reserve');
+      }
+    } finally {
+      if (parked) Atomics.store(this.view, PRODUCER_PARKED, 0);
+    }
+  }
+
+  private checkReserve(n: number, timeoutMs: number | undefined, who: string): number {
+    this.assertOpen();
+    checkTimeoutMs(timeoutMs, who);
     if (this.pending !== null) {
       throw new MembridgeError('E_RING_STATE', 'previous reserve not committed', {
         segmentName: this.name,
@@ -206,61 +285,47 @@ export class RingProducer {
           existing: this.maxMessage,
         });
     }
-    const framed = align8(4 + n);
-    const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
-    const nonBlocking = opts?.timeoutMs === 0;
-    let parked = false;
-    try {
-      for (;;) {
-        const head = this.head();
-        const tail = this.tail();
-        const used = (head - tail) >>> 0;
-        const pos = head & (this.capacity - 1);
-        if (pos + framed <= this.capacity) {
-          if (this.capacity - used >= framed) {
-            this.pending = {
-              headSnapshot: head,
-              pos,
-              framed,
-              payload: this.data.subarray(pos + 4, pos + 4 + n),
-            };
-            return this.pending.payload;
-          }
-        } else {
-          // SKIP: advance past the end once the consumer drained up to `pos`.
-          // The marker is visible to the consumer through the head advance.
-          if (used <= pos && pos - used >= framed) {
-            Atomics.store(this.view, DATA_WORD + pos / 4, -1); // u32 SKIP_MARKER
-            Atomics.store(this.view, HEAD, head + (this.capacity - pos));
-            this.wakeConsumer();
-            continue; // re-loop: now at offset 0
-          }
-        }
-        if (nonBlocking || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
-          throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
-            segmentName: this.name,
-          });
-        }
-        // Park on TAIL: announce, re-check, then wait (§8.2 + review P3).
-        Atomics.store(this.view, PRODUCER_PARKED, 1);
-        parked = true;
-        const tailNow = this.tail();
-        if (tailNow !== tail) continue;  // space appeared while announcing
-        this.b.syncWait(this.view, TAIL, tailNow, sliceOf(deadline));
-        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-          throw new MembridgeError('E_TIMEOUT', 'ring full: reserve timed out', {
-            segmentName: this.name,
-          });
-        }
+    return align8(4 + n);
+  }
+
+  private fullError(who: string): MembridgeError {
+    return new MembridgeError('E_TIMEOUT', `ring full: ${who} timed out`, { segmentName: this.name });
+  }
+
+  // One non-blocking attempt (round-3 C19: no exception on the full path —
+  // reserveAsync used to pay ~11 µs per failed attempt building an Error).
+  private tryReserve(n: number, framed: number): Uint8Array | null {
+    for (;;) {
+      const head = this.head();
+      const tail = this.tail();
+      const used = (head - tail) >>> 0;
+      const pos = head & (this.capacity - 1);
+      if (pos + framed <= this.capacity) {
+        if (this.capacity - used < framed) return null;
+        this.pending = {
+          headSnapshot: head,
+          pos,
+          framed,
+          payload: this.data.subarray(pos + 4, pos + 4 + n),
+        };
+        return this.pending.payload;
       }
-    } finally {
-      if (parked) Atomics.store(this.view, PRODUCER_PARKED, 0);
+      // SKIP: advance past the end once the consumer drained up to `pos`.
+      // The marker is visible to the consumer through the head advance.
+      if (used <= pos && pos - used >= framed) {
+        Atomics.store(this.view, DATA_WORD + pos / 4, -1); // u32 SKIP_MARKER
+        Atomics.store(this.view, HEAD, head + (this.capacity - pos));
+        this.wakeConsumer();
+        continue; // re-loop: now at offset 0
+      }
+      return null;
     }
   }
 
   /** Publish the reserved message: length field lands first, then the
    * release store on head + notify (§8.2). */
   commit(): void {
+    this.assertOpen();
     if (this.pending === null) {
       throw new MembridgeError('E_RING_STATE', 'no reserve to commit', { segmentName: this.name });
     }
@@ -271,15 +336,17 @@ export class RingProducer {
     this.wakeConsumer();
   }
 
+  // A plain load, deliberately NOT an exchange (round-3 C20 was tried and
+  // reverted): a notifier's flag check is not tied to the counter value it
+  // published, so a LATE exchange from an earlier commit could consume the
+  // peer's NEW park announcement — its wake spent before the peer slept —
+  // and the next commit then saw the flag clear and woke nobody (a full
+  // 250 ms slice, reproduced by test/round3.test.ts). The waiter clears its
+  // own flag on exit; the cost is extra wakes while it is parked, never a
+  // lost one.
   private wakeConsumer(): void {
     if (Atomics.load(this.view, CONSUMER_PARKED) === 1) {
       this.b.syncNotify(this.view, HEAD, 1);
-    }
-  }
-
-  private wakeProducer(): void {
-    if (Atomics.load(this.view, PRODUCER_PARKED) === 1) {
-      this.b.syncNotify(this.view, TAIL, 1);
     }
   }
 
@@ -293,34 +360,35 @@ export class RingProducer {
   /** Async variant of {@link reserve} (§8.2): waits ride the §6 waiter
    * threads; resolves with the same zero-copy view. */
   async reserveAsync(n: number, opts?: ReserveOptions): Promise<Uint8Array> {
+    const framed = this.checkReserve(n, opts?.timeoutMs, 'reserveAsync');
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     let parked = false;
     try {
       for (;;) {
-        try {
-          return this.reserve(n, { timeoutMs: 0 });  // non-blocking attempt
-        } catch (e) {
-          if (!(e instanceof MembridgeError) || e.code !== 'E_TIMEOUT') throw e;
+        // Snapshot BEFORE the attempt (round-3 C6): a release landing between
+        // the failed attempt and the flag store saw no flag and did not
+        // notify, so the re-check must compare against what the attempt saw —
+        // comparing two back-to-back reads missed it and parked a full slice.
+        const tailSeen = this.tail();
+        this.assertOpen();
+        const view = this.tryReserve(n, framed);
+        if (view !== null) return view;
+        if (opts?.timeoutMs === 0 || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
+          throw this.fullError('reserveAsync');
         }
-        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-          throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
-            segmentName: this.name,
-          });
-        }
-        // Park with the flag protocol (review R14): announce, re-check, wait.
         Atomics.store(this.view, PRODUCER_PARKED, 1);
         parked = true;
-        const tailNow = this.tail();
-        if (tailNow !== this.tail()) continue;
-        await waitAsync(this.view, TAIL, tailNow, sliceOf(deadline));
+        if (this.tail() !== tailSeen) continue;
+        await waitAsync(this.view, TAIL, tailSeen, sliceOf(deadline));
         if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-          throw new MembridgeError('E_TIMEOUT', 'ring full: reserveAsync timed out', {
-            segmentName: this.name,
-          });
+          this.assertOpen();
+          const last = this.tryReserve(n, framed);  // last look before giving up
+          if (last !== null) return last;
+          throw this.fullError('reserveAsync');
         }
       }
     } finally {
-      if (parked) Atomics.store(this.view, PRODUCER_PARKED, 0);
+      if (parked && !this.closed) Atomics.store(this.view, PRODUCER_PARKED, 0);
     }
   }
 
@@ -345,7 +413,7 @@ export class RingConsumer {
   private readonly data: Uint8Array;
   private readonly capacity: number;
   private readonly b: ReturnType<typeof nativeOrThrow>;
-  private claimed = false;
+  private closed = false;
   private pending: Peeked | null = null;
 
   private constructor(name: string, view: Int32Array, capacity: number) {
@@ -367,20 +435,37 @@ export class RingConsumer {
       });
     }
     const view = new Int32Array(sab);
+    // Cross-check the capacity word a producer recorded (§8.2): a segment of
+    // ring kind whose size disagrees with its own header is not usable.
+    const hdrCap = Atomics.load(view, CAPACITY);
+    if (hdrCap !== 0 && hdrCap !== capacity) {
+      throw new MembridgeError('E_INCOMPATIBLE',
+        `ring header capacity ${hdrCap} does not match the segment size (${capacity})`, {
+          segmentName: name, requested: capacity, existing: hdrCap,
+        });
+    }
     b.ringClaimRole(name, view, false);
+    Atomics.store(view, CONSUMER_PARKED, 0);  // round-3 C13: see RingProducer.open
     const c = new RingConsumer(name, view, capacity);
-    c.claimed = true;
-    consumerRoleRegistry.register(c, { data: view, slot: CONSUMER_SLOT }, c);
+    roleRegistry.register(c, { data: view, slot: CONSUMER_SLOT }, c);
     return c;
   }
 
-  /** Release this instance's consumer role (idempotent). After close() the
-   * instance is dead; a new RingConsumer can open on this thread. */
+  /** Release this instance's consumer role (idempotent). An open peek is
+   * abandoned unreleased, so the message is redelivered to the next consumer
+   * (at-least-once). Any later call throws E_CLOSED (round-3 C10: a closed
+   * consumer used to keep reading alongside its replacement). */
   close(): void {
-    if (this.claimed) {
-      consumerRoleRegistry.unregister(this);
-      this.b.mutexUnregisterRole(this.view, CONSUMER_SLOT);
-      this.claimed = false;
+    if (this.closed) return;
+    this.closed = true;
+    this.pending = null;
+    roleRegistry.unregister(this);
+    this.b.mutexUnregisterRole(this.view, CONSUMER_SLOT);
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new MembridgeError('E_CLOSED', 'ring consumer is closed', { segmentName: this.name });
     }
   }
 
@@ -394,6 +479,8 @@ export class RingConsumer {
   /** Two-phase read: view into shared memory, valid until {@link release}.
    * Returns null on timeout. Throws E_RING_STATE if a peek is already open. */
   peek(opts?: ReserveOptions): Uint8Array | null {
+    this.assertOpen();
+    checkTimeoutMs(opts?.timeoutMs, 'peek');
     if (this.pending !== null) {
       throw new MembridgeError('E_RING_STATE', 'previous peek not released', {
         segmentName: this.name,
@@ -455,6 +542,7 @@ export class RingConsumer {
 
   /** Only now does tail advance (§8.2). */
   release(): void {
+    this.assertOpen();
     if (this.pending === null) {
       throw new MembridgeError('E_RING_STATE', 'no peek to release', { segmentName: this.name });
     }
@@ -464,6 +552,7 @@ export class RingConsumer {
     this.wakeProducer();
   }
 
+  // Plain load, not an exchange — see RingProducer.wakeConsumer (C20).
   private wakeProducer(): void {
     if (Atomics.load(this.view, PRODUCER_PARKED) === 1) {
       this.b.syncNotify(this.view, TAIL, 1);
@@ -472,24 +561,29 @@ export class RingConsumer {
 
   /** Async variant of {@link peek} (§8.2). Resolves null on timeout. */
   async peekAsync(opts?: ReserveOptions): Promise<Uint8Array | null> {
+    this.assertOpen();
+    checkTimeoutMs(opts?.timeoutMs, 'peekAsync');
     const deadline = opts?.timeoutMs !== undefined ? nowMs() + opts.timeoutMs : Infinity;
     let parked = false;
     try {
       for (;;) {
+        // Snapshot BEFORE the attempt (round-3 C6), as in reserveAsync.
+        const headSeen = this.head();
         const msg = this.peek({ timeoutMs: 0 });
         if (msg !== null) return msg;
-        if (opts?.timeoutMs !== undefined && nowMs() >= deadline) return null;
+        if (opts?.timeoutMs === 0 || (opts?.timeoutMs !== undefined && nowMs() >= deadline)) {
+          return null;
+        }
         Atomics.store(this.view, CONSUMER_PARKED, 1);
         parked = true;
-        const headNow = this.head();
-        if (headNow !== this.head()) continue;
-        await waitAsync(this.view, HEAD, headNow, sliceOf(deadline));
+        if (this.head() !== headSeen) continue;
+        await waitAsync(this.view, HEAD, headSeen, sliceOf(deadline));
         if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
           return this.peek({ timeoutMs: 0 });  // last look before giving up
         }
       }
     } finally {
-      if (parked) Atomics.store(this.view, CONSUMER_PARKED, 0);
+      if (parked && !this.closed) Atomics.store(this.view, CONSUMER_PARKED, 0);
     }
   }
 

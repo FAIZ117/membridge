@@ -230,11 +230,11 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
         }
 #if defined(__linux__)
         if (opts.reserve) {
-          const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(requestedTotal));
+          const int rc = ReserveBacking(fd, requestedTotal);
           if (rc != 0) {
             ::close(fd);
             ::shm_unlink(obj.c_str());
-            ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+            ThrowReserveError(isolate, rc, name);
           }
         }
 #endif
@@ -268,11 +268,11 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       }
 #if defined(__linux__)
       if (opts.reserve) {
-        const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(requestedTotal));
+        const int rc = ReserveBacking(fd, requestedTotal);
         if (rc != 0) {
           ::close(fd);
           ::shm_unlink(obj.c_str());
-          ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+          ThrowReserveError(isolate, rc, name);
         }
       }
 #endif
@@ -285,11 +285,17 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
       if (fileSize < static_cast<off_t>(headerBytes)) {
         // Grace-wait for a mid-init creator to publish the header page.
         // Backoff poll from 50 µs (review R22: the flat 2 ms sleep put a
-        // 2 ms floor on every racing join).
+        // 2 ms floor on every racing join). A size-less join never takes over
+        // (review R6), so it waits out its whole initTimeoutMs here instead of
+        // truncating the object (round-3 C23: it used to ftruncate a 0-byte
+        // object to a header page and then wait ~250 ms + initTimeoutMs).
         const auto graceStart = std::chrono::steady_clock::now();
+        h.waitStartMs = std::chrono::duration<double, std::milli>(graceStart.time_since_epoch()).count();
+        const double graceMs = wholeObject ? opts.initTimeoutMs : 250.0;
         int delayUs = 50;
         while (fileSize < static_cast<off_t>(headerBytes)) {
-          if (std::chrono::steady_clock::now() - graceStart > std::chrono::milliseconds(250)) {
+          if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                        graceStart).count() > graceMs) {
             break;
           }
           ::usleep(static_cast<useconds_t>(delayUs));
@@ -300,6 +306,13 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
             ThrowSystemError(isolate, "fstat", e, name);
           }
           fileSize = st.st_size;
+        }
+        if (wholeObject && fileSize < static_cast<off_t>(headerBytes)) {
+          ::close(fd);
+          ThrowError(isolate, "E_INIT_TIMEOUT",
+                     "segment was never initialized within " +
+                         std::to_string(static_cast<int64_t>(opts.initTimeoutMs)) + " ms",
+                     name);
         }
         // Take over the page — GROW-ONLY (review R8): re-fstat immediately
         // before truncating so a takeover that sized the object in between is
@@ -360,6 +373,23 @@ void CloseSegment(SegmentHandle& h) {
 }
 
 
+#if defined(__linux__)
+int ReserveBacking(int fd, uint64_t bytes) {
+  int rc;
+  do {
+    rc = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
+  } while (rc == EINTR);  // a signal mid-reserve is not "out of space" (C21)
+  return rc;
+}
+
+void ThrowReserveError(v8::Isolate* isolate, int rc, const std::string& name) {
+  if (rc == ENOSPC || rc == EFBIG) {
+    ThrowError(isolate, "E_NO_SPACE", "not enough space to reserve segment", name);
+  }
+  ThrowSystemError(isolate, "posix_fallocate", rc, name);
+}
+#endif
+
 void RemapSegment(SegmentHandle& h, uint64_t newTotal) {
 #if !defined(_WIN32)
   if (static_cast<uint64_t>(h.mappingBytes) >= newTotal) return;
@@ -393,17 +423,31 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     CloseHandle(section);
     ThrowSystemError(isolate, "MapViewOfFile", e, name);
   }
+  // Round-3 C8: every read is bounded by the VIEW, as the POSIX branch is
+  // bounded by the bytes actually read — a small, raw or hostile section must
+  // never let headerBytes steer the row loop past the mapping.
+  MEMORY_BASIC_INFORMATION mbi{};
+  const size_t region =
+      VirtualQuery(base, &mbi, sizeof(mbi)) == sizeof(mbi) ? mbi.RegionSize : 0;
+  if (region < sizeof(Header)) {
+    UnmapViewOfFile(base);
+    CloseHandle(section);
+    ThrowError(isolate, "E_INCOMPATIBLE", "segment is smaller than a membridge header", name);
+  }
   const Header* h = static_cast<const Header*>(base);
   out->magic = h->magic;
   out->layoutVersion = h->layoutVersion;
   // Expose the STATE bits only: while initializing the word packs the
   // initializer's row into bits 8+ (review R7) — ops consumers expect 0/1/2.
   out->initState = h->initState & 0xFF;
-  out->headerBytes = h->headerBytes;
+  const uint32_t hb = h->headerBytes;  // read once
+  out->headerBytes = hb;
   out->flags = h->flags;
   out->dataBytes = h->dataBytes;
-  const uint32_t count = AttachSlotCount(h->headerBytes);
-  const uint32_t n = count < maxAttach ? count : maxAttach;
+  uint32_t n = AttachSlotCount(hb);
+  const uint64_t byView = (region - sizeof(Header)) / sizeof(AttachSlot);
+  if (n > byView) n = static_cast<uint32_t>(byView);
+  if (n > maxAttach) n = maxAttach;
   for (uint32_t i = 0; i < n; i++) {
     out->attach.push_back(h->attachTable[i].identity);
     out->refcounts.push_back(h->attachTable[i].refcount);

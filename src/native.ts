@@ -23,11 +23,15 @@ export interface Native {
   syncNotify(view: Int32Array, index: number, count: number): number;
   syncWaitAsync(view: Int32Array, index: number, expected: number, timeoutMs: number): Promise<string>;
   // §7 mutex support (CAS protocol in JS; native does liveness + teardown)
+  // mutexClaimSlot claims the thread's slot AND registers one claim
+  // reference for the calling instance, pinned by the view's own SAB.
   mutexClaimSlot(name: string, view: Int32Array): { slot: number; gen: number; token: number };
   mutexOwnerAlive(view: Int32Array, token: number): boolean;
-  mutexRegisterPin(name: string, view: Int32Array, slot: number, token: number, sab: SharedArrayBuffer): void;
-  mutexUnregisterClaim(view: Int32Array, slot: number): void;
+  // Drop one instance's claim reference; wasHeld = that instance held the lock.
+  mutexUnregisterClaim(view: Int32Array, slot: number, wasHeld: boolean): void;
   mutexUnregisterRole(view: Int32Array, slot: number): void;
+  // True when both views start at the same address (same mapping).
+  sameMemory(a: Int32Array, b: Int32Array): boolean;
   // §8 ring role claims (producer slot 0 / consumer slot 1)
   ringClaimRole(name: string, view: Int32Array, isProducer: boolean): number;
   // §7.1 liveness for §9 stat
@@ -44,6 +48,8 @@ export interface Native {
   };
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
+  /** The next grow-policy open throws E_SYSTEM right after its grow re-maps. */
+  debugFailAfterGrow(): void;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };
 }
 

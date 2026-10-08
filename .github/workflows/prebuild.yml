@@ -5,9 +5,8 @@ name: prebuilds
 # downloads `membridge-publish` and runs `npm publish` on it (docs/release.md).
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+  workflow_call:  # release.yml reuses this on tag pushes (test matrix → prebuilds → publish)
 
 jobs:
   prebuild:

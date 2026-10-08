@@ -82,3 +82,38 @@ jobs:
         run: >
           LD_PRELOAD=$(gcc -print-file-name=libasan.so)
           node --test dist/test/*.test.js
+
+  pack-and-install:
+    # Prove the artifact a consumer gets from npm works (expr-eval-nextgen
+    # pattern): pack the tarball, install it into a clean directory, and
+    # smoke-test the public API against the installed files. The tarball has
+    # no prebuilds on CI, so this exercises the node-gyp-build source
+    # fallback (python + a toolchain, which ubuntu runners have).
+    name: ubuntu · pack → clean install → smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --ignore-scripts && npm run build && npx node-gyp rebuild
+      - run: npm pack
+      - name: Clean install + smoke test
+        run: |
+          mkdir /tmp/smoke && cd /tmp/smoke
+          npm init -y >/dev/null
+          npm install "$OLDPWD"/membridge-*.tgz --no-audit --no-fund
+          node -e "
+            const m = require('membridge');
+            const name = '/membridge-smoke-' + process.pid;
+            const sab = m.open(name, 4096);
+            const v = new Int32Array(sab);
+            v[3] = 42;
+            if (new Int32Array(m.open(name, 4096))[3] !== 42) throw new Error('cross-open read broke');
+            const mutex = m.Mutex.open(name + '-m');
+            if (mutex.lock().ownerDied !== false) throw new Error('lock broke');
+            mutex.unlock();
+            mutex.close();
+            m.unlink(name); m.unlink(name + '-m');
+            console.log('installed-package smoke test passed');
+          "

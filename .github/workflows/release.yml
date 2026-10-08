@@ -1,0 +1,74 @@
+name: Release
+
+# Tag-driven release, modeled on expr-eval-nextgen's provenance flow:
+#   push a v* tag → full test matrix → prebuilds (reusable workflow) →
+#   publish FROM Actions with npm provenance (OIDC).
+#
+# Preconditions the owner makes in the release commit (docs/release.md):
+#   - package.json version bumped to match the tag
+#   - "private": true removed
+#   - NPM_TOKEN present in repo Secrets
+# The publish job fails safely on any of these (npm refuses `private`
+# packages; a version/tag mismatch fails the sanity check).
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm test
+
+  prebuilds:
+    uses: ./.github/workflows/prebuild.yml
+    # Builds the 18 prebuilds (6 targets × Node 22/24/26) and uploads the
+    # assembled `membridge-publish` tarball as a run artifact.
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [test, prebuilds]
+    permissions:
+      id-token: write  # npm provenance via OIDC
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: membridge-publish
+          path: publish/
+      - name: Tag/version sanity
+        run: |
+          cd publish
+          tarball=$(ls membridge-*.tgz)
+          version=${GITHUB_REF_NAME#v}
+          echo "tarball=$tarball version=$version"
+          case "$tarball" in
+            "membridge-$version.tgz") ;;
+            *) echo "::error::tag $GITHUB_REF_NAME does not match $tarball"; exit 1 ;;
+          esac
+          tar -xzf "$tarball" package/package.json
+          node -e "
+            const p = require('./package/package.json');
+            if (p.private) { console.error('package.json is still private'); process.exit(1); }
+            if (p.version !== '$version') { console.error('version drift: ' + p.version); process.exit(1); }
+          "
+      - name: Publish with provenance
+        run: npm publish publish/membridge-*.tgz --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

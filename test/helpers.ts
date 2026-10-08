@@ -13,9 +13,22 @@ import type { TestContext } from 'node:test';
 
 let nameCounter = 0;
 
-/** /membridge-test-<unique> — caller (or makeTrackedName) unlinks it. */
+/**
+ * /membridge-test-<unique> — caller (or makeTrackedName) unlinks it.
+ * darwin caps shm names at 31 bytes (PSHMNAMLEN, fact U2), so the suffix is
+ * compressed there; the /membridge-test- prefix rule (AGENTS.md hygiene) and
+ * cross-process uniqueness (pid + counter + random) hold on every platform.
+ */
 export function uniqueName(): string {
   nameCounter++;
+  if (process.platform === 'darwin') {
+    // 16 (prefix) + up to 15 more: pid base36 (~5) + '-' + counter base36 (~2)
+    // + '-' + 6 random bytes base36 (~8) stays under 31.
+    const pid = process.pid.toString(36);
+    const ctr = nameCounter.toString(36);
+    const rnd = randomBytes(6).toString('base64url').slice(0, 6);
+    return `/membridge-test-${pid}-${ctr}${rnd}`.slice(0, 31);
+  }
   return `/membridge-test-${process.pid}-${Date.now().toString(36)}-${nameCounter}-${randomBytes(4).toString('hex')}`;
 }
 

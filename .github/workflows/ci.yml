@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # windows-2022: node-gyp's VS discovery overflows its stdio buffer on
+        # the windows-2025 image (node-gyp#3147 class) — pin until that is fixed
+        os: [ubuntu-latest, macos-latest, windows-2022]
         node: [22, 24, 26]
     runs-on: ${{ matrix.os }}
     steps:
@@ -52,7 +54,9 @@ jobs:
           sudo unshare --mount
           bash -c 'mount --bind /mnt/membridge-tmpfs /dev/shm &&
                    chmod 1777 /dev/shm &&
-                   su $SUDO_USER -c "MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs npm test"'
+                   cd "$GITHUB_WORKSPACE" &&
+                   echo "addon loads inside ns: $(node -e "console.log(require('./dist/index.js').isNative())")" &&
+                   MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs npm test'
 
   sanitizers:
     # ASAN/UBSan (§12): LD_PRELOAD libasan into node with an instrumented
@@ -68,6 +72,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Install (node_modules for tsc + @types; builds a default .node)
+        run: npm install
       - name: Build the addon with sanitizers
         env:
           # node-gyp honors CC/CXX (with embedded flags) from the environment

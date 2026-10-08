@@ -488,7 +488,8 @@ test('R11/R12: claim-after-unlink teardown is clean; pins release on close/GC', 
     const { Mutex } = require(process.env.MX_PKG.replace(/core\\.js$/, 'mutex.js'));
     const before = readdirSync('/proc/self/fd').length;
     for (let i = 0; i < 500; i++) {
-      const n = '/membridge-test-r12-' + process.pid + '-' + i;
+      // darwin caps names at 31 bytes — short, collision-free per child
+      const n = '/membridge-test-' + process.pid.toString(36) + 'r' + i.toString(36);
       const m = Mutex.open(n);
       m.lock();
       m.unlock();

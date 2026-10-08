@@ -14,6 +14,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:  # manual re-fire without moving the tag
 
 jobs:
   test:

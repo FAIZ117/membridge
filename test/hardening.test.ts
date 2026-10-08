@@ -10,8 +10,8 @@ import { RingProducer, RingConsumer } from '../src/ringbuffer';
 import { Mutex, MUTEX_DATA_BYTES } from '../src/mutex';
 import { assert, uniqueName, unlinkQuietly, buildHeader, shmPath } from './helpers';
 
-const POSIX = process.platform === 'linux' || process.platform === 'darwin';
-const SKIP = 'needs POSIX /dev/shm (byte-level hostile-header crafting)';
+const POSIX = process.platform === 'linux';  // /dev/shm byte-crafting + grow (darwin refuses, U2)
+const SKIP = 'needs Linux /dev/shm (byte-level crafting / grow policy)';
 
 function craft(name: string, header: Record<string, unknown>, fileBytes = 4096): void {
   fs.writeFileSync(shmPath(name)!, buildHeader(header as never, fileBytes));

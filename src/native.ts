@@ -44,7 +44,16 @@ export interface Native {
     headerBytes: number;
     flags: number;
     dataBytes: number;
-    attach: Array<{ pid: number; threadId: number; startTime: number; pidNsInode: number; refcount: number }>;
+    attach: Array<{
+      pid: number;
+      threadId: number;
+      startTime: number;
+      pidNsInode: number;
+      refcount: number;
+      /** §7.1 verdict computed natively (0 dead, 1 alive, 2 unknown) — a JS
+       * checkLiveness round-trip loses Windows FILETIME precision. */
+      alive: number;
+    }>;
   };
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;

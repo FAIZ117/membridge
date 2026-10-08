@@ -357,7 +357,7 @@ test('P4-4: a role claim settling on a stuck participant does not block other cl
 
 // ---- E4-8: unlinkWhenUnused on the reuse path ----------------------------------
 
-test('E4-8: unlinkWhenUnused requested on a reused mapping still unlinks', { skip: POSIX ? false : 'POSIX' }, () => {
+test('E4-8: unlinkWhenUnused requested on a reused mapping still unlinks', { skip: LINUX ? false : 'needs /dev/shm crafting' }, () => {
   const name = uniqueName();
   try {
     const r = runNode(`

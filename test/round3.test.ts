@@ -19,6 +19,7 @@ const RING = require.resolve('../src/ringbuffer');
 const NATIVE = require.resolve('../src/native');
 const OPS = require.resolve('../src/ops');
 const POSIX = process.platform !== 'win32';
+const LINUX = process.platform === 'linux';  // byte-crafting (/dev/shm) and grow (darwin refuses, U2)
 
 /** Run a node -e script; returns { status, signal, out } with trimmed stdout. */
 function runNode(code: string, flags: string[] = [], env: NodeJS.ProcessEnv = process.env): { status: number | null; signal: string | null; out: string; err: string } {
@@ -239,7 +240,7 @@ test('C4: exactly one of N racing worker threads becomes the consumer', async ()
 
 // ---- C5: attach-row unwind after a grow re-mapped the handle -----------------
 
-test('C5: a throw after a winning grow releases the row through the new mapping', { skip: POSIX ? false : 'grow is POSIX-only' }, () => {
+test('C5: a throw after a winning grow releases the row through the new mapping', { skip: LINUX ? false : 'grow is POSIX-only' }, () => {
   const name = uniqueName();
   try {
     const keep = open(name, 4096);
@@ -427,7 +428,7 @@ function craftCrashedInit(name: string): void {
   assert.strictEqual(r.out, 'ok', r.err);
 }
 
-test('C12: a takeover keeps the crashed segment\'s kind and larger geometry', { skip: POSIX ? false : 'POSIX' }, () => {
+test('C12: a takeover keeps the crashed segment\'s kind and larger geometry', { skip: LINUX ? false : 'POSIX' }, () => {
   const plain = uniqueName();
   const mx = uniqueName();
   try {
@@ -457,7 +458,7 @@ test('C12: a takeover keeps the crashed segment\'s kind and larger geometry', { 
   }
 });
 
-test('C11: an opener facing a constantly re-forged dead baton is bounded by initTimeoutMs', { skip: POSIX ? false : 'POSIX' }, () => {
+test('C11: an opener facing a constantly re-forged dead baton is bounded by initTimeoutMs', { skip: LINUX ? false : 'POSIX' }, () => {
   const name = uniqueName();
   try {
     runNode(`require(${JSON.stringify(CORE)}).open(${JSON.stringify(name)}, 4096)`);
@@ -525,7 +526,7 @@ test('C14: NaN / negative / >2^31 ring timeouts throw E_NAME_INVALID', async () 
 
 // ---- C15: the attach row survives in whichever mapping lives longest ---------
 
-test('C15: unlinkWhenUnused fires after the owner mapping detaches first', { skip: POSIX ? false : 'grow is POSIX-only' }, () => {
+test('C15: unlinkWhenUnused fires after the owner mapping detaches first', { skip: LINUX ? false : 'grow is POSIX-only' }, () => {
   const name = uniqueName();
   try {
     const r = runNode(`

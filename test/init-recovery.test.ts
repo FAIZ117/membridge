@@ -22,8 +22,8 @@ import {
   unlinkQuietly,
 } from './helpers';
 
-const POSIX = process.platform === 'linux' || process.platform === 'darwin';
-const SKIP = 'needs POSIX /dev/shm (byte-level crash-state crafting)';
+const POSIX = process.platform === 'linux';  // /dev/shm byte-crafting
+const SKIP = 'needs Linux /dev/shm (byte-level crash-state crafting)';
 const TMPFS = process.env.MEMBRIDGE_TEST_TMPFS !== undefined;
 const SKIP_TMPFS = 'needs MEMBRIDGE_TEST_TMPFS pointing at a small tmpfs (CI mounts one)';
 
@@ -184,7 +184,14 @@ test('R7: packed baton word (1 | row<<8) is honored; stale field is ignored', { 
 // E_NO_SPACE: only where the CI prepared a small tmpfs (§13 platform rules).
 test('E_NO_SPACE on a full small tmpfs', { skip: TMPFS ? false : SKIP_TMPFS }, (t) => {
   const name = makeTrackedNameLocal(t);
-  assertThrowsCode(() => open(name, 512 * 1024 * 1024), 'E_NO_SPACE');
+  // lift the default 256 MiB cap so the 512 MiB request reaches
+  // posix_fallocate (the point of the test) instead of E_SIZE_INVALID
+  process.env.MEMBRIDGE_MAX_SEGMENT_BYTES = String(1024 * 1024 * 1024);
+  try {
+    assertThrowsCode(() => open(name, 512 * 1024 * 1024), 'E_NO_SPACE');
+  } finally {
+    delete process.env.MEMBRIDGE_MAX_SEGMENT_BYTES;
+  }
 });
 
 function makeTrackedNameLocal(t: TestContext): string {

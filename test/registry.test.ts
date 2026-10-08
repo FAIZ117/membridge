@@ -69,7 +69,7 @@ test('GC: mapping kept alive while ANY SAB reference remains (child, --expose-gc
   }
 });
 
-test('GC: grow replaces the registry entry; old SABs stay valid (child, --expose-gc)', () => {
+test('GC: grow replaces the registry entry; old SABs stay valid (child, --expose-gc)', { skip: process.platform !== 'linux' ? 'grow is a Linux-only policy' : false }, () => {
   const name = uniqueName();
   try {
     const r = runInGcChild(

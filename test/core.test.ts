@@ -90,7 +90,7 @@ test('close() is a documented no-op: SAB still usable, invalid name throws', () 
   }
 });
 
-test('unlink removes the name; re-open creates a fresh segment', () => {
+test('unlink removes the name; re-open creates a fresh segment', { skip: process.platform === 'win32' ? 'Windows named sections are refcounted: with the old SAB alive, re-opening reopens the same object (§5.4)' : false }, () => {
   const name = uniqueName();
   try {
     new Int32Array(open(name, 256))[0] = 9;
@@ -117,6 +117,7 @@ test('size validation: 2^32+16, 1.9, -1, 0, NaN, > cap -> E_SIZE_INVALID', () =>
     assertThrowsCode(() => open(name, 256 * 1024 * 1024 + 1), 'E_SIZE_INVALID', (e) => {
       assert.ok(e.message.includes('MEMBRIDGE_MAX_SEGMENT_BYTES'));
     });
+    if (process.env.MEMBRIDGE_TEST_TMPFS !== undefined) return; // 256 MiB cannot fit the CI tmpfs
     // the env override lifts the cap for big-but-legal sizes
     process.env.MEMBRIDGE_MAX_SEGMENT_BYTES = String(300 * 1024 * 1024);
     const big = uniqueName();
@@ -185,7 +186,7 @@ test("size policy 'at-least': smaller request maps a prefix; larger throws", () 
   }
 });
 
-test("size policy 'grow': extends the segment; old SABs stay valid; attached keep smaller views", () => {
+test("size policy 'grow': extends the segment; old SABs stay valid; attached keep smaller views", { skip: process.platform !== 'linux' ? 'grow is a Linux-only policy (E_GROW_UNSUPPORTED elsewhere)' : false }, () => {
   const name = uniqueName();
   try {
     const small = open(name, 4096);

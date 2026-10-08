@@ -541,7 +541,20 @@ void Unlink(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 #if defined(_WIN32)
   // The section disappears with the last handle; unlink only prevents new
-  // membridge joins by marking the header (§5.4).
+  // membridge joins by marking the header (§5.4). POSIX parity for a missing
+  // name: a named section kernel object exists while ANY handle references
+  // it, so OpenFileMappingW is the existence probe.
+  const bool known = Registry::Get().Find(name) != nullptr;
+  const std::string escaped = ObjectName(name, false);
+  int wn = MultiByteToWideChar(CP_UTF8, 0, escaped.c_str(), -1, nullptr, 0);
+  std::wstring wname(static_cast<size_t>(wn > 0 ? wn - 1 : 0), L'\0');
+  if (wn > 0) MultiByteToWideChar(CP_UTF8, 0, escaped.c_str(), -1, &wname[0], wn);
+  HANDLE probe = OpenFileMappingW(FILE_MAP_READ, FALSE, wname.c_str());
+  if (probe != nullptr) {
+    CloseHandle(probe);
+  } else if (!known && GetLastError() == ERROR_FILE_NOT_FOUND) {
+    ThrowError(isolate, "E_NOT_FOUND", "segment does not exist", name);
+  }
   if (auto live = Registry::Get().Find(name)) {
     if (!live->raw && live->base != nullptr) {
       static_cast<Header*>(live->base)->flags |= kFlagUnlinked;
@@ -986,6 +999,8 @@ void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
            v8::Number::New(isolate, static_cast<double>(id.pidNsInode))).Check();
     r->Set(ctx, Str(isolate, "refcount"),
            v8::Number::New(isolate, info.refcounts[i])).Check();
+    r->Set(ctx, Str(isolate, "alive"),
+           v8::Number::New(isolate, info.alive[i])).Check();
     rows->Set(ctx, static_cast<uint32_t>(i), r).Check();
   }
   o->Set(ctx, Str(isolate, "attach"), rows).Check();

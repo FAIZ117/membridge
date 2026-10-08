@@ -168,6 +168,7 @@ function runChild(script: string, name: string): { status: number | null; stdout
 }
 
 test('unlinkWhenUnused: the detaching process that empties the table unlinks', () => {
+  if (!LINUX) return; // asserts unlink visibility via /dev/shm (Linux paths)
   const parentName = uniqueName();
   const soleName = uniqueName();
   try {

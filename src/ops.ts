@@ -55,12 +55,6 @@ const FLAG_UNLINKED = 2;
 const KIND_MASK = 0xff << 8;
 const MAGIC = 0x424d454d;
 
-/** Native §7.1 liveness: 'alive' | 'dead' | 'unknown' (never-steal). */
-function livenessOf(pid: number, startTime: number, pidNsInode: number): boolean | 'unknown' {
-  const r = binding().checkLiveness(pid, startTime, pidNsInode);
-  return r === 'alive' ? true : r === 'dead' ? false : 'unknown';
-}
-
 function kindOf(flags: number): 'plain' | 'mutex' | 'ring' {
   const k = flags & KIND_MASK;
   if (k === 1 << 8) return 'mutex';
@@ -99,10 +93,14 @@ export function stat(name: string): SegmentStat {
     // §7.1 liveness through the native check (review F34: the old JS path was
     // a bare kill(pid,0) — no zombie detection, no start-time match, and
     // Windows always said alive).
-    // Every platform has a native §7.1 check (Windows: OpenProcess +
-    // GetExitCodeProcess + creation time) — round-3 F34: Windows used to be
-    // hard-coded 'unknown', so reap() could never collect there.
-    const alive = livenessOf(row.pid, row.startTime, row.pidNsInode);
+    // Every platform has a native §7.1 check. The verdict comes from
+    // readHeader itself (row.alive): the alternative — passing startTime back
+    // through checkLiveness as a JS double — loses low bits past 2^53, and a
+    // Windows FILETIME (~1.3e17) is far past it, so the native int64 compare
+    // read "pid reused" for LIVE Windows processes (round-4 CI). 'unknown'
+    // keeps the §7.1 never-steal meaning.
+    const alive =
+      row.alive === 1 ? true : row.alive === 2 ? ('unknown' as const) : false;
     attachSlots.push({
       pid: row.pid,
       startTime: row.startTime,

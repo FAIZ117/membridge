@@ -4,6 +4,8 @@
 
 #include "segment.h"
 
+#include "liveness.h"
+
 #include "header.h"
 
 #include <cerrno>
@@ -474,6 +476,8 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   for (uint32_t i = 0; i < n; i++) {
     out->attach.push_back(h->attachTable[i].identity);
     out->refcounts.push_back(h->attachTable[i].refcount);
+    const Liveness v1 = CheckLiveness(h->attachTable[i].identity);
+    out->alive.push_back(v1 == Liveness::kAlive ? 1 : v1 == Liveness::kUnknown ? 2 : 0);
   }
   UnmapViewOfFile(base);
   CloseHandle(section);
@@ -539,6 +543,8 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     if (slot.refcount <= 0 || slot.identity.pid == 0) continue;  // empty row
     out->attach.push_back(slot.identity);
     out->refcounts.push_back(slot.refcount);
+    const Liveness v2 = CheckLiveness(slot.identity);
+    out->alive.push_back(v2 == Liveness::kAlive ? 1 : v2 == Liveness::kUnknown ? 2 : 0);
   }
 #endif
 }

@@ -70,6 +70,11 @@ struct HeaderInfo {
   uint64_t dataBytes;
   std::vector<Identity> attach;
   std::vector<int32_t> refcounts;
+  // §7.1 verdict computed NATIVELY per row (round-4 CI, Windows): a JS-side
+  // checkLiveness(pid, startTime, ...) round-trips startTime through a double,
+  // and a Windows FILETIME (~1.3e17) loses low bits past 2^53 — the compare
+  // then reads "pid reused". Here the compare uses the full int64.
+  std::vector<int> alive;  // 0 dead, 1 alive, 2 unknown
 };
 void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttach,
                 HeaderInfo* out);

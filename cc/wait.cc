@@ -687,7 +687,7 @@ int SyncWake(int32_t* addr, int count) {
   // maximum, making every later wait return immediately (hot spin). Release
   // in bounded chunks instead; spurious over-waking is within §6's model.
   const std::wstring name = WordSemaphoreName(addr);
-  HANDLE sem = OpenSemaphoreW(SEMAPHORE_MODIFY, FALSE, name.c_str());
+  HANDLE sem = OpenSemaphoreW(SEMAPHORE_MODIFY_STATE, FALSE, name.c_str());
   if (sem == nullptr) return 0;  // no waiter ever created it
   int released = 0;
   int remaining = count > 1024 ? 1024 : count;  // cap the default wake-all too

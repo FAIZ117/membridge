@@ -50,12 +50,16 @@ jobs:
           echo "MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs" >> "$GITHUB_ENV"
       - run: npm install
       - name: Run the suite inside the small-tmpfs namespace
+        # PATH is preserved explicitly: sudo's secure_path resolves to the
+        # system Node (22), whose ABI differs from the setup-node Node (24)
+        # the addon was built against — node-gyp-build then reports the addon
+        # as unavailable inside the namespace.
         run: >
-          sudo unshare --mount
+          sudo env PATH="$PATH" unshare --mount
           bash -c 'mount --bind /mnt/membridge-tmpfs /dev/shm &&
                    chmod 1777 /dev/shm &&
                    cd "$GITHUB_WORKSPACE" &&
-                   echo "addon loads inside ns: $(node -e "console.log(require('./dist/index.js').isNative())")" &&
+                   echo "node: $(node -v), addon loads: $(node -p "require(process.argv[1]).isNative()" "$PWD/dist/index.js")" &&
                    MEMBRIDGE_TEST_TMPFS=/mnt/membridge-tmpfs npm test'
 
   sanitizers:

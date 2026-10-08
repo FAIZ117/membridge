@@ -227,11 +227,16 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
     }
     // Only a regular shm object is a segment (round-4 S4-2/S4-5): a FIFO,
     // device or directory planted at the name must fail cleanly, not block,
-    // hang in a grace loop or fail deep inside ftruncate.
+    // hang in a grace loop or fail deep inside ftruncate. Linux-only: glibc
+    // shm_open maps names to /dev/shm paths, where the attack lives; darwin's
+    // shm namespace is opaque (fstat there is not S_IFREG) and unreachable by
+    // hostile filesystem paths.
+#if defined(__linux__)
     if (!S_ISREG(st.st_mode)) {
       if (created) ::shm_unlink(obj.c_str());
       ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a non-regular file", name);
     }
+#endif
     off_t fileSize = st.st_size;
 
     if (opts.raw) {
@@ -490,7 +495,12 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   }
   {
     struct stat st{};
+    // S_ISREG is a Linux-only gate — see the matching note in OpenSegment.
+#if defined(__linux__)
     if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+#else
+    if (::fstat(fd, &st) != 0) {
+#endif
       ::close(fd);
       ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a non-regular file", name);
     }

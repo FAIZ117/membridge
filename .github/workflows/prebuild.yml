@@ -54,11 +54,17 @@ jobs:
       # ("make: o: No such file or directory").
       - name: prebuildify (Node 22/24/26 ABIs)
         run: |
+          STRIPFLAG="--strip"
           case "${{ matrix.target }}" in
-            linux-arm64-glibc) export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ;;
-            darwin-x64)        export CC="clang -arch x86_64" CXX="clang++ -arch x86_64" ;;
+            linux-arm64-glibc)
+              # host strip cannot read aarch64 objects and prebuildify always
+              # invokes `strip` from PATH — ship the cross build unstripped
+              STRIPFLAG=""
+              export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ;;
+            darwin-x64)
+              export CC="clang -arch x86_64" CXX="clang++ -arch x86_64" ;;
           esac
-          npx prebuildify -t 22.0.0 -t 24.0.0 -t 26.0.0 --strip \
+          npx prebuildify -t 22.0.0 -t 24.0.0 -t 26.0.0 "$STRIPFLAG" \
             ${{ matrix.cross == 'arm64' && '--arch arm64' || '' }}
       - name: Stage prebuilds
         run: |

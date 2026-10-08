@@ -1,7 +1,7 @@
 {
   "targets": [
     {
-      "target_name": "membridge",
+      "target_name": "memfuse",
       "sources": [
         "cc/addon.cc",
         "cc/segment.cc",

@@ -1,9 +1,9 @@
-# membridge
+# memfuse
 
 Cross-process shared memory for Node.js — a `SharedArrayBuffer` backed by OS
 shared memory (`shm_open`/`mmap` on Linux/macOS, `CreateFileMapping` on Windows),
 shareable across processes and usable with `Atomics`. Ships cross-process
-wait/notify (`membridge/sync`), a crash-safe Mutex, a zero-copy RingBuffer,
+wait/notify (`memfuse/sync`), a crash-safe Mutex, a zero-copy RingBuffer,
 and ops utilities.
 
 Supersedes [`shmbuf`](https://www.npmjs.com/package/shmbuf) (MIT, kedemd) —
@@ -13,7 +13,7 @@ deterministic lifecycle, cross-process synchronization, configurable limits.
 ## Install
 
 ```
-npm install membridge
+npm install memfuse
 ```
 
 Prebuilds ship for Linux (x64/arm64 glibc, x64 musl), macOS (arm64/x64) and
@@ -31,7 +31,7 @@ runtime dependency.
 
 ## The one-paragraph mental model
 
-Every membridge segment is a named OS shared-memory object with a native
+Every memfuse segment is a named OS shared-memory object with a native
 header page (metadata, attach table, init protocol) and a data region. `open()`
 hands you a `SharedArrayBuffer` covering **the data region only** — user
 offsets start at 0. The header is native-only memory; you cannot corrupt it
@@ -40,7 +40,7 @@ name (POSIX semantics). `close()` is a compatibility no-op (PLAN §5.4).
 
 ## API
 
-### `membridge` (core segments)
+### `memfuse` (core segments)
 
 ```ts
 open(name: string, size: number, opts?: OpenOptions): SharedArrayBuffer
@@ -75,13 +75,13 @@ interface OpenOptions {
   true`). The fallback is **this process only** — using it as if it were
   shared memory is a production bug waiting to happen.
 
-### `membridge/sync` — cross-process wait/notify
+### `memfuse/sync` — cross-process wait/notify
 
 `Atomics.notify` cannot wake a process that isn't ours (verified: PLAN §2
 F1). This is the same API shape, implemented over OS primitives:
 
 ```ts
-import { wait, waitAsync, notify } from 'membridge/sync';
+import { wait, waitAsync, notify } from 'memfuse/sync';
 
 wait(view: Int32Array, index: number, expected: number, timeoutMs?: number):
   'ok' | 'not-equal' | 'timed-out';   // blocks the calling thread like Atomics.wait
@@ -90,15 +90,15 @@ notify(view: Int32Array, index: number, count?: number): void;
 ```
 
 Waitable words are **`Int32Array` elements only** (futex/`os_sync`/semaphore
-constraint). Async waits run on membridge-owned threads, never the libuv
+constraint). Async waits run on memfuse-owned threads, never the libuv
 threadpool; on Linux ≥ 5.16 one multiplexer thread parks in `futex_waitv` for
 up to 127 waits. Isolate teardown (worker exit or `.terminate()`) cancels that
 isolate's pending waits and resolves them `'timed-out'`.
 
-### `membridge` — Mutex (crash-safe)
+### `memfuse` — Mutex (crash-safe)
 
 ```ts
-import { Mutex } from 'membridge';
+import { Mutex } from 'memfuse';
 
 const mutex = Mutex.open('/my-mutex');
 const { ownerDied } = mutex.lock({ timeoutMs: 1000 });
@@ -131,10 +131,10 @@ Mutex.unlink('/my-mutex');
 - No priority inheritance, no fairness guarantee — don't use it for
   latency-critical control loops.
 
-### `membridge` — RingBuffer (SPSC, zero-copy)
+### `memfuse` — RingBuffer (SPSC, zero-copy)
 
 ```ts
-import { RingProducer, RingConsumer } from 'membridge';
+import { RingProducer, RingConsumer } from 'memfuse';
 
 // one producer, one consumer, capacity 4 KiB .. 1 GiB (power of two)
 const p = RingProducer.open('/my-ring', { capacity: 65536 });
@@ -165,14 +165,14 @@ c.close(); p.close();                 // release the roles; later calls throw E_
 - Timeouts: `0` means non-blocking; otherwise a finite number of ms up to
   2^31 (`E_NAME_INVALID` for NaN, negative or larger values).
 
-### `membridge` — ops
+### `memfuse` — ops
 
 ```ts
-import { capacity, stat, list, reap } from 'membridge';
+import { capacity, stat, list, reap } from 'memfuse';
 
 capacity();          // { totalBytes, freeBytes } of the shm store (Linux only)
 stat('/name');       // kind, sizes, attach table + liveness
-list();              // membridge segments in /dev/shm (Linux only; magic-filtered)
+list();              // memfuse segments in /dev/shm (Linux only; magic-filtered)
 reap({ dryRun });    // unlink segments with no live attachers (overflow-safe)
 reap({ name });      // single-segment reap, every platform
 open(name, n, { unlinkWhenUnused: true }); // last detacher unlinks

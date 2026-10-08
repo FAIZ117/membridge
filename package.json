@@ -1,5 +1,5 @@
 {
-  "name": "membridge",
+  "name": "memfuse",
   "version": "0.1.0",
   "description": "Cross-process shared memory for Node.js \u2014 SharedArrayBuffer over OS shared memory, plus a crash-safe Mutex, zero-copy RingBuffer, and ops utilities",
   "license": "MIT",
@@ -50,12 +50,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FAIZ117/membridge.git"
+    "url": "git+https://github.com/FAIZ117/memfuse.git"
   },
   "bugs": {
-    "url": "https://github.com/FAIZ117/membridge/issues"
+    "url": "https://github.com/FAIZ117/memfuse/issues"
   },
-  "homepage": "https://github.com/FAIZ117/membridge#readme",
+  "homepage": "https://github.com/FAIZ117/memfuse#readme",
   "keywords": [
     "shared-memory",
     "shm",

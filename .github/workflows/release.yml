@@ -17,19 +17,37 @@ on:
   workflow_dispatch:  # manual re-fire without moving the tag
 
 jobs:
-  test:
-    name: ${{ matrix.os }} · Node ${{ matrix.node }}
-    timeout-minutes: 20
+  # The RELEASE GATE: Linux is the verified platform. Publish needs THIS job
+  # and the prebuilds — nothing else. (A timed-out job concludes "cancelled",
+  # which continue-on-error does NOT cover and which skips dependents — so
+  # the experimental platforms live in their own non-required job below.)
+  test-linux:
+    name: ubuntu · Node ${{ matrix.node }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-2022]
+        node: [22, 24, 26]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm test
+
+  # EXPERIMENTAL platforms (v0.1.0): failures are visible here and nowhere
+  # gate the publish. Their known issues are the docs/compat.md punch-list.
+  test-experimental:
+    name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-2022]
         node: [22, 24, 26]
     runs-on: ${{ matrix.os }}
-    # Linux gates the release (verified platform). macOS/Windows are
-    # experimental in v0.1.0 — their failures stay visible but do not block
-    # publishing (docs/compat.md "Known issues on non-Linux").
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -45,7 +63,7 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
-    needs: [test, prebuilds]
+    needs: [test-linux, prebuilds]
     permissions:
       id-token: write  # npm provenance via OIDC
       contents: read

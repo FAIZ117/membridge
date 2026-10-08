@@ -18,6 +18,13 @@ npm install membridge
 
 Prebuilds ship for Linux (x64/arm64 glibc, x64 musl), macOS (arm64/x64) and
 Windows (x64), per Node ABI (22/24/26). A source build via `node-gyp` is the
+
+> **Platform status (v0.1.0):** Linux is the verified platform — the full
+> test matrix, ASAN/UBSan and the cross-process integration tests gate every
+> commit there. macOS and Windows build and run, but are **experimental** in
+> this release: cross-process wake on macOS and some worker-teardown paths on
+> Windows are still being fixed — see "Known issues on non-Linux" in
+> [docs/compat.md](./docs/compat.md) before relying on them.
 fallback (needs a C++20 toolchain). The loader is
 [`node-gyp-build`](https://www.npmjs.com/package/node-gyp-build); the only
 runtime dependency.

@@ -3,10 +3,10 @@
 All notable changes to membridge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning follows SemVer.
 
-## [Unreleased]
+## [0.1.0] — 2026-10-08
 
-Nothing published yet. Implemented on `main` (M1–M8, see [PLAN.md](./PLAN.md)
-§14 and the milestone commits):
+First published release. Implemented on `main` (M1–M8, see
+[PLAN.md](./PLAN.md) §14 and the milestone commits):
 
 - Plain-V8 native addon (node.h, no N-API): SharedArrayBuffer windows over OS
   shared memory with a crash-safe mapping registry (M1/M2)

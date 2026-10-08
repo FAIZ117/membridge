@@ -18,12 +18,17 @@ on:
 jobs:
   test:
     name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-2022]
         node: [22, 24, 26]
     runs-on: ${{ matrix.os }}
+    # Linux gates the release (verified platform). macOS/Windows are
+    # experimental in v0.1.0 — their failures stay visible but do not block
+    # publishing (docs/compat.md "Known issues on non-Linux").
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -92,10 +92,15 @@ jobs:
           path: artifacts/
       - name: Merge prebuilds + build JS
         run: |
+          # Each uploaded artifact holds the platform dirs at its root (upload
+          # strips the stage/ prefix). Rebuild one prebuilds/ tree, keeping
+          # each file's path after the artifact name.
           mkdir -p prebuilds
-          for d in artifacts/prebuilds-*/prebuilds/*/; do
-            cp -rn "$d" prebuilds/ || true
-          done
+          while IFS= read -r f; do
+            rel=${f#artifacts/*/}
+            mkdir -p "prebuilds/$(dirname "$rel")"
+            cp -n "$f" "prebuilds/$rel"
+          done < <(find artifacts -name '*.node')
           find prebuilds -name '*.node' | sort
           npm install --ignore-scripts
           npm run build

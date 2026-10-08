@@ -446,7 +446,7 @@ test('R2: concurrent create/join produces no spurious E_INCOMPATIBLE', async () 
   }
 });
 
-test('R3: a grow that lost the race still returns a full window', async () => {
+test('R3: a grow that lost the race still returns a full window', { skip: process.platform !== 'linux' ? 'grow is a Linux-only policy' : false }, async () => {
   const name = uniqueName();
   try {
     open(name, 4096, { mode: 'create' });
@@ -476,7 +476,7 @@ test('R4/R5 hostile geometry races: native view guards', () => {
     e.code === 'E_SIZE_INVALID');
 });
 
-test('R11/R12: claim-after-unlink teardown is clean; pins release on close/GC', () => {
+test('R11/R12: claim-after-unlink teardown is clean; pins release on close/GC', { skip: process.platform !== 'linux' ? 'counts fds via /proc/self/fd' : false }, () => {
   const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
   // R12: 500 short-lived mutexes on unlinked segments must not pin 500
   // mappings + fds for the isolate's lifetime. The fd check runs in a

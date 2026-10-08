@@ -23,6 +23,31 @@ after the owner pushes.
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
 | Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
 
+**Known issues on non-Linux (from the first CI runs, 2026-10-08 — the punch-list):**
+
+- **macOS — cross-process wake is not delivered (U1, the blocker).** A waiter
+  parked in `os_sync_wait_on_address_with_timeout` never observes a peer
+  process's store + `os_sync_wake_by_address_all`: every cross-process
+  coordination test (`sync.notify` across processes, cross-process
+  `waitAsync`, mutex handoff timeouts) fails with the waiter timing out, while
+  same-process waits/wakes pass. Suspects, in order: the wake-flag pairing
+  (`OS_SYNC_WAKE_BY_ADDRESS_SHARED` vs the wait flag), the 6-argument timed
+  signature, `__builtin_available(macOS 14.4)` routing. Needs a macOS 14.4+
+  machine; CI iteration is ~10 min per round.
+- **macOS — `stat()` reports live rows as not-alive.** The native per-row
+  `CheckLiveness` (proc_pidinfo path) returns dead/unknown for the calling
+  process's own row. Under investigation alongside the sync work.
+- **Windows — suite hangs in worker-teardown paths** (Node 24/26; Node 22
+  completes). Suspect: spawned children outliving timed-out tests keep the
+  test file's event loop alive. Node 22's remaining failures concentrate
+  around unlink/re-open (Windows named sections are refcounted by handle —
+  re-opening a name whose old SABs still live reopens the same object; those
+  tests are now POSIX-gated) and `ownerDied` reporting.
+- Fixed en route during these rounds: Windows compile (`SEMAPHORE_MODIFY_STATE`),
+  the Linux-only S_ISREG guard (darwin shm fdstat is not S_IFREG), Windows
+  `stat()` liveness losing FILETIME precision through a JS double, darwin
+  31-byte name compression in the test harness.
+
 **Correction (round 3, 2026-10-07):** the round-2 text below claimed "untimed
 parks in bounded slices" — an untimed `os_sync` park is not bounded, so on macOS
 lock timeouts, the 250 ms dead-owner slice and initializer-death checks never
@@ -53,7 +78,7 @@ and on timeout.
 | Runtime | Status |
 |---------|--------|
 | Node 22 / 24 / 26 (official builds, Linux) | ✓ verified locally on every fix round |
-| Node on macOS / Windows | source compiles per the platform guards; **the runners have not built it yet** — treat every non-Linux cell above as pending the first CI run (review F19 found the pre-fix tree could not compile there at all) |
+| Node on macOS / Windows | **compiles and runs on CI (2026-10-08)**; mid-integration: CI runs these legs **non-blocking** while the issues below are fixed. Linux is the verified platform and gates the run |
 | Electron | ✗ — the V8 sandbox rejects external backing stores (F13); unsupported by design |
 | Bun / Deno | untested — likely broken (plain-V8 addon, node.h ABI) |
 | worker_threads | ✓ — context-aware `NODE_MODULE_INIT`, process-wide native registry |

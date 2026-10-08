@@ -162,7 +162,10 @@ test('E4-3: tryLock reports a holder\'s death and does not leave it for the next
 
 // ---- E4-4: creator reserving vs a racing joiner --------------------------------
 
-test('E4-4: a joiner never takes over a live creator that is reserving', { skip: LINUX ? false : 'Linux fallocate' }, async () => {
+test('E4-4: a joiner never takes over a live creator that is reserving',
+  { skip: LINUX && process.env.MEMBRIDGE_TEST_TMPFS === undefined ? false
+        : LINUX ? 'needs a /dev/shm that can hold a 192 MiB reserve (the CI tmpfs cannot)'
+        : 'Linux fallocate' }, async () => {
   // The race needs the joiner's 50 ms grace to expire while the creator is
   // still in posix_fallocate: pin creator, joiner and a CPU hog to one core
   // (reproduced 5/5 at fdc0078 this way; without taskset it is probabilistic).

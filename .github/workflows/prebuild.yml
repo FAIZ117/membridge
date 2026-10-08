@@ -14,18 +14,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # dir = the node-gyp-build tuple (EXACTLY <platform>-<arch>); libctag
+        # goes into the FILENAME (node-gyp-build matches glibc/musl by tag —
+        # a libc-suffixed DIRECTORY would never match its parseTuple)
         include:
-          - { target: linux-x64-glibc, os: ubuntu-latest }
+          - { target: linux-x64-glibc, os: ubuntu-latest, dir: linux-x64, libctag: glibc }
           # cross arm64: needs the aarch64 cross-toolchain (installed below)
-          - { target: linux-arm64-glibc, os: ubuntu-latest, cross: arm64 }
+          - { target: linux-arm64-glibc, os: ubuntu-latest, dir: linux-arm64, libctag: glibc, cross: arm64 }
           # alpine has no bash — the job's run steps use sh
-          - { target: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine', shell: sh }
-          - { target: darwin-arm64, os: macos-latest }
+          - { target: linux-x64-musl, os: ubuntu-latest, dir: linux-x64, libctag: musl, container: 'node:22-alpine', shell: sh }
+          - { target: darwin-arm64, os: macos-latest, dir: darwin-arm64, libctag: '' }
           # darwin-x64: build x86_64 slices under Rosetta-less clang
-          - { target: darwin-x64, os: macos-latest, ccflags: '-arch x86_64' }
+          - { target: darwin-x64, os: macos-latest, dir: darwin-x64, libctag: '' }
           # windows-2022: node-gyp's VS discovery overflows its stdio buffer
           # on the windows-2025 image (same reason as ci.yml)
-          - { target: win32-x64, os: windows-2022 }
+          - { target: win32-x64, os: windows-2022, dir: win32-x64, libctag: '' }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -49,23 +52,36 @@ jobs:
         run: |
           npm install --ignore-scripts
           npm run build
-      # CC/CXX are exported ONLY for the targets that need them — an EMPTY
-      # CC/CXX env makes node-gyp emit a mangled compile line
-      # ("make: o: No such file or directory").
-      - name: prebuildify (Node 22/24/26 ABIs)
+      # prebuildify v6 only produces N-API layouts; this addon is plain-V8
+      # (ABI-specific), so build each Node ABI explicitly with node-gyp
+      # --target and lay the files out exactly as node-gyp-build resolves
+      # them: prebuilds/<platform>-<arch>/membridge.abi<N>[.<libc>].node.
+      # CC/CXX/ARCH are exported ONLY for the targets that need them — an
+      # EMPTY CC/CXX env makes node-gyp emit a mangled compile line.
+      - name: Build per-ABI prebuilds (Node 22/24/26)
         run: |
-          STRIPFLAG="--strip"
-          case "${{ matrix.target }}" in
-            linux-arm64-glibc)
-              # host strip cannot read aarch64 objects and prebuildify always
-              # invokes `strip` from PATH — ship the cross build unstripped
-              STRIPFLAG=""
-              export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ;;
-            darwin-x64)
-              export CC="clang -arch x86_64" CXX="clang++ -arch x86_64" ;;
-          esac
-          npx prebuildify -t 22.0.0 -t 24.0.0 -t 26.0.0 "$STRIPFLAG" \
-            ${{ matrix.cross == 'arm64' && '--arch arm64' || '' }}
+          set -e
+          DIR="${{ matrix.dir }}"
+          LIBCTAG="${{ matrix.libctag || '' }}"
+          mkdir -p "prebuilds/$DIR"
+          for VER in 22.0.0 24.0.0 26.0.0; do
+            rm -rf build
+            unset CC CXX ARCH_ARGS
+            case "${{ matrix.target }}" in
+              linux-arm64-glibc)
+                export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++
+                ARCH_ARGS=--arch=arm64 ;;
+              darwin-x64)
+                export CC="clang -arch x86_64" CXX="clang++ -arch x86_64"
+                ARCH_ARGS=--arch=x86_64 ;;
+            esac
+            npx node-gyp rebuild --release --target=$VER --dist-url=https://nodejs.org/dist $ARCH_ARGS
+            ABI=$(sed -n 's/.*"node_module_version": \([0-9]*\).*/\1/p' build/config.gypi | head -1)
+            echo "node $VER -> ABI $ABI"
+            test -n "$ABI"
+            cp build/Release/membridge.node "prebuilds/$DIR/membridge.abi$ABI${LIBCTAG:+.$LIBCTAG}.node"
+          done
+          find "prebuilds/$DIR" -type f | sort
       - name: Stage prebuilds
         run: |
           mkdir -p stage/prebuilds
@@ -104,11 +120,16 @@ jobs:
           find prebuilds -name '*.node' | sort
           npm install --ignore-scripts
           npm run build
-      - name: Sanity — every target × ABI present (6 × 3)
+      - name: Sanity — every target × ABI present (6 × 3 = 18 files, 5 dirs)
         run: |
           count=$(find prebuilds -name '*.node' | wc -l)
-          echo "prebuilds: $count"
+          dirs=$(find prebuilds -mindepth 1 -maxdepth 1 -type d | wc -l)
+          echo "prebuilds: $count files in $dirs dirs"
           test "$count" -eq 18
+          test "$dirs" -eq 5
+          # the musl files must be tagged, and glibc files must not serve musl
+          test "$(find prebuilds -name '*.musl.node' | wc -l)" -eq 3
+          test "$(find prebuilds -name '*.glibc.node' | wc -l)" -eq 6
       - name: Pack
         run: npm pack --dry-run
       - name: Assemble the publish tarball

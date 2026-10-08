@@ -1,8 +1,8 @@
 name: prebuilds
 
 # Build the 18 per-ABI prebuilds (6 targets × Node 22/24/26) and assemble the
-# publish artifact exactly per the package.json `files` whitelist. The owner
-# downloads `membridge-publish` and runs `npm publish` on it (docs/release.md).
+# publish artifact exactly per the package.json `files` whitelist. Invoked by
+# release.yml on v* tags (workflow_call); workflow_dispatch for manual runs.
 
 on:
   workflow_dispatch:
@@ -15,17 +15,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: linux-x64-glibc, os: ubuntu-latest, container: null }
-          - { target: linux-arm64-glibc, os: ubuntu-latest, container: null, cross: arm64 }
-          - { target: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine' }
-          - { target: darwin-arm64, os: macos-latest, container: null }
-          - { target: darwin-x64, os: macos-latest, container: null, arch: x86_64h }
-          - { target: win32-x64, os: windows-latest, container: null }
+          - { target: linux-x64-glibc, os: ubuntu-latest }
+          # cross arm64: needs the aarch64 cross-toolchain (installed below)
+          - { target: linux-arm64-glibc, os: ubuntu-latest, cross: arm64 }
+          # alpine has no bash — the job's run steps use sh
+          - { target: linux-x64-musl, os: ubuntu-latest, container: 'node:22-alpine', shell: sh }
+          - { target: darwin-arm64, os: macos-latest }
+          # darwin-x64: build x86_64 slices under Rosetta-less clang
+          - { target: darwin-x64, os: macos-latest, ccflags: '-arch x86_64' }
+          # windows-2022: node-gyp's VS discovery overflows its stdio buffer
+          # on the windows-2025 image (same reason as ci.yml)
+          - { target: win32-x64, os: windows-2022 }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        shell: bash
-    container: ${{ matrix.container }}
+        shell: ${{ matrix.shell || 'bash' }}
+    container: ${{ matrix.container || null }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,20 +40,26 @@ jobs:
       - name: Install toolchain (musl container)
         if: ${{ matrix.container != null }}
         run: apk add --no-cache python3 make g++ linux-headers
+      - name: Install aarch64 cross-toolchain
+        if: ${{ matrix.cross == 'arm64' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - name: Install (typescript only; no native build here)
         run: |
           npm install --ignore-scripts
           npm run build
+      # CC/CXX are exported ONLY for the targets that need them — an EMPTY
+      # CC/CXX env makes node-gyp emit a mangled compile line
+      # ("make: o: No such file or directory").
       - name: prebuildify (Node 22/24/26 ABIs)
-        run: >
-          npx prebuildify
-          -t 22.0.0 -t 24.0.0 -t 26.0.0
-          --strip
-          ${{ matrix.cross == 'arm64' && '--arch arm64' || '' }}
-        env:
-          # darwin-x64 keeps x86_64 compatibility via the default slice
-          CC: ${{ matrix.arch == 'x86_64h' && 'clang -arch x86_64' || '' }}
-          CXX: ${{ matrix.arch == 'x86_64h' && 'clang++ -arch x86_64' || '' }}
+        run: |
+          case "${{ matrix.target }}" in
+            linux-arm64-glibc) export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ ;;
+            darwin-x64)        export CC="clang -arch x86_64" CXX="clang++ -arch x86_64" ;;
+          esac
+          npx prebuildify -t 22.0.0 -t 24.0.0 -t 26.0.0 --strip \
+            ${{ matrix.cross == 'arm64' && '--arch arm64' || '' }}
       - name: Stage prebuilds
         run: |
           mkdir -p stage/prebuilds

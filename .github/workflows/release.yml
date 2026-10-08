@@ -93,6 +93,11 @@ jobs:
             if (p.version !== '$version') { console.error('version drift: ' + p.version); process.exit(1); }
           "
       - name: Publish with provenance
-        run: npm publish publish/membridge-*.tgz --provenance --access public
+        # cd first: a bare filename can't be mis-parsed by npm-package-arg
+        # ('publish/membridge-0.1.0.tgz' reads as a GitHub shorthand spec and
+        # npm tries `git ls-remote` on it)
+        run: |
+          cd publish
+          npm publish *.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

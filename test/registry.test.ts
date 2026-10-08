@@ -119,8 +119,10 @@ test('worker isolate reuses the same mapping and shares memory', async () => {
         `const { parentPort, workerData } = require('worker_threads');
          const { open } = require(workerData.pkg);
          const sab = open(workerData.name, 4096);
-         parentPort.postMessage({ first: new Int32Array(sab)[2] });
-         Atomics.add(new Int32Array(sab), 3, 5);`,
+         // add BEFORE posting: the message resolves main's await, so a
+         // post-first ordering races the add (lost under ASAN timing)
+         Atomics.add(new Int32Array(sab), 3, 5);
+         parentPort.postMessage({ first: new Int32Array(sab)[2] });`,
         { eval: true, workerData: { name, pkg: PKG } },
       );
       w.on('message', (m: { first: number }) => resolve(m.first));

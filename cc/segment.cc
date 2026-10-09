@@ -518,13 +518,18 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     }
     objSize = static_cast<long long>(st.st_size);
   }
+  // lseek + read, NOT pread: macOS shm descriptors return EOF (0) for pread
+  // on a non-empty object (diagnosed via the too-small error's object size —
+  // the object was fully sized while every pread read 0 bytes).
   uint8_t buf[64 * 1024];
   ssize_t total = 0;
-  while (total < static_cast<ssize_t>(sizeof(buf))) {
-    const ssize_t n = ::pread(fd, buf + static_cast<size_t>(total),
-                              sizeof(buf) - static_cast<size_t>(total), static_cast<off_t>(total));
-    if (n <= 0) break;
-    total += n;
+  if (::lseek(fd, 0, SEEK_SET) == 0) {
+    while (total < static_cast<ssize_t>(sizeof(buf))) {
+      const ssize_t n = ::read(fd, buf + static_cast<size_t>(total),
+                               sizeof(buf) - static_cast<size_t>(total));
+      if (n <= 0) break;
+      total += n;
+    }
   }
   ::close(fd);
   if (total < 32) {

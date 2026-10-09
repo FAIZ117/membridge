@@ -200,11 +200,21 @@ bool ReadBsdInfo(int32_t pid, int64_t* outStartUs, bool* outZombie) {
   proc_bsdinfo info{};
   const int r = static_cast<int>(proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)));
   if (r <= 0) return false;  // call failed / process gone: unknown
-  if (r < static_cast<int>(sizeof(info)) && info.pbi_start_tvsec == 0 &&
-      info.pbi_start_tvusec == 0) {
-    *outStartUs = -1;
+  if (r < static_cast<int>(sizeof(info))) {
+    // Short fill (older runtime / zombie corpse): pbi_status (@4) is still
+    // valid, the deep start fields may not be. A zombie is DEAD regardless
+    // of start; a live short read reports an unknown start (never a fake
+    // mismatch) for CheckLiveness to map to kUnknown = never steal.
+    if (info.pbi_status == SZOMB) {
+      *outZombie = true;
+      *outStartUs = 0;
+      return true;
+    }
     *outZombie = false;
-    return true;
+    if (info.pbi_start_tvsec == 0 && info.pbi_start_tvusec == 0) {
+      *outStartUs = -1;
+      return true;
+    }
   }
   *outStartUs = static_cast<int64_t>(info.pbi_start_tvsec) * 1000000 +
                 static_cast<int64_t>(info.pbi_start_tvusec);
@@ -230,7 +240,13 @@ Identity SelfIdentity() {
 // zombie = dead (it answers kill(pid,0) until reaped); start mismatch = dead.
 Liveness CheckLiveness(const Identity& id) {
   if (id.pid <= 0) return Liveness::kDead;
-  if (id.pid == static_cast<int32_t>(getpid())) return Liveness::kAlive;  // self is trivially alive
+  if (id.pid == static_cast<int32_t>(getpid())) {
+    // Self: alive iff the row's start matches ours (a stale row carrying our
+    // pid with a foreign start is a recycled-pid simulation — dead, F62).
+    const int64_t selfStart = SelfIdentity().startTime;
+    if (id.startTime < 0 || selfStart < 0) return Liveness::kUnknown;
+    return id.startTime == selfStart ? Liveness::kAlive : Liveness::kDead;
+  }
   if (id.startTime < 0) return Liveness::kUnknown;
   if (kill(static_cast<pid_t>(id.pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
   int64_t start = -1;

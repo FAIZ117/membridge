@@ -10,7 +10,7 @@ import { open, unlink } from '../src/core';
 import { fallbackOpen, fallbackUnlink } from '../src/fallback';
 import { Mutex } from '../src/mutex';
 import { RingProducer } from '../src/ringbuffer';
-import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
+import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core'); // tests use core directly (debug hooks are not re-exported)
 
@@ -147,10 +147,10 @@ test('unlink while SABs are alive: memory stays valid, name is gone', () => {
 // F33 residual: the same-process registry reuse path must honor the header's
 // kind flags the same way the cross-process join path does — a mutex-kind
 // segment re-opened as plain/ring is E_INCOMPATIBLE, not a silent reuse.
-test('kind mismatch on registry reuse -> E_INCOMPATIBLE (review F33)', () => {
+test('kind mismatch on registry reuse -> E_INCOMPATIBLE (review F33)', (t) => {
   const name = uniqueName();
   try {
-    Mutex.open(name);  // creates a mutex-kind segment and caches the mapping
+    holdForTest(t, Mutex.open(name));  // creates a mutex-kind segment and caches the mapping
     // kind-specific request over a different kind: E_INCOMPATIBLE (plain
     // opens are kind-agnostic by design, so a plain request is NOT asserted
     // to fail — parity with the cross-process join check).

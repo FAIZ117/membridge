@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import { fork } from 'node:child_process';
 import { open, unlink } from '../src/core';
-import { assert, uniqueName, unlinkQuietly } from './helpers';
+import { assert, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
 if (ROLE !== undefined) {
@@ -52,11 +52,11 @@ function forkRole(role: string, arg: string): Promise<{ code: number | null; pid
   });
 }
 
-test('8-process join race on one name (ported + new)', async () => {
+test('8-process join race on one name (ported + new)', async (t) => {
   const name = uniqueName();
   const size = 4096;
   try {
-    open(name, size); // parent creates first so children all join
+    holdForTest(t, open(name, size)); // parent creates first so children all join
     const runs = Array.from({ length: 8 }, (_, i) => forkRole('join-write', `${name}|${size}|${i}`));
     const results = await Promise.all(runs);
     for (const r of results) assert.strictEqual(r.code, 0, `child exited ${r.code}`);
@@ -85,10 +85,10 @@ test('8-process lost-update check: Atomics.add is correct cross-process (ported)
   }
 });
 
-test('fork handshake: child joins, writes, parent observes (ported)', async () => {
+test('fork handshake: child joins, writes, parent observes (ported)', async (t) => {
   const name = uniqueName();
   try {
-    open(name, 256, { mode: 'create' });
+    holdForTest(t, open(name, 256, { mode: 'create' }));
     const { code } = await forkRole('handshake-write', `${name}|256|424242`);
     assert.strictEqual(code, 0);
     const i32 = new Int32Array(open(name, 256));

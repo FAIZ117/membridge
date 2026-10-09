@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import { Worker } from 'node:worker_threads';
 import { open, close, unlink, isNative } from '../src/core';
-import { assert, makeTrackedName, assertThrowsCode, uniqueName } from './helpers';
+import { assert, makeTrackedName, assertThrowsCode, uniqueName, holdForTest } from './helpers';
 
 test('native addon is loaded', () => {
   assert.strictEqual(isNative(), true);
@@ -141,10 +141,10 @@ test('name validation -> E_NAME_INVALID', () => {
   assertThrowsCode(() => open(`/${'x'.repeat(300)}`, 16), 'E_NAME_INVALID');
 });
 
-test("mode 'create' throws E_EXISTS; 'join' missing throws E_NOT_FOUND", () => {
+test("mode 'create' throws E_EXISTS; 'join' missing throws E_NOT_FOUND", (t) => {
   const name = uniqueName();
   try {
-    open(name, 256, { mode: 'create' });
+    holdForTest(t, open(name, 256, { mode: 'create' }));
     assertThrowsCode(() => open(name, 256, { mode: 'create' }), 'E_EXISTS', (e) => {
       assert.strictEqual(e.segmentName, name);
     });
@@ -156,10 +156,10 @@ test("mode 'create' throws E_EXISTS; 'join' missing throws E_NOT_FOUND", () => {
   }
 });
 
-test("size policy 'exact' mismatch -> E_SIZE_MISMATCH with structured fields", () => {
+test("size policy 'exact' mismatch -> E_SIZE_MISMATCH with structured fields", (t) => {
   const name = uniqueName();
   try {
-    open(name, 4096);
+    holdForTest(t, open(name, 4096));
     assertThrowsCode(() => open(name, 8192), 'E_SIZE_MISMATCH', (e) => {
       assert.strictEqual(e.segmentName, name);
       assert.strictEqual(e.requested, 8192);
@@ -206,10 +206,10 @@ test("size policy 'grow': extends the segment; old SABs stay valid; attached kee
   }
 });
 
-test('open(name, opts) joins at the existing size', () => {
+test('open(name, opts) joins at the existing size', (t) => {
   const name = uniqueName();
   try {
-    open(name, 4096);
+    holdForTest(t, open(name, 4096));
     const sab = open(name, { mode: 'join' });
     assert.strictEqual(sab.byteLength, 4096);
     // size-less create is invalid

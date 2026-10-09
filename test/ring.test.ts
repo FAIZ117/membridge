@@ -8,7 +8,7 @@ import { fork } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { RingProducer, RingConsumer, RING_HEADER_BYTES } from '../src/ringbuffer';
 import { open } from '../src/core';
-import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
+import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core');
 const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
@@ -111,9 +111,9 @@ function waitFor(child: ReturnType<typeof fork>, type: string, timeoutMs = 15000
 }
 
 function registerTests(): void {
-  test('cross-process stream: checksummed messages across wrap/SKIP boundaries', async () => {
+  test('cross-process stream: checksummed messages across wrap/SKIP boundaries', async (t) => {
     const name = uniqueName();
-    open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' }); // no role claim
+    holdForTest(t, open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' })); // no role claim
     const count = 300;
     const consumer = forkChild('rb-consumer', `${name}|${count}`);
     // let the consumer take the role, then produce
@@ -130,10 +130,10 @@ function registerTests(): void {
     }
   });
 
-  test('full/empty blocking semantics', async () => {
+  test('full/empty blocking semantics', async (t) => {
     const name = uniqueName();
     try {
-      open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' }); // no roles claimed
+      holdForTest(t, open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' })); // no roles claimed
       const c = RingConsumer.open(name);
       // empty: consumer blocks until a late write. The write comes from a
       // worker producer (the segment was created without any role claim,
@@ -195,7 +195,7 @@ function registerTests(): void {
     }
   });
 
-  test('producer killed mid-reserve: nothing becomes visible', async () => {
+  test('producer killed mid-reserve: nothing becomes visible', async (t) => {
     const name = uniqueName();
     const child = forkChild('rb-producer-hold', name);
     try {
@@ -212,7 +212,7 @@ function registerTests(): void {
     const name2 = uniqueName();
     const child2 = forkChild('rb-producer-hold', name2);
     try {
-      open(name2, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' });
+      holdForTest(t, open(name2, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' }));
       await waitFor(child2, 'reserved');
       await new Promise((r) => setTimeout(r, 100));
       child2.kill('SIGKILL');
@@ -228,10 +228,10 @@ function registerTests(): void {
     }
   });
 
-  test('consumer killed mid-peek: message redelivered (at-least-once)', async () => {
+  test('consumer killed mid-peek: message redelivered (at-least-once)', async (t) => {
     const name = uniqueName();
     try {
-      open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' });
+      holdForTest(t, open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' }));
       const child = forkChild('rb-consumer-hold', name);
       // the child needs a producer first: write via a temporary producer role
       // that exits (role becomes claimable again after death)

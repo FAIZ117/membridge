@@ -23,30 +23,24 @@ after the owner pushes.
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
 | Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
 
-**Known issues on non-Linux (from the first CI runs, 2026-10-08 — the punch-list):**
+**Known issues on non-Linux (updated 2026-10-10):**
 
-- **macOS — cross-process wake is not delivered (U1, the blocker).** A waiter
-  parked in `os_sync_wait_on_address_with_timeout` never observes a peer
-  process's store + `os_sync_wake_by_address_all`: every cross-process
-  coordination test (`sync.notify` across processes, cross-process
-  `waitAsync`, mutex handoff timeouts) fails with the waiter timing out, while
-  same-process waits/wakes pass. Suspects, in order: the wake-flag pairing
-  (`OS_SYNC_WAKE_BY_ADDRESS_SHARED` vs the wait flag), the 6-argument timed
-  signature, `__builtin_available(macOS 14.4)` routing. Needs a macOS 14.4+
-  machine; CI iteration is ~10 min per round.
-- **macOS — `stat()` reports live rows as not-alive.** The native per-row
-  `CheckLiveness` (proc_pidinfo path) returns dead/unknown for the calling
-  process's own row. Under investigation alongside the sync work.
-- **Windows — suite hangs in worker-teardown paths** (Node 24/26; Node 22
-  completes). Suspect: spawned children outliving timed-out tests keep the
-  test file's event loop alive. Node 22's remaining failures concentrate
-  around unlink/re-open (Windows named sections are refcounted by handle —
-  re-opening a name whose old SABs still live reopens the same object; those
-  tests are now POSIX-gated) and `ownerDied` reporting.
+- **macOS: GREEN.** Node 22/24/26 pass the full suite on the runners
+  (2026-10-10, run `37974031646`). The failures found and fixed en route:
+  a store-less notify never resolved 'ok' (the os_sync wake return was
+  ignored — woken is 'ok' with or without a value change), shm descriptors
+  do not service read()/pread() (ReadHeader now reads through an mmap), a
+  zombie's proc_pidinfo returns zero bytes (that IS the dead verdict), and
+  a stale row carrying our pid with a foreign start is dead, not alive.
+- **Windows: experimental.** Node 22 completes with a small cross-process
+  cluster (role-claim settle, killed-consumer redelivery, stream tests);
+  Node 24/26 hang in worker-teardown paths and are cut off by the 25-minute
+  cap. Punch-list with hypotheses: docs/review/2026-10-10-experimental-handoff.md.
 - Fixed en route during these rounds: Windows compile (`SEMAPHORE_MODIFY_STATE`),
   the Linux-only S_ISREG guard (darwin shm fdstat is not S_IFREG), Windows
   `stat()` liveness losing FILETIME precision through a JS double, darwin
-  31-byte name compression in the test harness.
+  31-byte name compression in the test harness, whole-section mapping for
+  existing sections of a different size.
 
 **Correction (round 3, 2026-10-07):** the round-2 text below claimed "untimed
 parks in bounded slices" — an untimed `os_sync` park is not bounded, so on macOS

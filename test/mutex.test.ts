@@ -8,7 +8,7 @@ import { fork, spawnSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { open } from '../src/core';
 import { Mutex, MUTEX_DATA_BYTES, SLOT_LAYOUT } from '../src/mutex';
-import { assert, uniqueName, unlinkQuietly } from './helpers';
+import { assert, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core');
 const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
@@ -81,11 +81,11 @@ function makeDeadPid(): number {
 }
 
 function registerTests(): void {
-  test('mutual exclusion across 8 processes', async () => {
+  test('mutual exclusion across 8 processes', async (t) => {
     const mutexName = uniqueName();
     const dataName = uniqueName();
     const cycles = 50;
-    Mutex.open(mutexName);
+    holdForTest(t, Mutex.open(mutexName));
     const data = new Int32Array(open(dataName, 64));
     try {
       const children = Array.from({ length: 8 }, () =>
@@ -102,11 +102,11 @@ function registerTests(): void {
     }
   });
 
-  test('holder SIGKILLed -> steal + ownerDied', async () => {
+  test('holder SIGKILLed -> steal + ownerDied', async (t) => {
     const mutexName = uniqueName();
     const child = forkChild('mx-hold', mutexName);
     try {
-      Mutex.open(mutexName);
+      holdForTest(t, Mutex.open(mutexName));
       await waitFor(child, 'locked');
       await new Promise((r) => setTimeout(r, 100));
       child.kill('SIGKILL');
@@ -123,10 +123,10 @@ function registerTests(): void {
     }
   });
 
-  test('worker terminated while holding -> recovered via env-cleanup hook', async () => {
+  test('worker terminated while holding -> recovered via env-cleanup hook', async (t) => {
     const mutexName = uniqueName();
     try {
-      Mutex.open(mutexName);
+      holdForTest(t, Mutex.open(mutexName));
       const w = new Worker(
         `const { workerData } = require('worker_threads');
          const { Mutex } = require(workerData.pkg.replace(/core\\.js$/, 'mutex.js'));

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | State at handoff | `9ca9c50` (main; tag `v0.1.0` points here). **shm-bridge@0.1.0 is LIVE on npm** with verified SLSA provenance and 18 per-ABI prebuilds. |
-| In flight | CI `37974031646` + Release `37974034452` — round-4 fixes being verified. Linux gates green on every round; macOS/Windows run **non-blocking** (ci.yml `continue-on-error`), so these runs never block the release gate. |
+| In flight | CI `37974031646` finished: **macOS × 22/24/26 GREEN**, Linux green, Windows Node 22 red (R-B below), Windows 24/26 cancelled at the 25-min cap. |
 | Verified working | Linux (full matrix 22/24/26 + ASAN/UBSan + small-tmpfs + pack-and-install smoke), npm publish pipeline end-to-end (provenance signed, transparency log). |
 | Not verifiable locally | macOS and Windows — every item below is debugged through ~25-minute CI rounds. A local macOS (14.4+) and Windows box would compress this work enormously. |
 | Hygiene at handoff | `/dev/shm` clean, git tree clean, no secrets in the repo. `NPM_TOKEN` set on the repo (write-only). |
@@ -49,20 +49,15 @@ depends only on `test-linux` + `prebuilds`.
    on a corpse) → that IS the dead verdict; a short fill keeps pbi_status
    (zombie detection) and reports start −1 → kUnknown = never steal.
 
+## RESOLVED (was R-A) — macOS is GREEN
+
+**Verified 2026-10-10, run `37974031646`: macOS × Node 22/24/26 all pass the
+full suite.** The fixes that closed it: the mmap ReadHeader (shm descriptors
+don't service read/pread), the zero-info zombie verdict, the self-start
+compare in CheckLiveness, and the wake-semantics repair. No macOS items
+remain; keep the leg watched for flake regressions only.
+
 ## REMAINING issues, in priority order
-
-### R-A. macOS — stat() "segment too small" + zombie steal (tests 66/67/30)
-
-- **66/67**: should be FIXED by the mmap ReadHeader (round 4). If the
-  in-flight run still shows `segment too small`, the error now prints
-  `(<bytes> bytes read, object size <n>)` — use that to split between
-  "object is 0/rounded" (creator sizing) and "mapping refused".
-- **30 (Corr F4)**: should be FIXED by the zero-info zombie verdict. If still
-  `mutex lock timed out`: instrument `MutexOwnerAlive`'s verdict chain
-  (slot state → gen → CheckLiveness) with a debug env var
-  (`MEMBRIDGE_TEST_HOOKS`-style) and read which stage says "alive" for a
-  zombie on the runner. Next suspects after proc_pidinfo: the slot GEN
-  mismatch path (F13) racing the 250 ms slice.
 
 ### R-B. Windows Node 22 — the cross-process ring/role cluster
 
@@ -81,9 +76,6 @@ worker-teardown suspicion (worker `.terminate()` with native waiter threads)
 is documented in compat.md.
 
 ### R-C. macOS — remaining items after R-A
-
-- If 66/67 pass in the in-flight run, macOS is down to **zero known
-  failures** except flaky timing — re-check `test 30` across 2–3 runs.
 
 ## Release mechanics (unchanged)
 

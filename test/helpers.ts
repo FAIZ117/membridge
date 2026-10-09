@@ -39,6 +39,22 @@ export function makeTrackedName(t: TestContext): string {
   return name;
 }
 
+/**
+ * Keep `value` (a SAB, Mutex, or ring handle) reachable until the test ends.
+ * A segment is mapped only while something references it: on Windows the
+ * named section dies with its last handle (PLAN §5.4), and on every OS this
+ * process's attach row goes with the GC'd SAB. A creator whose open() result
+ * is discarded can be collected before a child or worker joins — the joiner
+ * then sees E_NOT_FOUND, or a fresh zeroed object. Hold every handle a later
+ * joiner, or an assertion about our attach row, depends on.
+ */
+export function holdForTest<T>(t: TestContext, value: T): T {
+  t.after(() => {
+    void value; // the hook's closure is the reference
+  });
+  return value;
+}
+
 export function unlinkQuietly(name: string): void {
   try {
     unlink(name);

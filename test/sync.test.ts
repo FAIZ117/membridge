@@ -12,7 +12,7 @@ import { fork, spawnSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { open, unlink } from '../src/core';
 import * as sync from '../src/sync';
-import { assert, uniqueName, unlinkQuietly, assertThrowsCode } from './helpers';
+import { assert, uniqueName, holdForTest, unlinkQuietly, assertThrowsCode } from './helpers';
 
 const PKG = require.resolve('../src/core');
 const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
@@ -140,11 +140,11 @@ function waitFor(child: ReturnType<typeof fork>, type: string, timeoutMs = 10000
 // ---- parent tests -----------------------------------------------------------
 
 function registerTests(): void {
-  test('F1 regression: sync.notify wakes a waiter in ANOTHER process well before its timeout', async () => {
+  test('F1 regression: sync.notify wakes a waiter in ANOTHER process well before its timeout', async (t) => {
     const name = uniqueName();
     const child = forkChild('sync-wait', name);
     try {
-      open(name, 4096);
+      holdForTest(t, open(name, 4096));
       await waitFor(child, 'ready');
       await new Promise((r) => setTimeout(r, 200)); // child is parked by now
       const i32 = new Int32Array(open(name, 4096));
@@ -158,11 +158,11 @@ function registerTests(): void {
     }
   });
 
-  test('cross-process waitAsync: muxed wake + timeout concurrently', async () => {
+  test('cross-process waitAsync: muxed wake + timeout concurrently', async (t) => {
     const name = uniqueName();
     const child = forkChild('async-mux', name);
     try {
-      open(name, 4096);
+      holdForTest(t, open(name, 4096));
       await waitFor(child, 'ready');
       await new Promise((r) => setTimeout(r, 200));
       const i32 = new Int32Array(open(name, 4096));
@@ -178,11 +178,11 @@ function registerTests(): void {
     }
   });
 
-  test('waitAsync does not consume libuv pool threads (UV_THREADPOOL_SIZE=1 child)', async () => {
+  test('waitAsync does not consume libuv pool threads (UV_THREADPOOL_SIZE=1 child)', async (t) => {
     const name = uniqueName();
     const child = forkChild('pool-starvation', name);
     try {
-      open(name, 4096);
+      holdForTest(t, open(name, 4096));
       const result = await waitFor(child, 'result', 15000);
       assert.ok(result.fsMs < 200, `fs.statSync took ${result.fsMs} ms while 6 waits pended`);
       assert.strictEqual(result.allTimedOut, true);
@@ -192,10 +192,10 @@ function registerTests(): void {
     }
   });
 
-  test('worker .terminate() with a pending waitAsync: teardown resolves, pin released', () => {
+  test('worker .terminate() with a pending waitAsync: teardown resolves, pin released', (t) => {
     const name = uniqueName();
     try {
-      open(name, 4096);
+      holdForTest(t, open(name, 4096));
       const r = spawnSync(process.execPath, ['--expose-gc', __filename], {
         env: { ...process.env, MEMBRIDGE_TEST_ROLE: 'terminate-pin', MEMBRIDGE_TEST_ARG: name },
         encoding: 'utf8',

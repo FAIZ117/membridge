@@ -11,7 +11,7 @@ import { Mutex, MUTEX_DATA_BYTES, SLOT_LAYOUT } from '../src/mutex';
 import { RingProducer, RingConsumer } from '../src/ringbuffer';
 import { list, reap, stat } from '../src/ops';
 import { MembridgeError } from '../src/errors';
-import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
+import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const CORE = require.resolve('../src/core');
 const MUTEX = require.resolve('../src/mutex');
@@ -47,10 +47,10 @@ function claimingWord(tag: number, pid: number): number {
 
 // ---- E4-1: close() during a pending lockAsync ---------------------------------
 
-test('E4-1: close() while lockAsync is pending rejects with E_CLOSED and never acquires', async () => {
+test('E4-1: close() while lockAsync is pending rejects with E_CLOSED and never acquires', async (t) => {
   const name = uniqueName();
   try {
-    Mutex.open(name);
+    holdForTest(t, Mutex.open(name));
     const holder = spawn(process.execPath, ['-e', `
       const {Mutex}=require(${JSON.stringify(MUTEX)});const m=Mutex.open(${JSON.stringify(name)});
       m.lock(); console.log('locked'); setTimeout(()=>{ m.unlock(); setTimeout(()=>process.exit(0), 50); }, 300);`],

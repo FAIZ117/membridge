@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { open, unlink } from '../src/core';
 import { capacity, stat, list, reap } from '../src/ops';
-import { assert, uniqueName, unlinkQuietly, buildHeader, shmPath, readStartTime } from './helpers';
+import { assert, uniqueName, holdForTest, unlinkQuietly, buildHeader, shmPath, readStartTime } from './helpers';
 
 const PKG = require.resolve('../src/core');
 const LINUX = process.platform === 'linux';
@@ -48,10 +48,10 @@ test('list(): magic-filtered; foreign files ignored', () => {
   }
 });
 
-test('stat(): kind, sizes, and our live attach row', () => {
+test('stat(): kind, sizes, and our live attach row', (t) => {
   const name = uniqueName();
   try {
-    open(name, 4096);
+    holdForTest(t, open(name, 4096));
     const st = stat(name);
     assert.strictEqual(st.kind, 'plain');
     assert.strictEqual(st.dataBytes, 4096);
@@ -63,13 +63,13 @@ test('stat(): kind, sizes, and our live attach row', () => {
   }
 });
 
-test('stat(): kind markers for mutex and ring segments', () => {
+test('stat(): kind markers for mutex and ring segments', (t) => {
   const mx = uniqueName();
   const rg = uniqueName();
   try {
-    open(mx, 2064, { kind: 'mutex' });
+    holdForTest(t, open(mx, 2064, { kind: 'mutex' }));
     assert.strictEqual(stat(mx).kind, 'mutex');
-    open(rg, 256 + 4096, { kind: 'ring' });
+    holdForTest(t, open(rg, 256 + 4096, { kind: 'ring' }));
     assert.strictEqual(stat(rg).kind, 'ring');
   } finally {
     unlinkQuietly(mx);
@@ -105,12 +105,12 @@ async function makeDeadIdentity(): Promise<{ pid: number; startTime: number }> {
   return { pid, startTime };
 }
 
-test('reap(): live attacher blocks; dead-only table reaps; dryRun reports', async () => {
+test('reap(): live attacher blocks; dead-only table reaps; dryRun reports', async (t) => {
   if (!LINUX) return;
   const live = uniqueName();
   const dead = uniqueName();
   try {
-    open(live, 256); // we are alive
+    holdForTest(t, open(live, 256)); // we are alive
     const res = reap({ name: live });
     assert.strictEqual(res[0]!.reaped, false, 'live attacher blocks the reap');
     assert.ok(list().includes(live), 'still there after a blocked reap');
@@ -167,13 +167,13 @@ function runChild(script: string, name: string): { status: number | null; stdout
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
-test('unlinkWhenUnused: the detaching process that empties the table unlinks', () => {
+test('unlinkWhenUnused: the detaching process that empties the table unlinks', (t) => {
   if (!LINUX) return; // asserts unlink visibility via /dev/shm (Linux paths)
   const parentName = uniqueName();
   const soleName = uniqueName();
   try {
     // parent holds an attach row: the child's flagged detach must NOT unlink
-    open(parentName, 4096);
+    holdForTest(t, open(parentName, 4096));
     const r = runChild(
       `
       const { open } = require(process.env.MEMBRIDGE_TEST_PKG);

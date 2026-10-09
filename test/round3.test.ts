@@ -11,7 +11,7 @@ import { open } from '../src/core';
 import { Mutex, MUTEX_DATA_BYTES, SLOT_LAYOUT } from '../src/mutex';
 import { RingProducer, RingConsumer, RING_HEADER_BYTES } from '../src/ringbuffer';
 import { stat } from '../src/ops';
-import { assert, assertThrowsCode, uniqueName, unlinkQuietly } from './helpers';
+import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const CORE = require.resolve('../src/core');
 const MUTEX = require.resolve('../src/mutex');
@@ -88,15 +88,15 @@ test('C1: a garbage-collected sibling does not release the holder\'s lock', () =
 
 // ---- C2: threads of one process never share a slot / overlap ---------------
 
-test('C2: concurrent worker claims get distinct slots and mutual exclusion holds', async () => {
+test('C2: concurrent worker claims get distinct slots and mutual exclusion holds', async (t) => {
   for (let round = 0; round < 4; round++) {
     const name = uniqueName();
     const flagName = uniqueName();
+    const workers: Worker[] = [];
     try {
-      Mutex.open(name);
+      holdForTest(t, Mutex.open(name));
       const flags = new Int32Array(open(flagName, 64, { mode: 'create' }));
       const N = 8;
-      const workers: Worker[] = [];
       const results: Array<Promise<{ overlaps: number }>> = [];
       for (let i = 0; i < N; i++) {
         const w = new Worker(
@@ -141,6 +141,9 @@ test('C2: concurrent worker claims get distinct slots and mutual exclusion holds
       for (const w of workers) w.postMessage('exit');
       await Promise.all(workers.map((w) => new Promise((r) => w.once('exit', r))));
     } finally {
+      // a failed assert above skips the 'exit' handshake; live workers would
+      // hold the file's event loop open until the runner's timeout
+      await Promise.all(workers.map((w) => w.terminate()));
       unlinkQuietly(name);
       unlinkQuietly(flagName);
     }
@@ -202,14 +205,14 @@ test('C3: processes reclaiming dead slots concurrently never overlap', { skip: P
 
 // ---- C4: ring role claims race between threads -------------------------------
 
-test('C4: exactly one of N racing worker threads becomes the consumer', async () => {
+test('C4: exactly one of N racing worker threads becomes the consumer', async (t) => {
   for (let round = 0; round < 40; round++) {
     const name = uniqueName();
+    const workers: Worker[] = [];
     try {
-      open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' });
+      holdForTest(t, open(name, RING_HEADER_BYTES + 4096, { kind: 'ring', mode: 'create' }));
       const barrier = new Int32Array(new SharedArrayBuffer(4));
       const N = 6;
-      const workers: Worker[] = [];
       const results: Array<Promise<string>> = [];
       for (let i = 0; i < N; i++) {
         const w = new Worker(
@@ -233,6 +236,7 @@ test('C4: exactly one of N racing worker threads becomes the consumer', async ()
       for (const w of workers) w.postMessage('exit');
       await Promise.all(workers.map((w) => new Promise((r) => w.once('exit', r))));
     } finally {
+      await Promise.all(workers.map((w) => w.terminate())); // see C2
       unlinkQuietly(name);
     }
   }

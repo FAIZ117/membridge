@@ -8,7 +8,7 @@ import { fork, spawn } from 'node:child_process';
 import { open, unlink } from '../src/core';
 import { RingProducer, RingConsumer } from '../src/ringbuffer';
 import { Mutex, MUTEX_DATA_BYTES } from '../src/mutex';
-import { assert, uniqueName, unlinkQuietly, buildHeader, shmPath } from './helpers';
+import { assert, uniqueName, holdForTest, unlinkQuietly, buildHeader, shmPath } from './helpers';
 
 const POSIX = process.platform === 'linux';  // /dev/shm byte-crafting + grow (darwin refuses, U2)
 const SKIP = 'needs Linux /dev/shm (byte-level crafting / grow policy)';
@@ -199,11 +199,11 @@ test('Corr F4: a SIGKILLed-but-unreaped (zombie) holder is stolen from', async (
   }
 });
 
-test('Corr F2: exited workers do not exhaust the 64-slot table', async () => {
+test('Corr F2: exited workers do not exhaust the 64-slot table', async (t) => {
   const { Mutex } = await import('../src/mutex');
   const name = uniqueName();
   try {
-    Mutex.open(name); // parent creates
+    holdForTest(t, Mutex.open(name)); // parent creates
     for (let i = 0; i < 70; i++) {
       // each worker claims a slot, locks+unlocks, and exits gracefully
       const r = await new Promise<number>((resolve, reject) => {
@@ -230,10 +230,10 @@ test('Corr F2: exited workers do not exhaust the 64-slot table', async () => {
   }
 });
 
-test('Corr F3: sequential workers with waitAsync all settle (no stale hub reuse)', async () => {
+test('Corr F3: sequential workers with waitAsync all settle (no stale hub reuse)', async (t) => {
   const name = uniqueName();
   try {
-    open(name, 4096);
+    holdForTest(t, open(name, 4096));
     for (let i = 0; i < 8; i++) {
       const r = await new Promise<{ resolvedAs: string }>((resolve, reject) => {
         const w = new (require('node:worker_threads').Worker)(
@@ -254,9 +254,13 @@ test('Corr F3: sequential workers with waitAsync all settle (no stale hub reuse)
   }
 });
 
-test('Corr F22: ownerDied is reported exactly once per death', async () => {
+test('Corr F22: ownerDied is reported exactly once per death', async (t) => {
   const { Mutex } = await import('../src/mutex');
   const name = uniqueName();
+  // Attach before the holder dies: on Windows a section whose only handle was
+  // the dead child's is destroyed with it, and the "steal" would create a
+  // fresh mutex (ownerDied false) instead of recovering the dead one.
+  holdForTest(t, Mutex.open(name));
   const { spawn } = require('node:child_process') as typeof import('node:child_process');
   const child = spawn(process.execPath, ['-e', `
     const { Mutex } = require(${JSON.stringify(require.resolve('../src/mutex'))});
@@ -343,10 +347,10 @@ test('Perf P4: short timeouts are not stretched to a 250 ms slice', async () => 
   }
 });
 
-test('Corr F30: ring join validates capacity and maxMessage against the header', () => {
+test('Corr F30: ring join validates capacity and maxMessage against the header', (t) => {
   const name = uniqueName();
   try {
-    RingProducer.open(name, { capacity: 4096 });
+    holdForTest(t, RingProducer.open(name, { capacity: 4096 }));
     assert.throws(() => RingProducer.open(name, { capacity: 8192 }), (e: any) =>
       e.code === 'E_SIZE_MISMATCH');
     assert.throws(
@@ -381,10 +385,10 @@ test('Corr F30: reserveAsync and peekAsync work end to end', async () => {
   }
 });
 
-test('R1: cross-process prefix / smaller-size opens work', { skip: process.platform === 'win32' ? 'Windows sections die with the last handle: the child exiting destroys the object before the parent opens (§5.4)' : false }, () => {
+test('R1: cross-process prefix / smaller-size opens work', (t) => {
   const name = uniqueName();
   try {
-    open(name, 8192, { mode: 'create' });
+    holdForTest(t, open(name, 8192, { mode: 'create' }));
     const { spawnSync } = require('node:child_process') as typeof import('node:child_process');
     const run = (code: string) =>
       spawnSync(process.execPath, ['-e', code], {

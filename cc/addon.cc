@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <uv.h>
+
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -145,12 +147,36 @@ bool GetProp(v8::Isolate* isolate, v8::Local<v8::Context> ctx, v8::Local<v8::Obj
   return o->Get(ctx, Str(isolate, key)).ToLocal(out);
 }
 
+// Reads the environment process.env writes to. Node sets process.env through
+// libuv (SetEnvironmentVariableW on Windows); the MSVC CRT's getenv() reads
+// its own startup copy and never sees those runtime sets, so the JS-side cap
+// check and this one disagreed on Windows. uv_os_getenv reads the same store
+// on every OS. False when unset.
+bool GetEnvVar(const char* key, std::string* out) {
+  char small[256];
+  size_t size = sizeof(small);
+  int r = uv_os_getenv(key, small, &size);
+  if (r == 0) {
+    out->assign(small, size);
+    return true;
+  }
+  if (r != UV_ENOBUFS) return false;
+  std::string big(size, '\0');  // size now includes the terminator
+  r = uv_os_getenv(key, &big[0], &size);
+  if (r != 0) return false;
+  big.resize(size);
+  *out = std::move(big);
+  return true;
+}
+
 double GetEnvMaxSegmentBytes() {
-  const char* env = std::getenv("MEMBRIDGE_MAX_SEGMENT_BYTES");
-  if (env == nullptr) return static_cast<double>(kDefaultMaxSegmentBytes);
+  std::string env;
+  if (!GetEnvVar("MEMBRIDGE_MAX_SEGMENT_BYTES", &env)) {
+    return static_cast<double>(kDefaultMaxSegmentBytes);
+  }
   char* end = nullptr;
-  const long long v = std::strtoll(env, &end, 10);
-  if (end == env || v <= 0) return static_cast<double>(kDefaultMaxSegmentBytes);
+  const long long v = std::strtoll(env.c_str(), &end, 10);
+  if (end == env.c_str() || v <= 0) return static_cast<double>(kDefaultMaxSegmentBytes);
   return static_cast<double>(v);
 }
 
@@ -596,8 +622,8 @@ void DebugFailAfterGrow(const v8::FunctionCallbackInfo<v8::Value>& args) {
   // Test-only fault injection (round-4 S4-14): inert unless the process was
   // started with MEMBRIDGE_TEST_HOOKS=1, so a shipped binary cannot be made
   // to fail opens by anything that loads the .node file directly.
-  const char* on = std::getenv("MEMBRIDGE_TEST_HOOKS");
-  if (on == nullptr || std::string(on) != "1") {
+  std::string on;
+  if (!GetEnvVar("MEMBRIDGE_TEST_HOOKS", &on) || on != "1") {
     ThrowError(args.GetIsolate(), "E_UNSUPPORTED",
                "test hooks are disabled (set MEMBRIDGE_TEST_HOOKS=1 in tests)");
   }

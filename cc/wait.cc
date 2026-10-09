@@ -178,6 +178,11 @@ struct WaitNode {
   bool onThread = false;
   bool cancelled = false;
   std::atomic<bool> delivered{false};  // exactly one pending-decrement per node
+#if defined(_WIN32)
+  // The word's semaphore, opened by StartAsyncWait on the caller's thread;
+  // the waiter thread takes ownership and closes it.
+  HANDLE sem = nullptr;
+#endif
 };
 
 void ResolveOnLoop(v8::Isolate* isolate, PromiseState& state, const char* result) {
@@ -323,16 +328,22 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   // Named-semaphore wait (§6): block on the word's semaphore in bounded
   // slices and re-check the word each wake — a missed/extra permit costs a
   // spurious wake, never correctness.
-  const std::wstring name = WordSemaphoreName(node->addr);
-  HANDLE sem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, name.c_str());
+  HANDLE sem = node->sem;
+  node->sem = nullptr;  // this thread owns it now
+  if (sem == nullptr) {
+    sem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, WordSemaphoreName(node->addr).c_str());
+  }
   if (sem == nullptr) {
     Deliver(node, Fulfill::kTimedOut);
     return;
   }
+  bool parked = false;
   for (;;) {
     if (node->cancelled) break;
     if (*node->addr != static_cast<int32_t>(node->expected)) {
-      Deliver(node, Fulfill::kNotEqual);  // §6 parity: differs before park = EAGAIN
+      // §6 parity: differs before any park = EAGAIN ('not-equal'); a change
+      // seen after a park is a wake whose permit we missed ('ok').
+      Deliver(node, parked ? Fulfill::kOk : Fulfill::kNotEqual);
       break;
     }
     DWORD slice = 250;
@@ -346,12 +357,12 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
     }
     const DWORD wr = WaitForSingleObject(sem, slice);
     if (node->cancelled) break;
+    parked = true;
     if (wr == WAIT_OBJECT_0) {
       // A permit IS a notify (§6): deliver 'ok' whether or not the word
       // changed — a store-less sync.notify must wake as 'ok'.
       Deliver(node, Fulfill::kOk);
       break;
-      // permit without the store landing (race, §6): loop and re-check
     } else if (wr == WAIT_TIMEOUT) {
       if (node->hasTimeout && NowMs() >= node->deadlineMs) {
         Deliver(node, Fulfill::kTimedOut);
@@ -655,9 +666,12 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
   HANDLE sem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, WordSemaphoreName(addr).c_str());
   if (sem == nullptr) return WaitResult::kTimedOut;
   WaitResult out = WaitResult::kTimedOut;
+  bool parked = false;
   for (;;) {
     if (*addr != static_cast<int32_t>(expected)) {
-      out = WaitResult::kNotEqual;
+      // differs before any park = 'not-equal' (§6, futex EAGAIN parity);
+      // after a park it is a wake whose permit we missed = 'ok'
+      out = parked ? WaitResult::kOk : WaitResult::kNotEqual;
       break;
     }
     DWORD slice = 250;
@@ -667,6 +681,7 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
       slice = static_cast<DWORD>(rem > 250 ? 250 : rem);
     }
     const DWORD wr = WaitForSingleObject(sem, slice);
+    parked = true;
     if (wr == WAIT_OBJECT_0) {
       // A permit IS a notify (§6): 'ok' with or without a value change.
       out = WaitResult::kOk;
@@ -796,6 +811,13 @@ bool StartAsyncWait(v8::Isolate* isolate, v8::Local<v8::Promise::Resolver> resol
   }
   WakeMux();
   if (onThread) {
+#if defined(_WIN32)
+    // Open the word's semaphore here, before waitAsync returns, not on the
+    // waiter thread: a notify landing before that thread is scheduled would
+    // otherwise find no semaphore and be dropped (SyncWake returns 0), losing
+    // a store-less wake. With the object open, its permit waits for us.
+    node->sem = CreateSemaphoreW(nullptr, 0, 0x7FFFFFFF, WordSemaphoreName(addr).c_str());
+#endif
     std::thread(WaitThreadMain, node).detach();
   }
   {

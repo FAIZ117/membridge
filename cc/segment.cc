@@ -518,16 +518,29 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     }
     objSize = static_cast<long long>(st.st_size);
   }
-  // lseek + read, NOT pread: macOS shm descriptors return EOF (0) for pread
-  // on a non-empty object (diagnosed via the too-small error's object size —
-  // the object was fully sized while every pread read 0 bytes).
+  // Read the header THROUGH A MAPPING: macOS shm descriptors do not service
+  // read()/pread() at all (both return EOF on a fully sized object — the
+  // earlier diagnostic read 0 bytes of a 32 KiB object), while mmap of the
+  // same descriptor is exactly how the rest of this library accesses it.
   uint8_t buf[64 * 1024];
   ssize_t total = 0;
-  if (::lseek(fd, 0, SEEK_SET) == 0) {
-    while (total < static_cast<ssize_t>(sizeof(buf))) {
-      const ssize_t n = ::read(fd, buf + static_cast<size_t>(total),
-                               sizeof(buf) - static_cast<size_t>(total));
-      if (n <= 0) break;
+  if (objSize > 0) {
+    const size_t mapBytes =
+        objSize > static_cast<long long>(sizeof(buf)) ? sizeof(buf) : static_cast<size_t>(objSize);
+    void* view = ::mmap(nullptr, mapBytes, PROT_READ, MAP_SHARED, fd, 0);
+    if (view != MAP_FAILED) {
+      std::memcpy(buf, view, mapBytes);
+      total = static_cast<ssize_t>(mapBytes);
+      ::munmap(view, mapBytes);
+    }
+  }
+  if (total < static_cast<ssize_t>(sizeof(buf))) {
+    // POSIX fallback (and Linux, where read works fine): lseek + read.
+    ssize_t n = 0;
+    while (total < static_cast<ssize_t>(sizeof(buf)) &&
+           (n = ::pread(fd, buf + static_cast<size_t>(total),
+                        sizeof(buf) - static_cast<size_t>(total),
+                        static_cast<off_t>(total))) > 0) {
       total += n;
     }
   }

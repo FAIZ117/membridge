@@ -199,12 +199,20 @@ namespace {
 bool ReadBsdInfo(int32_t pid, int64_t* outStartUs, bool* outZombie) {
   proc_bsdinfo info{};
   const int r = static_cast<int>(proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)));
-  if (r <= 0) return false;  // call failed / process gone: unknown
+  if (r == 0) {
+    // The kernel returned NO info for a pid that kill() says exists: the
+    // process has exited (an unreaped zombie corpse carries no BSD info).
+    // That is exactly the §7.1 dead verdict the steal path needs.
+    *outStartUs = 0;
+    *outZombie = true;
+    return true;
+  }
+  if (r < 0) return false;  // call error (EPERM/…): unknown, never steal
   if (r < static_cast<int>(sizeof(info))) {
-    // Short fill (older runtime / zombie corpse): pbi_status (@4) is still
-    // valid, the deep start fields may not be. A zombie is DEAD regardless
-    // of start; a live short read reports an unknown start (never a fake
-    // mismatch) for CheckLiveness to map to kUnknown = never steal.
+    // Short fill (older runtime): pbi_status (@4) is still valid; the deep
+    // start fields may not be. A short-filled zombie is dead; a live short
+    // read reports an unknown start (never a fake mismatch) so CheckLiveness
+    // maps it to kUnknown = never steal.
     if (info.pbi_status == SZOMB) {
       *outZombie = true;
       *outStartUs = 0;

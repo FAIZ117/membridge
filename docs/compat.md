@@ -32,10 +32,20 @@ after the owner pushes.
   do not service read()/pread() (ReadHeader now reads through an mmap), a
   zombie's proc_pidinfo returns zero bytes (that IS the dead verdict), and
   a stale row carrying our pid with a foreign start is dead, not alive.
-- **Windows: experimental.** Node 22 completes with a small cross-process
-  cluster (role-claim settle, killed-consumer redelivery, stream tests);
-  Node 24/26 hang in worker-teardown paths and are cut off by the 25-minute
-  cap. Punch-list with hypotheses: docs/review/2026-10-10-experimental-handoff.md.
+- **Windows: GREEN.** Node 22/24/26 pass the full suite on the runners
+  (2026-10-10, run `37977949293`: 91 pass, 0 fail, 32 POSIX-only skips).
+  The root of the cross-process cluster and the Node 24/26 hangs was test
+  lifetime, not the library: a named section dies with its last handle
+  (§5.4), so a creator whose SAB was garbage-collected took the object with
+  it before children/workers joined (they saw `E_NOT_FOUND` or a fresh
+  zeroed section; a failed assert then left workers pinning the event
+  loop). **Users: on Windows, keep the creator's SAB (or Mutex/ring handle)
+  reachable for as long as the segment must exist** — POSIX names persist
+  until `unlink`, Windows names do not. Library fixes found en route: a
+  change seen after a park is `'ok'` (not `'not-equal'`), `waitAsync`
+  registers before returning (no lost store-less wake), and
+  `MEMBRIDGE_MAX_SEGMENT_BYTES` set via `process.env` at runtime is honoured
+  natively (read through libuv, not the CRT's startup copy).
 - Fixed en route during these rounds: Windows compile (`SEMAPHORE_MODIFY_STATE`),
   the Linux-only S_ISREG guard (darwin shm fdstat is not S_IFREG), Windows
   `stat()` liveness losing FILETIME precision through a JS double, darwin

@@ -57,25 +57,23 @@ don't service read/pread), the zero-info zombie verdict, the self-start
 compare in CheckLiveness, and the wake-semantics repair. No macOS items
 remain; keep the leg watched for flake regressions only.
 
-## REMAINING issues, in priority order
+## RESOLVED (was R-B) — Windows is GREEN
 
-### R-B. Windows Node 22 — the cross-process ring/role cluster
+**Verified 2026-10-10, run `37977949293`: Windows × Node 22/24/26 all pass
+the full suite (91 pass, 0 fail, 32 POSIX-only skips).** The R-B hypotheses
+above were wrong; the real causes:
 
-| Test | Symptom | Working hypothesis |
+| Test | Real cause | Fix |
 |---|---|---|
-| `round3.test.js` (whole file) | times out at 120 s | ONE of its tests hangs — run the file alone (`node --test dist/test/round3.test.js`) and bisect; prime suspect C4's role-claim settle loop (`cc/mutex.cc` ClaimRoleLocked → the P4-4 unique_lock settle) |
-| C4 (91) | N racing workers, exactly one consumer | same settle loop, or the role-word CAS losing forever on Windows semaphore timing |
-| 84 / 80 | consumer killed mid-peek / cross-process stream | the Windows waiter-thread path: `WaitThreadMain` `_WIN32` branch — check the semaphore permit bookkeeping after the round-1 kOk change (a permit consumed by a waiter that then loops without clearing may starve the next waiter) |
-| 54 | 8-process join race | possibly cascading from 80/84 (shared fixture), else Windows `CreateFileMappingW` ALREADY_EXISTS race in OpenSegment |
-| 33 (F22) | ownerDied reported once — `false !== true` | the stealer acquired WITHOUT the steal path: on Windows `MutexOwnerAlive` for the killed holder may report alive (OpenProcess succeeds on a terminated-but-referenced process and GetExitCodeProcess returns the exit code only after termination is FULLY complete — add a small retry or treat `GetExitCodeProcess != STILL_ACTIVE` with a second confirmation read) |
-| 9 | size validation | the env-lift test (`core.test.ts` ~121) is only gated on MEMBRIDGE_TEST_TMPFS — on Windows CI it opens 256 MiB+1 for real; gate on `process.platform !== 'win32'` too, or verify the pagefile section actually maps |
+| 54, 80, 84, 91 (C4), 120 | the creator's discarded `open()` SAB was GC'd; a Windows section dies with its last handle, so joiners saw `E_NOT_FOUND` / a fresh zeroed object | `holdForTest(t, …)` in test/helpers.ts at every creator a later joiner depends on (`5b799aa`/`08bad9b`) |
+| 33 (F22) | same lifetime issue: the dead child held the only handle, so the "steal" created a fresh mutex (`ownerDied` false) | parent attaches before the holder dies |
+| `round3.test.js` 120 s / Node 24/26 hangs | C4's failed assert skipped the worker exit handshake; live workers pinned the loop | C2/C4 terminate workers in `finally` |
+| 9 | native cap read the CRT `getenv`, which never sees runtime `process.env` sets on Windows | env read via `uv_os_getenv` (`cc/addon.cc`) |
+| 122 / 118 (found after the above) | a change seen after a park returned `'not-equal'`; an async wait's semaphore was created only once its thread ran, dropping an earlier store-less notify | `parked` tracking in both Windows wait paths; semaphore opened in StartAsyncWait (`49f9fca`) |
+| R1 | was skipped on Windows for the same misdiagnosed reason | un-skipped; passes |
 
-Windows Node 24/26: whole-file hangs (25-min cap cancels them) — bisect with
-the Node 22 file-alone approach once the cluster above is understood; the
-worker-teardown suspicion (worker `.terminate()` with native waiter threads)
-is documented in compat.md.
-
-### R-C. macOS — remaining items after R-A
+Watch only: Perf P4 (`lock({timeoutMs:10})` took 212 ms once on Node 24,
+passed on the rerun) — runner scheduling jitter, not reproduced.
 
 ## Release mechanics (unchanged)
 

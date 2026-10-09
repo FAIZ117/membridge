@@ -381,7 +381,7 @@ test('Corr F30: reserveAsync and peekAsync work end to end', async () => {
   }
 });
 
-test('R1: cross-process prefix / smaller-size opens work', () => {
+test('R1: cross-process prefix / smaller-size opens work', { skip: process.platform === 'win32' ? 'Windows sections die with the last handle: the child exiting destroys the object before the parent opens (§5.4)' : false }, () => {
   const name = uniqueName();
   try {
     open(name, 8192, { mode: 'create' });

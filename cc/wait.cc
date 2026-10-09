@@ -78,21 +78,24 @@ namespace membridge {
 
 #if defined(__APPLE__)
 namespace {
-// One bounded park on `addr` while it holds `expected` (macOS). Returns false
-// when os_sync is unavailable — the caller then sleeps its back-off instead.
-// Wakes, value changes and timeouts are all re-checked by the caller.
-bool OsSyncPark(int32_t* addr, uint32_t expected, double sliceMs) {
+// One bounded park on `addr` while it holds `expected` (macOS). The return
+// distinguishes WOKEN (os_sync returned 0 — a wake landed, with or without a
+// value change; a notify-only wake MUST surface as 'ok', §6) from
+// Parked/Spurious (timeout or spurious return — the caller re-checks the word
+// and deadline) and Unavailable (os_sync unusable — the caller back-offs).
+enum class ParkResult { kWoken, kParked, kUnavailable };
+ParkResult OsSyncPark(int32_t* addr, uint32_t expected, double sliceMs) {
 #if defined(MEMBRIDGE_HAVE_OS_SYNC)
   if (__builtin_available(macOS 14.4, *)) {
     const uint64_t ns = sliceMs <= 0 ? 1000 : static_cast<uint64_t>(sliceMs * 1e6);
-    os_sync_wait_on_address_with_timeout(addr, static_cast<uint64_t>(expected), sizeof(int32_t),
-                                         OS_SYNC_WAIT_ON_ADDRESS_SHARED,
-                                         OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
-    return true;
+    const int r = os_sync_wait_on_address_with_timeout(
+        addr, static_cast<uint64_t>(expected), sizeof(int32_t),
+        OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
+    return r == 0 ? ParkResult::kWoken : ParkResult::kParked;
   }
 #endif
   (void)addr; (void)expected; (void)sliceMs;
-  return false;
+  return ParkResult::kUnavailable;
 }
 
 int OsSyncWakeAll(int32_t* addr) {
@@ -329,7 +332,7 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
   for (;;) {
     if (node->cancelled) break;
     if (*node->addr != static_cast<int32_t>(node->expected)) {
-      Deliver(node, Fulfill::kOk);
+      Deliver(node, Fulfill::kNotEqual);  // §6 parity: differs before park = EAGAIN
       break;
     }
     DWORD slice = 250;
@@ -344,10 +347,10 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
     const DWORD wr = WaitForSingleObject(sem, slice);
     if (node->cancelled) break;
     if (wr == WAIT_OBJECT_0) {
-      if (*node->addr != static_cast<int32_t>(node->expected)) {
-        Deliver(node, Fulfill::kOk);
-        break;
-      }
+      // A permit IS a notify (§6): deliver 'ok' whether or not the word
+      // changed — a store-less sync.notify must wake as 'ok'.
+      Deliver(node, Fulfill::kOk);
+      break;
       // permit without the store landing (race, §6): loop and re-check
     } else if (wr == WAIT_TIMEOUT) {
       if (node->hasTimeout && NowMs() >= node->deadlineMs) {
@@ -360,12 +363,15 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
 #elif defined(__APPLE__)
   // macOS (U1, unverified locally): timed os_sync parks in bounded slices
   // (14.4+), else a bounded exponential back-off poll (50 us -> 2 ms). Every
-  // pass re-checks cancellation, the word and the deadline.
+  // pass re-checks cancellation, the word and the deadline. §6 parity with
+  // the Linux paths: a WOKEN park resolves 'ok' (notify with or without a
+  // value change), a value that already differs before any park resolves
+  // 'not-equal' (the futex EAGAIN case).
   double delayUs = 50;
   for (;;) {
     if (node->cancelled) break;  // resolved by the teardown hook
     if (*node->addr != static_cast<int32_t>(node->expected)) {
-      Deliver(node, Fulfill::kOk);
+      Deliver(node, Fulfill::kNotEqual);
       break;
     }
     double sliceMs = 250;
@@ -377,7 +383,12 @@ void WaitThreadMain(std::shared_ptr<WaitNode> node) {
       }
       if (rem < sliceMs) sliceMs = rem;
     }
-    if (!OsSyncPark(node->addr, static_cast<uint32_t>(node->expected), sliceMs)) {
+    const ParkResult pr = OsSyncPark(node->addr, static_cast<uint32_t>(node->expected), sliceMs);
+    if (pr == ParkResult::kWoken) {
+      Deliver(node, Fulfill::kOk);
+      break;
+    }
+    if (pr == ParkResult::kUnavailable) {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
     }
@@ -622,8 +633,14 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
       if (rem <= 0) return WaitResult::kTimedOut;
       if (rem < sliceMs) sliceMs = rem;
     }
-    if (OsSyncPark(addr, expected, sliceMs)) {
-      parked = true;
+    const ParkResult pr = OsSyncPark(addr, expected, sliceMs);
+    if (pr == ParkResult::kWoken) {
+      // A wake lands as 'ok' whether or not the word changed (§6: notify is
+      // a signal in its own right).
+      return parked ? WaitResult::kOk : WaitResult::kOk;
+    }
+    if (pr == ParkResult::kParked) {
+      parked = true;  // slice timeout or spurious: re-check word + deadline
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int64_t>(delayUs)));
       if (delayUs < 2000) delayUs *= 2;
@@ -650,7 +667,8 @@ WaitResult SyncWait(int32_t* addr, uint32_t expected, double timeoutMs) {
       slice = static_cast<DWORD>(rem > 250 ? 250 : rem);
     }
     const DWORD wr = WaitForSingleObject(sem, slice);
-    if (wr == WAIT_OBJECT_0 && *addr != static_cast<int32_t>(expected)) {
+    if (wr == WAIT_OBJECT_0) {
+      // A permit IS a notify (§6): 'ok' with or without a value change.
       out = WaitResult::kOk;
       break;
     }

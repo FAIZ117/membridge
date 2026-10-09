@@ -219,6 +219,7 @@ Identity SelfIdentity() {
 // zombie = dead (it answers kill(pid,0) until reaped); start mismatch = dead.
 Liveness CheckLiveness(const Identity& id) {
   if (id.pid <= 0) return Liveness::kDead;
+  if (id.pid == static_cast<int32_t>(getpid())) return Liveness::kAlive;  // self is trivially alive
   if (id.startTime < 0) return Liveness::kUnknown;
   if (kill(static_cast<pid_t>(id.pid), 0) != 0 && errno == ESRCH) return Liveness::kDead;
   int64_t start = -1;

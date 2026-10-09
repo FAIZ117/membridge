@@ -157,14 +157,21 @@ SegmentHandle OpenSegment(v8::Isolate* isolate, const std::string& name, const O
     CloseHandle(section);
     ThrowError(isolate, "E_EXISTS", "segment already exists", name);
   }
+  // An EXISTING section may have been created with a different size (a
+  // different kind or a racing opener) — a view larger than the section is
+  // refused by the kernel (ACCESS_DENIED, which surfaced as a misleading
+  // E_SYSTEM in the kind-mismatch path). Map the WHOLE existing section and
+  // let the header's kind/size checks below throw the real errors.
+  const bool mapWhole = wholeObject || exists;
   void* base = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0,
-                             wholeObject ? 0 : static_cast<SIZE_T>(requestedTotal));
+                             mapWhole ? 0 : static_cast<SIZE_T>(requestedTotal));
   if (base == nullptr) {
+    const int e = static_cast<int>(GetLastError());
     CloseHandle(section);
-    ThrowSystemError(isolate, "MapViewOfFile", static_cast<int>(GetLastError()), name);
+    ThrowSystemError(isolate, "MapViewOfFile", e, name);
   }
   size_t mapped = static_cast<size_t>(requestedTotal);
-  if (wholeObject) {
+  if (mapWhole) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(base, &mbi, sizeof(mbi)) != 0) {
       mapped = static_cast<size_t>(mbi.RegionSize);

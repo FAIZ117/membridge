@@ -103,7 +103,8 @@ test('unlink removes the name; re-open creates a fresh segment', { skip: process
 });
 
 test('unlink of a missing segment throws E_NOT_FOUND', () => {
-  assertThrowsCode(() => unlink('/membridge-test-definitely-missing-zz'), 'E_NOT_FOUND');
+  // fresh uniqueName: never exists, and short enough for the darwin limit
+  assertThrowsCode(() => unlink(uniqueName()), 'E_NOT_FOUND');
 });
 
 test('size validation: 2^32+16, 1.9, -1, 0, NaN, > cap -> E_SIZE_INVALID', () => {

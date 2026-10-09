@@ -155,19 +155,20 @@ bool GetProp(v8::Isolate* isolate, v8::Local<v8::Context> ctx, v8::Local<v8::Obj
 // check and this one disagreed on Windows. uv_os_getenv reads the same store
 // on every OS. False when unset.
 bool GetEnvVar(const char* key, std::string* out) {
-  char small[256];
-  size_t size = sizeof(small);
-  int r = uv_os_getenv(key, small, &size);
+  // (not "small": rpcndr.h, via windows.h, #defines small as char)
+  char stackBuf[256];
+  size_t size = sizeof(stackBuf);
+  int r = uv_os_getenv(key, stackBuf, &size);
   if (r == 0) {
-    out->assign(small, size);
+    out->assign(stackBuf, size);
     return true;
   }
   if (r != UV_ENOBUFS) return false;
-  std::string big(size, '\0');  // size now includes the terminator
-  r = uv_os_getenv(key, &big[0], &size);
+  std::string heapBuf(size, '\0');  // size now includes the terminator
+  r = uv_os_getenv(key, &heapBuf[0], &size);
   if (r != 0) return false;
-  big.resize(size);
-  *out = std::move(big);
+  heapBuf.resize(size);
+  *out = std::move(heapBuf);
   return true;
 }
 

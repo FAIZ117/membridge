@@ -504,6 +504,7 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     }
     ThrowSystemError(isolate, "shm_open", errno, name);
   }
+  long long objSize = -1;
   {
     struct stat st{};
     // S_ISREG is a Linux-only gate — see the matching note in OpenSegment.
@@ -515,6 +516,7 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
       ::close(fd);
       ThrowError(isolate, "E_INCOMPATIBLE", "segment name refers to a non-regular file", name);
     }
+    objSize = static_cast<long long>(st.st_size);
   }
   uint8_t buf[64 * 1024];
   ssize_t total = 0;
@@ -526,11 +528,11 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   }
   ::close(fd);
   if (total < 32) {
-    struct stat st2{};
-    const long long sz = (::fstat(fd, &st2) == 0) ? static_cast<long long>(st2.st_size) : -1;
+    // objSize (from the fstat above, pre-close) vs bytes actually read: on
+    // macOS this pair diagnosed a sized object whose reads return EOF.
     ThrowError(isolate, "E_INCOMPATIBLE",
                "segment too small for a membridge header (" + std::to_string(total) +
-                   " bytes read, size " + std::to_string(sz) + ")",
+                   " bytes read, object size " + std::to_string(objSize) + ")",
                name);
   }
   uint32_t headerBytes;

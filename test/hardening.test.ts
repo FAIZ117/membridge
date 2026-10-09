@@ -570,14 +570,23 @@ test('R14: peekAsync wakes in milliseconds when the producer commits', async () 
   try {
     const p = RingProducer.open(name, { capacity: 4096 });
     const c = RingConsumer.open(name);
-    const t0 = performance.now();
-    const msgP = c.peekAsync({ timeoutMs: 5000 });
-    await new Promise((r) => setTimeout(r, 20));  // consumer is parked
-    p.write(Buffer.from('async wake'));
-    const msg = await msgP;
-    const ms = performance.now() - t0;
-    assert.strictEqual(Buffer.from(msg!).toString(), 'async wake');
-    assert.ok(ms < 150, `async wake took ${ms.toFixed(1)} ms (slice-bound = flagless wait)`);
+    // A flagless wait sleeps the full 250 ms slice in EVERY round (mutation-
+    // checked); scheduling noise — a ~190 ms Windows Server quantum spent
+    // ready behind a parallel file's spinning workers — does not. Judge the
+    // best round, not one sample.
+    const samples: number[] = [];
+    for (let round = 0; round < 5; round++) {
+      const t0 = performance.now();
+      const msgP = c.peekAsync({ timeoutMs: 5000 });
+      await new Promise((r) => setTimeout(r, 20));  // consumer is parked
+      p.write(Buffer.from('async wake'));
+      const msg = await msgP;
+      samples.push(performance.now() - t0);
+      assert.strictEqual(Buffer.from(msg!).toString(), 'async wake');
+      c.release();
+    }
+    assert.ok(Math.min(...samples) < 150,
+      `async wake never under 150 ms (slice-bound = flagless wait): ${samples.map((s) => s.toFixed(1)).join(', ')}`);
   } finally {
     unlinkQuietly(name);
   }

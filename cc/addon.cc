@@ -3,11 +3,13 @@
 // init protocol, BackingStore windows (§5). Native throws are NativeError
 // (shm_bridge.h) caught at each entry point — they never cross V8 frames.
 
-// uv.h first: on Windows it pulls in winsock2.h, which must precede the
-// <windows.h> that header.h includes (else winsock.h redefines every type).
+// Windows include order (same as wait.cc): node/V8 headers BEFORE windows.h —
+// its min/max macros break std::numeric_limits<...>::max() in older V8
+// headers (Node 22.0.0, C2589) — then uv.h, whose winsock2.h must precede the
+// <windows.h> header.h includes (else winsock.h redefines every type).
+#include "shm_bridge.h"
 #include <uv.h>
 
-#include "shm_bridge.h"
 #include "header.h"
 #include "liveness.h"
 #include "mutex.h"

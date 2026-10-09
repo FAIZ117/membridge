@@ -19,12 +19,12 @@ npm install shm-bridge
 Prebuilds ship for Linux (x64/arm64 glibc, x64 musl), macOS (arm64/x64) and
 Windows (x64), per Node ABI (22/24/26). A source build via `node-gyp` is the
 
-> **Platform status (v0.1.0):** Linux is the verified platform — the full
+> **Platform status (v0.2.0):** Linux is the verified platform — the full
 > test matrix, ASAN/UBSan and the cross-process integration tests gate every
-> commit there. macOS and Windows build and run, but are **experimental** in
-> this release: cross-process wake on macOS and some worker-teardown paths on
-> Windows are still being fixed — see "Known issues on non-Linux" in
-> [docs/compat.md](./docs/compat.md) before relying on them.
+> commit there. macOS and Windows now pass the full suite on CI (Node
+> 22/24/26) but are still **experimental**: their CI legs do not yet gate a
+> release. Platform differences (no `grow` on either; Windows sections die
+> with their last handle) are in [docs/compat.md](./docs/compat.md).
 fallback (needs a C++20 toolchain). The loader is
 [`node-gyp-build`](https://www.npmjs.com/package/node-gyp-build); the only
 runtime dependency.
@@ -63,7 +63,7 @@ interface OpenOptions {
 }
 ```
 
-- Sizes are validated as safe integers (≥ 1, ≤ `MEMBRIDGE_MAX_SEGMENT_BYTES`,
+- Sizes are validated as safe integers (≥ 1, ≤ `SHM_BRIDGE_MAX_SEGMENT_BYTES`,
   default 256 MiB). `exact` mismatches throw `E_SIZE_MISMATCH`; `at-least`
   maps a prefix; `grow` extends the segment POSIX-only (Windows:
   `E_GROW_UNSUPPORTED`).
@@ -71,7 +71,7 @@ interface OpenOptions {
   arrives while the creator is initializing waits (bounded by
   `initTimeoutMs`); if the creator died, the joiner takes over.
 - Without the native addon, `open` throws `E_NATIVE_UNAVAILABLE` unless you
-  opt into the fallback (`MEMBRIDGE_ALLOW_FALLBACK=1` or `allowFallback:
+  opt into the fallback (`SHM_BRIDGE_ALLOW_FALLBACK=1` or `allowFallback:
   true`). The fallback is **this process only** — using it as if it were
   shared memory is a production bug waiting to happen.
 
@@ -180,7 +180,7 @@ open(name, n, { unlinkWhenUnused: true }); // last detacher unlinks
 
 ## Errors
 
-Everything throws `MembridgeError` with a `code` (`E_SIZE_MISMATCH`,
+Everything throws `ShmBridgeError` with a `code` (`E_SIZE_MISMATCH`,
 `E_ROLE_TAKEN`, `E_DEADLOCK`, `E_NO_SPACE`, `E_TOO_MANY_WAITERS`, `E_CLOSED`, …) and
 structured fields (`segmentName`, `requested`, `existing`, `syscall`,
 `errno`). The full list lives in [PLAN.md §10](./PLAN.md).

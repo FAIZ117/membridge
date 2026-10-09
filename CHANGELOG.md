@@ -1,7 +1,57 @@
 # Changelog
 
-All notable changes to membridge are documented here. The format follows
+All notable changes to shm-bridge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versioning follows SemVer.
+
+## [0.2.0] — 2026-10-10
+
+macOS and Windows now pass the full suite on CI (Node 22/24/26, run
+`37977949293`): Windows 91 pass / 0 fail (32 POSIX-only skips), macOS and
+Linux green. Their CI legs stay non-gating for now; Linux still gates the
+publish.
+
+### Breaking — one name everywhere: shm-bridge
+The package's former codename is gone from the API, the environment and the
+on-memory format:
+- Error class `ShmBridgeError` (with `ShmBridgeErrorCode`,
+  `ShmBridgeErrorFields`, `isShmBridgeErrorCode`); `err.name` is
+  `'ShmBridgeError'`. Error **codes** (`E_*`) are unchanged.
+- Environment variables use the `SHM_BRIDGE_` prefix:
+  `SHM_BRIDGE_MAX_SEGMENT_BYTES`, `SHM_BRIDGE_ALLOW_FALLBACK`.
+- Segment header magic is `"SHMB"` and Windows object names use the
+  `Local\shm-bridge` prefix. **A 0.1.x process and a 0.2.0 process cannot
+  share a live segment**: 0.2.0 rejects a 0.1.x header with
+  `E_INCOMPATIBLE` (on Windows the two simply see different objects).
+  Upgrade every participant together, and recreate persistent POSIX segments.
+
+### Fixed — macOS
+- `sync.notify` without a store now wakes a waiter as `'ok'` (the
+  `os_sync` wake result was ignored, leaving the waiter parked to timeout).
+- Header reads go through an mmap: macOS shm descriptors return EOF to
+  `read()`/`pread()` on a fully sized object (`stat()` and joins failed
+  with "segment too small").
+- Liveness: `proc_pidinfo` short fills are tolerated (unknown = never
+  steal), a zombie's zero-byte reply is the dead verdict (dead-holder steal
+  works), and a stale row with our pid but a foreign start time is dead.
+
+### Fixed — Windows
+- `sync.notify` without a store wakes as `'ok'`; a value change seen after
+  a park is `'ok'`, not `'not-equal'` (§6 parity with the futex path).
+- `waitAsync` registers its wait before returning, so a notify that lands
+  before the waiter thread is scheduled is no longer lost.
+- Opening an existing section with a different size/kind maps the whole
+  section and reports the real `E_INCOMPATIBLE`/`E_SIZE_MISMATCH` instead
+  of a misleading `E_SYSTEM`.
+- `SHM_BRIDGE_MAX_SEGMENT_BYTES` set at runtime via `process.env` is now
+  honoured by the native layer (the MSVC CRT `getenv` never saw it; env is
+  read through libuv on every OS).
+
+### Tests
+- Creator handles are held for the test's duration (`holdForTest`): on
+  Windows a section dies with its last handle, so a garbage-collected
+  creator SAB made later joiners see `E_NOT_FOUND` or a fresh object. This
+  was the root of the Windows cross-process failures and of the Node 24/26
+  hangs (workers left alive after a failed assert).
 
 ## [0.1.0] — 2026-10-08
 
@@ -12,8 +62,8 @@ First published release. Implemented on `main` (M1–M8, see
   shared memory with a crash-safe mapping registry (M1/M2)
 - Hardened core segments — header page with init protocol and attach table,
   size policies (`exact`/`at-least`/`grow`), posix_fallocate reserve,
-  typed `MembridgeError`s, opt-in in-process fallback (M2)
-- Cross-process wait/notify via `membridge/sync` — shared futexes on Linux,
+  typed `ShmBridgeError`s, opt-in in-process fallback (M2)
+- Cross-process wait/notify via `shm-bridge/sync` — shared futexes on Linux,
   `futex_waitv` multiplexer thread, `os_sync`/semaphore paths for
   macOS/Windows (M3)
 - Crash-safe Mutex — single-word token CAS, dead-holder steal with
@@ -92,7 +142,7 @@ handoff and verification guide: [docs/review/2026-10-07T1349-round3-fixes.md].
   mid-claim waits up to 100 ms for it to settle instead of failing fast; the
   registry's mapping list is pruned on every insert.
 - **API**: new error code `E_CLOSED`; mutex/ring `timeoutMs` errors are
-  `E_NAME_INVALID` (matching `membridge/sync` and PLAN §7.3).
+  `E_NAME_INVALID` (matching `shm-bridge/sync` and PLAN §7.3).
 
 ### Round-4 fix round (2026-10-07)
 
@@ -122,7 +172,7 @@ guide: [docs/review/2026-10-07T1753-round4-fixes.md].
 - **Registry**: `unlinkWhenUnused` is honoured on reuse and non-owner
   mappings (E4-8); a raw open no longer displaces a typed entry (E4-10).
 - **Packaging**: the fault-injection hook is inert unless
-  `MEMBRIDGE_TEST_HOOKS=1`; compiled tests are no longer shipped (S4-14).
+  `SHM_BRIDGE_TEST_HOOKS=1`; compiled tests are no longer shipped (S4-14).
 
 ### Release process
 

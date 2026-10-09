@@ -1,6 +1,6 @@
 {
   "name": "shm-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-process shared memory for Node.js \u2014 SharedArrayBuffer over OS shared memory, plus a crash-safe Mutex, zero-copy RingBuffer, and ops utilities",
   "license": "MIT",
   "author": "Faiz",

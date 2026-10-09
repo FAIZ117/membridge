@@ -337,10 +337,20 @@ test('Perf P4: short timeouts are not stretched to a 250 ms slice', async () => 
   try {
     await new Promise<void>((r) => holder.on('message', () => r()));
     const m = Mutex.open(name);
-    const t0 = performance.now();
-    assert.throws(() => m.lock({ timeoutMs: 10 }), (e: any) => e.code === 'E_TIMEOUT');
-    const ms = performance.now() - t0;
-    assert.ok(ms < 120, `lock({timeoutMs:10}) took ${ms.toFixed(1)} ms (slice floor)`);
+    // Min of spaced attempts: the regression (a full 250 ms slice) makes EVERY
+    // attempt >= 250 ms, while CPU contention from parallel test files is
+    // transient — on Windows Server runners one ready-but-unscheduled quantum
+    // (~190 ms) behind busy-spinning workers made a single sample flaky.
+    const samples: number[] = [];
+    for (let i = 0; i < 8; i++) {
+      const t0 = performance.now();
+      assert.throws(() => m.lock({ timeoutMs: 10 }), (e: any) => e.code === 'E_TIMEOUT');
+      samples.push(performance.now() - t0);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const best = Math.min(...samples);
+    assert.ok(best < 120,
+      `lock({timeoutMs:10}) never under 120 ms (slice floor): ${samples.map((s) => s.toFixed(1)).join(', ')}`);
   } finally {
     await holder.terminate();
     unlinkQuietly(name);

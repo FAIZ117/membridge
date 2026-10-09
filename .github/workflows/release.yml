@@ -59,7 +59,7 @@ jobs:
   prebuilds:
     uses: ./.github/workflows/prebuild.yml
     # Builds the 18 prebuilds (6 targets × Node 22/24/26) and uploads the
-    # assembled `memfuse-publish` tarball as a run artifact.
+    # assembled `shm-bridge-publish` tarball as a run artifact.
 
   publish:
     runs-on: ubuntu-latest
@@ -74,16 +74,16 @@ jobs:
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
-          name: memfuse-publish
+          name: shm-bridge-publish
           path: publish/
       - name: Tag/version sanity
         run: |
           cd publish
-          tarball=$(ls memfuse-*.tgz)
+          tarball=$(ls shm-bridge-*.tgz)
           version=${GITHUB_REF_NAME#v}
           echo "tarball=$tarball version=$version"
           case "$tarball" in
-            "memfuse-$version.tgz") ;;
+            "shm-bridge-$version.tgz") ;;
             *) echo "::error::tag $GITHUB_REF_NAME does not match $tarball"; exit 1 ;;
           esac
           tar -xzf "$tarball" package/package.json
@@ -94,7 +94,7 @@ jobs:
           "
       - name: Publish with provenance
         # cd first: a bare filename can't be mis-parsed by npm-package-arg
-        # ('publish/memfuse-0.1.0.tgz' reads as a GitHub shorthand spec and
+        # ('publish/shm-bridge-0.1.0.tgz' reads as a GitHub shorthand spec and
         # npm tries `git ls-remote` on it)
         run: |
           cd publish

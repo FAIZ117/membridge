@@ -51,11 +51,11 @@ jobs:
           node-version: 24
       - name: Mount a 64 MiB tmpfs
         run: |
-          sudo mkdir -p /mnt/memfuse-tmpfs
-          sudo mount -t tmpfs -o size=64m tmpfs /mnt/memfuse-tmpfs
-          # bind it as the segment source: memfuse uses /dev/shm, so run the
+          sudo mkdir -p /mnt/shm-bridge-tmpfs
+          sudo mount -t tmpfs -o size=64m tmpfs /mnt/shm-bridge-tmpfs
+          # bind it as the segment source: shm-bridge uses /dev/shm, so run the
           # test in a mount namespace where /dev/shm IS the small tmpfs
-          echo "MEMBRIDGE_TEST_TMPFS=/mnt/memfuse-tmpfs" >> "$GITHUB_ENV"
+          echo "MEMBRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs" >> "$GITHUB_ENV"
       - run: npm install
       - name: Run the suite inside the small-tmpfs namespace
         # PATH is preserved explicitly: sudo's secure_path resolves to the
@@ -64,11 +64,11 @@ jobs:
         # as unavailable inside the namespace.
         run: >
           sudo env PATH="$PATH" unshare --mount
-          bash -c 'mount --bind /mnt/memfuse-tmpfs /dev/shm &&
+          bash -c 'mount --bind /mnt/shm-bridge-tmpfs /dev/shm &&
                    chmod 1777 /dev/shm &&
                    cd "$GITHUB_WORKSPACE" &&
                    echo "node: $(node -v), addon loads: $(node -p "require(process.argv[1]).isNative()" "$PWD/dist/index.js")" &&
-                   MEMBRIDGE_TEST_TMPFS=/mnt/memfuse-tmpfs npm test'
+                   MEMBRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs npm test'
 
   sanitizers:
     # ASAN/UBSan (§12): LD_PRELOAD libasan into node with an instrumented
@@ -120,9 +120,9 @@ jobs:
         run: |
           mkdir /tmp/smoke && cd /tmp/smoke
           npm init -y >/dev/null
-          npm install "$OLDPWD"/memfuse-*.tgz --no-audit --no-fund
+          npm install "$OLDPWD"/shm-bridge-*.tgz --no-audit --no-fund
           node -e "
-            const m = require('memfuse');
+            const m = require('shm-bridge');
             const name = '/membridge-smoke-' + process.pid;
             const sab = m.open(name, 4096);
             const v = new Int32Array(sab);

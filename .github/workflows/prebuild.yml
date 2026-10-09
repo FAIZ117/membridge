@@ -55,7 +55,7 @@ jobs:
       # prebuildify v6 only produces N-API layouts; this addon is plain-V8
       # (ABI-specific), so build each Node ABI explicitly with node-gyp
       # --target and lay the files out exactly as node-gyp-build resolves
-      # them: prebuilds/<platform>-<arch>/memfuse.abi<N>[.<libc>].node.
+      # them: prebuilds/<platform>-<arch>/shmbridge.abi<N>[.<libc>].node.
       # CC/CXX/ARCH are exported ONLY for the targets that need them — an
       # EMPTY CC/CXX env makes node-gyp emit a mangled compile line.
       - name: Build per-ABI prebuilds (Node 22/24/26)
@@ -79,7 +79,7 @@ jobs:
             ABI=$(sed -n 's/.*"node_module_version": \([0-9]*\).*/\1/p' build/config.gypi | head -1)
             echo "node $VER -> ABI $ABI"
             test -n "$ABI"
-            cp build/Release/memfuse.node "prebuilds/$DIR/memfuse.abi$ABI${LIBCTAG:+.$LIBCTAG}.node"
+            cp build/Release/shmbridge.node "prebuilds/$DIR/shmbridge.abi$ABI${LIBCTAG:+.$LIBCTAG}.node"
           done
           find "prebuilds/$DIR" -type f | sort
       - name: Stage prebuilds
@@ -136,5 +136,5 @@ jobs:
         run: npm pack
       - uses: actions/upload-artifact@v4
         with:
-          name: memfuse-publish
-          path: memfuse-*.tgz
+          name: shm-bridge-publish
+          path: shm-bridge-*.tgz

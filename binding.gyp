@@ -1,7 +1,7 @@
 {
   "targets": [
     {
-      "target_name": "memfuse",
+      "target_name": "shmbridge",
       "sources": [
         "cc/addon.cc",
         "cc/segment.cc",

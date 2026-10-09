@@ -3,6 +3,10 @@
 // init protocol, BackingStore windows (§5). Native throws are NativeError
 // (membridge.h) caught at each entry point — they never cross V8 frames.
 
+// uv.h first: on Windows it pulls in winsock2.h, which must precede the
+// <windows.h> that header.h includes (else winsock.h redefines every type).
+#include <uv.h>
+
 #include "membridge.h"
 #include "header.h"
 #include "liveness.h"
@@ -21,8 +25,6 @@
 #include <mutex>
 #include <string>
 #include <vector>
-
-#include <uv.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>

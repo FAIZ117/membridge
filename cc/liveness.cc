@@ -191,15 +191,26 @@ namespace {
 
 // One proc_pidinfo read: start time (µs — second granularity would let a pid
 // recycled within the same second look like the original) and zombie state.
+// proc_pidinfo returns however many bytes the kernel filled, which can be
+// SHORTER than the SDK's struct on an older runtime. A short fill zeroed the
+// start fields, and a zero start must never be compared against a real row
+// start (it would read "pid reused" for a LIVE holder) — report start = -1,
+// which CheckLiveness maps to kUnknown = never steal (safe, §7.1).
 bool ReadBsdInfo(int32_t pid, int64_t* outStartUs, bool* outZombie) {
   proc_bsdinfo info{};
-  if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) return false;
+  const int r = static_cast<int>(proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)));
+  if (r <= 0) return false;  // call failed / process gone: unknown
+  if (r < static_cast<int>(sizeof(info)) && info.pbi_start_tvsec == 0 &&
+      info.pbi_start_tvusec == 0) {
+    *outStartUs = -1;
+    *outZombie = false;
+    return true;
+  }
   *outStartUs = static_cast<int64_t>(info.pbi_start_tvsec) * 1000000 +
                 static_cast<int64_t>(info.pbi_start_tvusec);
   *outZombie = info.pbi_status == SZOMB;
   return true;
 }
-
 }  // namespace
 
 Identity SelfIdentity() {

@@ -526,7 +526,12 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   }
   ::close(fd);
   if (total < 32) {
-    ThrowError(isolate, "E_INCOMPATIBLE", "segment too small for a membridge header", name);
+    struct stat st2{};
+    const long long sz = (::fstat(fd, &st2) == 0) ? static_cast<long long>(st2.st_size) : -1;
+    ThrowError(isolate, "E_INCOMPATIBLE",
+               "segment too small for a membridge header (" + std::to_string(total) +
+                   " bytes read, size " + std::to_string(sz) + ")",
+               name);
   }
   uint32_t headerBytes;
   std::memcpy(&headerBytes, buf + 16, 4);

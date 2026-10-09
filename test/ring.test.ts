@@ -11,8 +11,8 @@ import { open } from '../src/core';
 import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const PKG = require.resolve('../src/core');
-const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
-const ARG = process.env.MEMBRIDGE_TEST_ARG ?? '';
+const ROLE = process.env.SHM_BRIDGE_TEST_ROLE;
+const ARG = process.env.SHM_BRIDGE_TEST_ARG ?? '';
 
 function checksum(buf: Uint8Array): number {
   let h = 2166136261;
@@ -88,7 +88,7 @@ if (ROLE !== undefined) {
 
 function forkChild(role: string, arg: string): ReturnType<typeof fork> {
   return fork(__filename, {
-    env: { ...process.env, MEMBRIDGE_TEST_ROLE: role, MEMBRIDGE_TEST_ARG: arg },
+    env: { ...process.env, SHM_BRIDGE_TEST_ROLE: role, SHM_BRIDGE_TEST_ARG: arg },
     stdio: 'inherit',
   });
 }

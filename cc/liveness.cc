@@ -25,7 +25,7 @@
 #include <windows.h>
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 #if defined(__linux__)
 
@@ -356,4 +356,4 @@ const char* CheckLivenessJs(int32_t pid, int64_t startTime, int64_t pidNsInode) 
   return "unknown";
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

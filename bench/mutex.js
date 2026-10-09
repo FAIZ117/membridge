@@ -7,7 +7,7 @@ const { fork } = require('node:child_process');
 const { Mutex } = require('../dist/mutex');
 const { unlink } = require('../dist/core');
 
-const NAME = `/membridge-bench-mutex-${process.pid}`;
+const NAME = `/shm-bridge-bench-mutex-${process.pid}`;
 
 async function run() {
   const rows = [];

@@ -21,7 +21,7 @@ after the owner pushes.
 | `stat(name)` | ✓ | ✓ (native header read) | ✓ (read-only section view) |
 | `list()` | ✓ (magic-filtered readdir) | ✗ `E_UNSUPPORTED` (POSIX shm cannot be enumerated) | ✗ `E_UNSUPPORTED` |
 | `reap()` scan form | ✓ (needs `list`) | single-segment `reap(name)` only | single-segment `reap(name)` only |
-| Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\membridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
+| Segment names | `/x`, ≤ 250 B | `/x`, ≤ 31 B if U2 holds (`PSHMNAMLEN`) | escaped to `Local\shm-bridge…` (`/`→`%2F`, `%`→`%25`); **case-insensitive** — `/Foo` and `/foo` are the same Windows section (review F8); `Global\` opt-in needs `SeCreateGlobalPrivilege` |
 
 **Known issues on non-Linux (updated 2026-10-10):**
 
@@ -44,7 +44,7 @@ after the owner pushes.
   until `unlink`, Windows names do not. Library fixes found en route: a
   change seen after a park is `'ok'` (not `'not-equal'`), `waitAsync`
   registers before returning (no lost store-less wake), and
-  `MEMBRIDGE_MAX_SEGMENT_BYTES` set via `process.env` at runtime is honoured
+  `SHM_BRIDGE_MAX_SEGMENT_BYTES` set via `process.env` at runtime is honoured
   natively (read through libuv, not the CRT's startup copy).
 - Fixed en route during these rounds: Windows compile (`SEMAPHORE_MODIFY_STATE`),
   the Linux-only S_ISREG guard (darwin shm fdstat is not S_IFREG), Windows
@@ -98,7 +98,7 @@ and on timeout.
   (§8.2).
 - **Mutex has no priority inheritance and no fairness guarantee** (§7.3) — do
   not use it for latency-critical control loops.
-- `MEMBRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB) caps segment sizes; a ring's
+- `SHM_BRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB) caps segment sizes; a ring's
   capacity counts against it (`E_SIZE_INVALID` above the cap, §8.1).
 - **`close()` releases a handle**: `Mutex`, `RingProducer` and `RingConsumer`
   instances are also released when garbage-collected, but call `close()` for

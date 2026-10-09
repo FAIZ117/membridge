@@ -4,10 +4,10 @@
 // cross-check. All fields are little-endian two's complement, standard C
 // layout with natural alignment.
 
-#ifndef MEMBRIDGE_HEADER_H_
-#define MEMBRIDGE_HEADER_H_
+#ifndef SHM_BRIDGE_HEADER_H_
+#define SHM_BRIDGE_HEADER_H_
 
-#include "membridge.h"
+#include "shm_bridge.h"
 
 #include <atomic>
 #include <cstring>
@@ -18,7 +18,7 @@
 #include <unistd.h>  // sysconf
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 // Header page: one page at mapping offset 0 (size = max(4096, page size)) so
 // the data region stays page-aligned and 16 KiB pages (Apple Silicon) work.
@@ -170,6 +170,6 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
                      const OpenOpts& opts, uint32_t headerBytes, uint64_t newDataBytes,
                      uint64_t maxSegmentBytes);
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
-#endif  // MEMBRIDGE_HEADER_H_
+#endif  // SHM_BRIDGE_HEADER_H_

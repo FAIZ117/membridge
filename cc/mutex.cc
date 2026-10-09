@@ -14,7 +14,7 @@
 
 #include <string.h>
 
-namespace membridge {
+namespace shm_bridge {
 
 void MutexCleanupIsolate(v8::Isolate* isolate);
 
@@ -668,4 +668,4 @@ void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot) {
   ReleaseRole(dropped);
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

@@ -116,18 +116,18 @@ test('size validation: 2^32+16, 1.9, -1, 0, NaN, > cap -> E_SIZE_INVALID', () =>
     assertThrowsCode(() => open(name, 0), 'E_SIZE_INVALID');
     assertThrowsCode(() => open(name, Number.NaN), 'E_SIZE_INVALID');
     assertThrowsCode(() => open(name, 256 * 1024 * 1024 + 1), 'E_SIZE_INVALID', (e) => {
-      assert.ok(e.message.includes('MEMBRIDGE_MAX_SEGMENT_BYTES'));
+      assert.ok(e.message.includes('SHM_BRIDGE_MAX_SEGMENT_BYTES'));
     });
-    if (process.env.MEMBRIDGE_TEST_TMPFS !== undefined) return; // 256 MiB cannot fit the CI tmpfs
+    if (process.env.SHM_BRIDGE_TEST_TMPFS !== undefined) return; // 256 MiB cannot fit the CI tmpfs
     // the env override lifts the cap for big-but-legal sizes
-    process.env.MEMBRIDGE_MAX_SEGMENT_BYTES = String(300 * 1024 * 1024);
+    process.env.SHM_BRIDGE_MAX_SEGMENT_BYTES = String(300 * 1024 * 1024);
     const big = uniqueName();
     try {
       const s = open(big, 256 * 1024 * 1024 + 1);
       assert.strictEqual(s.byteLength, 256 * 1024 * 1024 + 1);
     } finally {
       unlinkQuietly(big);
-      delete process.env.MEMBRIDGE_MAX_SEGMENT_BYTES;
+      delete process.env.SHM_BRIDGE_MAX_SEGMENT_BYTES;
     }
   } finally {
     unlinkQuietly(name);

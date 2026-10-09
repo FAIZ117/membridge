@@ -1,11 +1,11 @@
-// membridge.h — shared definitions for the membridge native addon.
+// shm_bridge.h — shared definitions for the shm-bridge native addon.
 // Design: PLAN.md §3–§5. One Mapping owns the OS mapping (`base`, which is
 // what mmap/MapViewOfFile returned); every SAB is a BackingStore-level window
 // over `base + headerBytes` (F15: a SAB's length always equals its
 // BackingStore's, so windows are made at the BackingStore level).
 
-#ifndef MEMBRIDGE_MEMBRIDGE_H_
-#define MEMBRIDGE_MEMBRIDGE_H_
+#ifndef SHM_BRIDGE_SHM_BRIDGE_H_
+#define SHM_BRIDGE_SHM_BRIDGE_H_
 
 #include <node.h>
 #include <v8.h>
@@ -15,9 +15,9 @@
 #include <memory>
 #include <string>
 
-namespace membridge {
+namespace shm_bridge {
 
-constexpr uint32_t kMagic = 0x424D454Du;  // "MEMB" little-endian
+constexpr uint32_t kMagic = 0x424D4853u;  // "SHMB" little-endian
 constexpr uint32_t kLayoutVersion = 1;
 
 constexpr uint64_t kDefaultMaxSegmentBytes = 256ull * 1024 * 1024;
@@ -93,7 +93,7 @@ struct Mapping {
   void Detach();
 };
 
-// Errors (§10). Each Throw* sets the pending JS exception (a MembridgeError
+// Errors (§10). Each Throw* sets the pending JS exception (a ShmBridgeError
 // with the code plus structured fields) and throws NativeError, which every
 // JS entry point catches — so C++ error paths unwind RAII guards and never
 // cross into V8 frames. `syscall`/`errno` populate E_SYSTEM details.
@@ -107,11 +107,11 @@ struct NativeError {};
 [[noreturn]] void ThrowSystemError(v8::Isolate* isolate, const std::string& syscall, int err,
                                    const std::string& name);
 
-// Set once per isolate from index.ts so native throws real MembridgeError
+// Set once per isolate from index.ts so native throws real ShmBridgeError
 // instances. Per-isolate: a v8::Global belongs to exactly one isolate, and
 // every worker isolate loads the addon separately.
 void SetErrorCtor(v8::Isolate* isolate, v8::Local<v8::Function> ctor);
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
-#endif  // MEMBRIDGE_MEMBRIDGE_H_
+#endif  // SHM_BRIDGE_SHM_BRIDGE_H_

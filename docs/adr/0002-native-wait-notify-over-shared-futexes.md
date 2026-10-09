@@ -17,8 +17,8 @@ makes a single-thread multiplexer possible.
 
 ## Decision
 
-`membridge/sync` exposes wait/waitAsync/notify over i32 words. Linux uses raw
-shared-futex syscalls; `waitAsync` runs on membridge-owned threads (never the
+`shm-bridge/sync` exposes wait/waitAsync/notify over i32 words. Linux uses raw
+shared-futex syscalls; `waitAsync` runs on shm-bridge-owned threads (never the
 libuv pool), multiplexed through one `futex_waitv` thread (127 waits + a
 process-private control word) with a one-thread-per-wait fallback below
 kernel 5.16 or a full cap (E_TOO_MANY_WAITERS). macOS uses `os_sync`

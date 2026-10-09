@@ -1,6 +1,6 @@
 'use strict';
 // bench/contention.js — shared-memory throughput: single-process Atomics over
-// a membridge segment (the floor any cross-process scheme pays), plus a
+// a shm-bridge segment (the floor any cross-process scheme pays), plus a
 // multi-process increment round to show the cross-process cost.
 
 const { performance } = require('node:perf_hooks');
@@ -8,7 +8,7 @@ const { fork } = require('node:child_process');
 const { open, unlink } = require('../dist/core');
 const { wait, notify } = require('../dist/sync');
 
-const NAME = `/membridge-bench-contention-${process.pid}`;
+const NAME = `/shm-bridge-bench-contention-${process.pid}`;
 const ITERS = 5e6;
 
 async function run() {

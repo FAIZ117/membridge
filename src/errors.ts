@@ -1,7 +1,7 @@
-// errors.ts — MembridgeError with E_* codes (PLAN §10). A new code goes into
+// errors.ts — ShmBridgeError with E_* codes (PLAN §10). A new code goes into
 // PLAN §10 and this file in the same change (AGENTS.md guardrail 5).
 
-export type MembridgeErrorCode =
+export type ShmBridgeErrorCode =
   | 'E_NAME_INVALID'
   | 'E_SIZE_INVALID'
   | 'E_SIZE_MISMATCH'
@@ -23,7 +23,7 @@ export type MembridgeErrorCode =
   | 'E_UNSUPPORTED'
   | 'E_SYSTEM';
 
-export interface MembridgeErrorFields {
+export interface ShmBridgeErrorFields {
   /** The segment the error is about. */
   readonly segmentName?: string;
   /** Requested size for size errors. */
@@ -59,17 +59,17 @@ const CODES: ReadonlySet<string> = new Set<string>([
   'E_SYSTEM',
 ]);
 
-export class MembridgeError extends Error {
-  readonly code: MembridgeErrorCode;
+export class ShmBridgeError extends Error {
+  readonly code: ShmBridgeErrorCode;
   readonly segmentName?: string;
   readonly requested?: number;
   readonly existing?: number;
   readonly syscall?: string;
   readonly errno?: number;
 
-  constructor(code: MembridgeErrorCode, message: string, fields: MembridgeErrorFields = {}) {
+  constructor(code: ShmBridgeErrorCode, message: string, fields: ShmBridgeErrorFields = {}) {
     super(message);
-    this.name = 'MembridgeError';
+    this.name = 'ShmBridgeError';
     this.code = code;
     if (fields.segmentName !== undefined) this.segmentName = fields.segmentName;
     if (fields.requested !== undefined) this.requested = fields.requested;
@@ -79,6 +79,6 @@ export class MembridgeError extends Error {
   }
 }
 
-export function isMembridgeErrorCode(code: string): code is MembridgeErrorCode {
+export function isShmBridgeErrorCode(code: string): code is ShmBridgeErrorCode {
   return CODES.has(code);
 }

@@ -17,7 +17,7 @@ const PKG = require.resolve('../src/core'); // tests use core directly (debug ho
 /** Run a script with --expose-gc in a child; exit 0 = assertion held. */
 function runInGcChild(script: string, name: string): { status: number; out: string } {
   const r = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
-    env: { ...process.env, MEMBRIDGE_TEST_NAME: name, MEMBRIDGE_TEST_PKG: PKG },
+    env: { ...process.env, SHM_BRIDGE_TEST_NAME: name, SHM_BRIDGE_TEST_PKG: PKG },
     encoding: 'utf8',
   });
   return { status: r.status ?? -1, out: r.stdout + r.stderr };
@@ -28,8 +28,8 @@ test('GC: mapping freed only after the last SAB is collected (child, --expose-gc
   try {
     const r = runInGcChild(
       `
-      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
-      const name = process.env.MEMBRIDGE_TEST_NAME;
+      const { open, debugRegistryHas } = require(process.env.SHM_BRIDGE_TEST_PKG);
+      const name = process.env.SHM_BRIDGE_TEST_NAME;
       let sab = open(name, 4096);
       new Int32Array(sab)[0] = 3;
       if (!debugRegistryHas(name)) process.exit(2);
@@ -50,8 +50,8 @@ test('GC: mapping kept alive while ANY SAB reference remains (child, --expose-gc
   try {
     const r = runInGcChild(
       `
-      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
-      const name = process.env.MEMBRIDGE_TEST_NAME;
+      const { open, debugRegistryHas } = require(process.env.SHM_BRIDGE_TEST_PKG);
+      const name = process.env.SHM_BRIDGE_TEST_NAME;
       let a = open(name, 4096);
       const b = open(name, 4096);
       new Int32Array(a)[0] = 3;
@@ -74,8 +74,8 @@ test('GC: grow replaces the registry entry; old SABs stay valid (child, --expose
   try {
     const r = runInGcChild(
       `
-      const { open, debugRegistryHas } = require(process.env.MEMBRIDGE_TEST_PKG);
-      const name = process.env.MEMBRIDGE_TEST_NAME;
+      const { open, debugRegistryHas } = require(process.env.SHM_BRIDGE_TEST_PKG);
+      const name = process.env.SHM_BRIDGE_TEST_NAME;
       const old = open(name, 4096);
       new Int32Array(old)[0] = 7;
       const grown = open(name, 16384, { sizePolicy: 'grow' });

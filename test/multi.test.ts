@@ -2,7 +2,7 @@
 // join race, the ported 8-process lost-update check as a pure correctness
 // test (no throughput threshold), and a cross-process fork handshake.
 //
-// Children re-enter this same file via fork() with MEMBRIDGE_TEST_ROLE set;
+// Children re-enter this same file via fork() with SHM_BRIDGE_TEST_ROLE set;
 // the guard below runs the role and exits before any test registration.
 
 import { test } from 'node:test';
@@ -10,9 +10,9 @@ import { fork } from 'node:child_process';
 import { open, unlink } from '../src/core';
 import { assert, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
-const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
+const ROLE = process.env.SHM_BRIDGE_TEST_ROLE;
 if (ROLE !== undefined) {
-  childMain(ROLE, process.env.MEMBRIDGE_TEST_ARG ?? '');
+  childMain(ROLE, process.env.SHM_BRIDGE_TEST_ARG ?? '');
   process.exit(1); // childMain exits on its own; this is a safety net
 }
 
@@ -44,7 +44,7 @@ function childMain(role: string, arg: string): void {
 function forkRole(role: string, arg: string): Promise<{ code: number | null; pid: number }> {
   return new Promise((resolve, reject) => {
     const child = fork(__filename, {
-      env: { ...process.env, MEMBRIDGE_TEST_ROLE: role, MEMBRIDGE_TEST_ARG: arg },
+      env: { ...process.env, SHM_BRIDGE_TEST_ROLE: role, SHM_BRIDGE_TEST_ARG: arg },
       stdio: 'inherit',
     });
     child.on('exit', (code) => resolve({ code, pid: child.pid ?? -1 }));

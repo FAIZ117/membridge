@@ -1,20 +1,20 @@
 // segment.h — OS-level segment creation/opening and name validation (§5.5).
 
-#ifndef MEMBRIDGE_SEGMENT_H_
-#define MEMBRIDGE_SEGMENT_H_
+#ifndef SHM_BRIDGE_SEGMENT_H_
+#define SHM_BRIDGE_SEGMENT_H_
 
-#include "membridge.h"
+#include "shm_bridge.h"
 
 #include <string>
 #include <vector>
 
-namespace membridge {
+namespace shm_bridge {
 
 // Validate a segment name per platform (§5.5). Throws E_NAME_INVALID.
 void ValidateName(v8::Isolate* isolate, const std::string& name);
 
 // POSIX shm object name is the name itself (must start with '/'). Windows
-// maps the name to Local\membridge<escaped> (or Global\ with the opt-in),
+// maps the name to Local\shm-bridge<escaped> (or Global\ with the opt-in),
 // percent-encoding '/' -> %2F and '%' -> %25 (§5.5); overflow of the kernel
 // object-name limit is E_NAME_INVALID, never truncation.
 std::string ObjectName(const std::string& name, bool winGlobal);
@@ -79,5 +79,5 @@ struct HeaderInfo {
 void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttach,
                 HeaderInfo* out);
 
-}  // namespace membridge
-#endif  // MEMBRIDGE_SEGMENT_H_
+}  // namespace shm_bridge
+#endif  // SHM_BRIDGE_SEGMENT_H_

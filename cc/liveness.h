@@ -1,11 +1,11 @@
 // liveness.h — §7.1 participant identity and liveness checking.
 
-#ifndef MEMBRIDGE_LIVENESS_H_
-#define MEMBRIDGE_LIVENESS_H_
+#ifndef SHM_BRIDGE_LIVENESS_H_
+#define SHM_BRIDGE_LIVENESS_H_
 
-#include "membridge.h"
+#include "shm_bridge.h"
 
-namespace membridge {
+namespace shm_bridge {
 
 Identity SelfIdentity();  // threadId = OS thread id (gettid) for lock slots
 
@@ -28,6 +28,6 @@ Liveness CheckPidAlive(int32_t pid);
 // JS-facing wrapper (§9 stat): 'alive' | 'dead' | 'unknown'.
 const char* CheckLivenessJs(int32_t pid, int64_t startTime, int64_t pidNsInode);
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
-#endif  // MEMBRIDGE_LIVENESS_H_
+#endif  // SHM_BRIDGE_LIVENESS_H_

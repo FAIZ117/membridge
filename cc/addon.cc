@@ -1,13 +1,13 @@
 // addon.cc — plain-V8 addon entry (node.h, NODE_MODULE_INIT, no N-API —
 // PLAN §4). Owns the open() flow: validation, registry reuse with sizes,
 // init protocol, BackingStore windows (§5). Native throws are NativeError
-// (membridge.h) caught at each entry point — they never cross V8 frames.
+// (shm_bridge.h) caught at each entry point — they never cross V8 frames.
 
 // uv.h first: on Windows it pulls in winsock2.h, which must precede the
 // <windows.h> that header.h includes (else winsock.h redefines every type).
 #include <uv.h>
 
-#include "membridge.h"
+#include "shm_bridge.h"
 #include "header.h"
 #include "liveness.h"
 #include "mutex.h"
@@ -33,7 +33,7 @@
 #include <unistd.h>
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 namespace {
 
@@ -174,7 +174,7 @@ bool GetEnvVar(const char* key, std::string* out) {
 
 double GetEnvMaxSegmentBytes() {
   std::string env;
-  if (!GetEnvVar("MEMBRIDGE_MAX_SEGMENT_BYTES", &env)) {
+  if (!GetEnvVar("SHM_BRIDGE_MAX_SEGMENT_BYTES", &env)) {
     return static_cast<double>(kDefaultMaxSegmentBytes);
   }
   char* end = nullptr;
@@ -331,7 +331,7 @@ void ValidateSize(v8::Isolate* isolate, const std::string& name, bool haveSize, 
   if (sizeD > static_cast<double>(opts.maxSegmentBytes)) {
     ThrowError(isolate, "E_SIZE_INVALID",
                "size " + std::to_string(static_cast<int64_t>(sizeD)) +
-                   " exceeds MEMBRIDGE_MAX_SEGMENT_BYTES (" +
+                   " exceeds SHM_BRIDGE_MAX_SEGMENT_BYTES (" +
                    std::to_string(static_cast<int64_t>(opts.maxSegmentBytes)) + ")",
                name);
   }
@@ -570,7 +570,7 @@ void Unlink(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 #if defined(_WIN32)
   // The section disappears with the last handle; unlink only prevents new
-  // membridge joins by marking the header (§5.4). POSIX parity for a missing
+  // shm-bridge joins by marking the header (§5.4). POSIX parity for a missing
   // name: a named section kernel object exists while ANY handle references
   // it, so OpenFileMappingW is the existence probe.
   const bool known = Registry::Get().Find(name) != nullptr;
@@ -623,12 +623,12 @@ void IsNative(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
 void DebugFailAfterGrow(const v8::FunctionCallbackInfo<v8::Value>& args) {
   // Test-only fault injection (round-4 S4-14): inert unless the process was
-  // started with MEMBRIDGE_TEST_HOOKS=1, so a shipped binary cannot be made
+  // started with SHM_BRIDGE_TEST_HOOKS=1, so a shipped binary cannot be made
   // to fail opens by anything that loads the .node file directly.
   std::string on;
-  if (!GetEnvVar("MEMBRIDGE_TEST_HOOKS", &on) || on != "1") {
+  if (!GetEnvVar("SHM_BRIDGE_TEST_HOOKS", &on) || on != "1") {
     ThrowError(args.GetIsolate(), "E_UNSUPPORTED",
-               "test hooks are disabled (set MEMBRIDGE_TEST_HOOKS=1 in tests)");
+               "test hooks are disabled (set SHM_BRIDGE_TEST_HOOKS=1 in tests)");
   }
   g_debugFailAfterGrow.store(true);
   args.GetReturnValue().Set(v8::Undefined(args.GetIsolate()));
@@ -668,7 +668,7 @@ void SetErrorCtorJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   v8::HandleScope scope(isolate);
   if (args.Length() < 1 || !args[0]->IsFunction()) {
     isolate->ThrowException(
-        v8::Exception::TypeError(Str(isolate, "setMembridgeErrorCtor(ctor: function)")));
+        v8::Exception::TypeError(Str(isolate, "setShmBridgeErrorCtor(ctor: function)")));
     return;
   }
   SetErrorCtor(isolate, args[0].As<v8::Function>());
@@ -683,7 +683,7 @@ void Guarded(const v8::FunctionCallbackInfo<v8::Value>& args, Fn&& fn) {
     // JS exception is pending; nothing to clean up (RAII guards ran).
   } catch (...) {
     // Unexpected: report as E_SYSTEM rather than unwind into V8 frames.
-    membridge::ThrowSystemError(args.GetIsolate(), "membridge (internal)", 0, "");
+    shm_bridge::ThrowSystemError(args.GetIsolate(), "shm-bridge (internal)", 0, "");
   }
 }
 
@@ -692,7 +692,7 @@ void Guarded(const v8::FunctionCallbackInfo<v8::Value>& args, Fn&& fn) {
 int32_t* WordAddrOf(v8::Isolate* isolate, v8::Local<v8::Value> arg, int32_t index) {
   if (!arg->IsInt32Array()) {
     ThrowError(isolate, "E_NAME_INVALID",
-               "sync.wait/notify need an Int32Array view over a membridge segment");
+               "sync.wait/notify need an Int32Array view over a shm-bridge segment");
   }
   v8::Local<v8::Int32Array> view = arg.As<v8::Int32Array>();
   const size_t words = view->Length();
@@ -908,7 +908,7 @@ void CheckLivenessJsBridge(const v8::FunctionCallbackInfo<v8::Value>& args) {
 // Every JS entry point catches NativeError (JS exception already pending).
 // Anything else becomes an E_SYSTEM — C++ must never unwind into V8 frames.
 
-#define MEMBRIDGE_TRAMPOLINE(JsName, Impl)                                        \
+#define SHM_BRIDGE_TRAMPOLINE(JsName, Impl)                                        \
   void JsName(const v8::FunctionCallbackInfo<v8::Value>& args) {                  \
     try {                                                                         \
       Impl(args);                                                                 \
@@ -920,17 +920,17 @@ void CheckLivenessJsBridge(const v8::FunctionCallbackInfo<v8::Value>& args) {
     }                                                                             \
   }
 
-MEMBRIDGE_TRAMPOLINE(OpenJs, Open)
-MEMBRIDGE_TRAMPOLINE(UnlinkJs, Unlink)
-MEMBRIDGE_TRAMPOLINE(CloseJs, Close)
-MEMBRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
-MEMBRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
-MEMBRIDGE_TRAMPOLINE(DebugFailAfterGrowJs, DebugFailAfterGrow)
-MEMBRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
-MEMBRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
-MEMBRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
-MEMBRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
-MEMBRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
+SHM_BRIDGE_TRAMPOLINE(OpenJs, Open)
+SHM_BRIDGE_TRAMPOLINE(UnlinkJs, Unlink)
+SHM_BRIDGE_TRAMPOLINE(CloseJs, Close)
+SHM_BRIDGE_TRAMPOLINE(IsNativeJs, IsNative)
+SHM_BRIDGE_TRAMPOLINE(DebugRegistryHasJs, DebugRegistryHas)
+SHM_BRIDGE_TRAMPOLINE(DebugFailAfterGrowJs, DebugFailAfterGrow)
+SHM_BRIDGE_TRAMPOLINE(SelfIdentityJs2, SelfIdentityJs)
+SHM_BRIDGE_TRAMPOLINE(SetErrorCtorJs2, SetErrorCtorJs)
+SHM_BRIDGE_TRAMPOLINE(SyncWaitJs2, SyncWaitJs)
+SHM_BRIDGE_TRAMPOLINE(SyncNotifyJs2, SyncNotifyJs)
+SHM_BRIDGE_TRAMPOLINE(SyncWaitAsyncJs2, SyncWaitAsyncJs)
 // mutexUnregisterClaim(view, slot, wasHeld) — a JS Mutex instance was
 // collected or closed: drop its claim reference; release the lock only if
 // THAT instance held it (round-3 C1).
@@ -1036,14 +1036,14 @@ void ReadHeaderJs(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(o);
 }
 
-MEMBRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
-MEMBRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
-MEMBRIDGE_TRAMPOLINE(MutexUnregisterClaimJs2, MutexUnregisterClaimJs)
-MEMBRIDGE_TRAMPOLINE(MutexUnregisterRoleJs2, MutexUnregisterRoleJs)
-MEMBRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
-MEMBRIDGE_TRAMPOLINE(SameMemoryJs2, SameMemoryJs)
-MEMBRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
-MEMBRIDGE_TRAMPOLINE(CheckLivenessJsBridge2, CheckLivenessJsBridge)
+SHM_BRIDGE_TRAMPOLINE(MutexClaimSlotJs2, MutexClaimSlotJs)
+SHM_BRIDGE_TRAMPOLINE(MutexOwnerAliveJs2, MutexOwnerAliveJs)
+SHM_BRIDGE_TRAMPOLINE(MutexUnregisterClaimJs2, MutexUnregisterClaimJs)
+SHM_BRIDGE_TRAMPOLINE(MutexUnregisterRoleJs2, MutexUnregisterRoleJs)
+SHM_BRIDGE_TRAMPOLINE(RingClaimRoleJs2, RingClaimRoleJs)
+SHM_BRIDGE_TRAMPOLINE(SameMemoryJs2, SameMemoryJs)
+SHM_BRIDGE_TRAMPOLINE(ReadHeaderJs2, ReadHeaderJs)
+SHM_BRIDGE_TRAMPOLINE(CheckLivenessJsBridge2, CheckLivenessJsBridge)
 
 void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
   v8::Isolate* isolate = v8::Isolate::GetCurrent();  // F16: no Context::GetIsolate in V8 14.6
@@ -1052,7 +1052,7 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
     v8::FunctionCallback fn;
   };
   const Reg regs[] = {
-      {"setMembridgeErrorCtor", SetErrorCtorJs2},
+      {"setShmBridgeErrorCtor", SetErrorCtorJs2},
       {"open", OpenJs},
       {"unlink", UnlinkJs},
       {"close", CloseJs},
@@ -1081,8 +1081,8 @@ void RegisterModule(v8::Local<v8::Object> exports, v8::Local<v8::Context> ctx) {
 
 }  // namespace
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
 NODE_MODULE_INIT(/* exports, module, context */) {
-  membridge::RegisterModule(exports, context);
+  shm_bridge::RegisterModule(exports, context);
 }

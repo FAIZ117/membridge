@@ -16,7 +16,7 @@ msgs/s, round-4 performance pass).
 
 | Bench | Value |
 |-------|-------|
-| contention — same-process `Atomics.add` (5 M ops on a membridge SAB) | 94–98 M ops/s this session (~119 M on an idle box, 2026-10-06) |
+| contention — same-process `Atomics.add` (5 M ops on a shm-bridge SAB) | 94–98 M ops/s this session (~119 M on an idle box, 2026-10-06) |
 | contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~155–170k/s) |
 | mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **0.07–0.10 µs/op** in the bench; 49–51 ns in a 2M-iteration loop (same-session `248f731` baseline: 48–59 ns — no regression) |
 | mutex — 3-way contended handoff | not produced by `npm run bench`; the round-3 performance pass measured 0 waits ≥ 250 ms in 31 tight-loop runs (5 µs critical section, 0 think time, 3/6/8 processes) |

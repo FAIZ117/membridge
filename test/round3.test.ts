@@ -255,7 +255,7 @@ test('C5: a throw after a winning grow releases the row through the new mapping'
        let code='none'; try{ open(${JSON.stringify(name)}, 1<<20, {sizePolicy:'grow'}); }catch(e){ code=e.code; }
        const mine=stat(${JSON.stringify(name)}).attachSlots.filter(s=>s.pid===process.pid).length;
        console.log(JSON.stringify({code, mine}));`,
-      [], { ...process.env, MEMBRIDGE_TEST_HOOKS: '1' },
+      [], { ...process.env, SHM_BRIDGE_TEST_HOOKS: '1' },
     );
     assert.strictEqual(r.signal, null, `child crashed: ${r.err}`);
     assert.deepStrictEqual(lastJson(r.out), { code: 'E_SYSTEM', mine: 0 });

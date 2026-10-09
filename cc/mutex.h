@@ -7,14 +7,14 @@
 // path (§7.1), and per-isolate tracking so the env-cleanup hook can release
 // locks a dead worker still holds (§7.1).
 
-#ifndef MEMBRIDGE_MUTEX_H_
-#define MEMBRIDGE_MUTEX_H_
+#ifndef SHM_BRIDGE_MUTEX_H_
+#define SHM_BRIDGE_MUTEX_H_
 
-#include "membridge.h"
+#include "shm_bridge.h"
 
 #include <cstdint>
 
-namespace membridge {
+namespace shm_bridge {
 
 // Data-region layout for kind=mutex (byte contract; mirrored in src/mutex.ts).
 constexpr uint32_t kMutexSlotCount = 64;
@@ -98,6 +98,6 @@ uint32_t RingClaimRole(v8::Isolate* isolate, const std::string& name, int32_t* d
 // clear the role word (if it still holds our token) and free the role slot.
 void MutexUnregisterRole(v8::Isolate* isolate, int32_t* data, int slot);
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
-#endif  // MEMBRIDGE_MUTEX_H_
+#endif  // SHM_BRIDGE_MUTEX_H_

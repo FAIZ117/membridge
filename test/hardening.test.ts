@@ -476,7 +476,7 @@ test('R4/R5 hostile geometry races: native view guards', () => {
   const b = (require('../src/native') as typeof import('../src/native')).nativeOrThrow();
   // A view shorter than the mutex layout is rejected before any slot access.
   const short = new Int32Array(new SharedArrayBuffer(64));
-  assert.throws(() => b.mutexClaimSlot('/membridge-test-x', short), (e: any) =>
+  assert.throws(() => b.mutexClaimSlot('/shm-bridge-test-x', short), (e: any) =>
     e.code === 'E_SIZE_INVALID');
 });
 
@@ -493,7 +493,7 @@ test('R11/R12: claim-after-unlink teardown is clean; pins release on close/GC', 
     const before = readdirSync('/proc/self/fd').length;
     for (let i = 0; i < 500; i++) {
       // darwin caps names at 31 bytes — short, collision-free per child
-      const n = '/membridge-test-' + process.pid.toString(36) + 'r' + i.toString(36);
+      const n = '/shm-bridge-test-' + process.pid.toString(36) + 'r' + i.toString(36);
       const m = Mutex.open(n);
       m.lock();
       m.unlock();

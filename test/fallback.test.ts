@@ -9,14 +9,14 @@ import type { OpenOptions } from '../src/core';
 import { assert, uniqueName, unlinkQuietly, assertThrowsCode } from './helpers';
 
 test('fallback is opt-in (env or per-call), never on by default', () => {
-  delete process.env.MEMBRIDGE_ALLOW_FALLBACK;
+  delete process.env.SHM_BRIDGE_ALLOW_FALLBACK;
   assert.strictEqual(fallbackEnabled(), false);
   assert.strictEqual(fallbackEnabled({ allowFallback: true }), true);
-  process.env.MEMBRIDGE_ALLOW_FALLBACK = '1';
+  process.env.SHM_BRIDGE_ALLOW_FALLBACK = '1';
   try {
     assert.strictEqual(fallbackEnabled(), true);
   } finally {
-    delete process.env.MEMBRIDGE_ALLOW_FALLBACK;
+    delete process.env.SHM_BRIDGE_ALLOW_FALLBACK;
   }
 });
 

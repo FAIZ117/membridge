@@ -1,7 +1,7 @@
 'use strict';
 // F1 (PLAN §2): Atomics.notify does not wake waiters in another process —
 // V8 keeps its waiter list per process and never consults a shared kernel
-// futex. This is why membridge needs native cross-process wait/notify (§6).
+// futex. This is why shm-bridge needs native cross-process wait/notify (§6).
 //
 // PASS = the parent's Atomics.notify returns 0 (V8 sees no waiter in its own
 // process) and the child times out at ~3000 ms instead of waking at ~200 ms.
@@ -11,8 +11,8 @@ const { addon, probeName, unlinkQuietly } = require('./lib');
 
 const a = addon();
 
-if (process.env.MEMBRIDGE_PROBE_ROLE === 'child') {
-  const sab = a.open(process.env.MEMBRIDGE_PROBE_NAME, 4096);
+if (process.env.SHM_BRIDGE_PROBE_ROLE === 'child') {
+  const sab = a.open(process.env.SHM_BRIDGE_PROBE_NAME, 4096);
   const i32 = new Int32Array(sab);
   process.send({ type: 'ready' });
   const t0 = process.hrtime.bigint();
@@ -29,7 +29,7 @@ const name = probeName('f1');
 a.open(name, 4096); // create before forking
 
 const child = fork(__filename, {
-  env: { ...process.env, MEMBRIDGE_PROBE_ROLE: 'child', MEMBRIDGE_PROBE_NAME: name },
+  env: { ...process.env, SHM_BRIDGE_PROBE_ROLE: 'child', SHM_BRIDGE_PROBE_NAME: name },
   silent: true,
 });
 child.stderr.on('data', d => process.stderr.write('[child] ' + d));

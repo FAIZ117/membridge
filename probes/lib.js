@@ -1,7 +1,7 @@
 'use strict';
 // Shared helpers for probes/ — locate the spike addon, generate unique
-// /membridge-probe-* names, clean up. (AGENTS.md guardrail 3: segments are
-// always under /membridge-probe- and always unlinked.)
+// /shm-bridge-probe-* names, clean up. (AGENTS.md guardrail 3: segments are
+// always under /shm-bridge-probe- and always unlinked.)
 //
 // The addon is ABI-bound (plain V8, not N-API), so if the cached build does
 // not match the running Node, lib.js rebuilds it for the current version via
@@ -11,8 +11,8 @@ const path = require('path');
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 
-const ADDON = process.env.MEMBRIDGE_SPIKE_ADDON ||
-  path.join(__dirname, '..', 'spike', 'build', 'Release', 'membridge_spike.node');
+const ADDON = process.env.SHM_BRIDGE_SPIKE_ADDON ||
+  path.join(__dirname, '..', 'spike', 'build', 'Release', 'shm_bridge_spike.node');
 
 function rebuildForCurrentNode() {
   console.error(`probes: rebuilding spike addon for Node ${process.versions.node} ...`);
@@ -42,7 +42,7 @@ function addon() {
 const runSuffix = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
 function probeName(tag) {
-  return `/membridge-probe-${tag}-${runSuffix}-${Date.now().toString(36)}`;
+  return `/shm-bridge-probe-${tag}-${runSuffix}-${Date.now().toString(36)}`;
 }
 
 function unlinkQuietly(a, names) {

@@ -16,8 +16,8 @@ const { addon, probeName, unlinkQuietly } = require('./lib');
 
 const a = addon();
 
-if (process.env.MEMBRIDGE_PROBE_ROLE === 'child') {
-  const [name, mode, timeoutMs] = [process.env.MEMBRIDGE_PROBE_NAME, process.env.MEMBRIDGE_PROBE_MODE, process.env.MEMBRIDGE_PROBE_TIMEOUT];
+if (process.env.SHM_BRIDGE_PROBE_ROLE === 'child') {
+  const [name, mode, timeoutMs] = [process.env.SHM_BRIDGE_PROBE_NAME, process.env.SHM_BRIDGE_PROBE_MODE, process.env.SHM_BRIDGE_PROBE_TIMEOUT];
   const sab = a.open(name, 4096);
   const i32 = new Int32Array(sab);
   process.send({ type: 'ready' });
@@ -37,7 +37,7 @@ const label = c => (c >= 0 ? String(c) : `${ERRNOS[-c] || 'errno'}(-${c})`);
 
 function forkChild(mode, timeoutMs) {
   const c = fork(__filename, {
-    env: { ...process.env, MEMBRIDGE_PROBE_ROLE: 'child', MEMBRIDGE_PROBE_NAME: name, MEMBRIDGE_PROBE_MODE: mode, MEMBRIDGE_PROBE_TIMEOUT: String(timeoutMs) },
+    env: { ...process.env, SHM_BRIDGE_PROBE_ROLE: 'child', SHM_BRIDGE_PROBE_NAME: name, SHM_BRIDGE_PROBE_MODE: mode, SHM_BRIDGE_PROBE_TIMEOUT: String(timeoutMs) },
     silent: true,
   });
   c.stderr.on('data', d => process.stderr.write('[child] ' + d));

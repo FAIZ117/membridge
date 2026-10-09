@@ -5,7 +5,7 @@
 //
 // Crash states are hand-crafted by writing the §5.2 byte layout into the shm
 // object directly — an outside cross-check of cc/header.h. POSIX-only; the
-// tmpfs test additionally requires MEMBRIDGE_TEST_TMPFS (CI mounts one).
+// tmpfs test additionally requires SHM_BRIDGE_TEST_TMPFS (CI mounts one).
 
 import { test } from 'node:test';
 import type { TestContext } from 'node:test';
@@ -24,8 +24,8 @@ import {
 
 const POSIX = process.platform === 'linux';  // /dev/shm byte-crafting
 const SKIP = 'needs Linux /dev/shm (byte-level crash-state crafting)';
-const TMPFS = process.env.MEMBRIDGE_TEST_TMPFS !== undefined;
-const SKIP_TMPFS = 'needs MEMBRIDGE_TEST_TMPFS pointing at a small tmpfs (CI mounts one)';
+const TMPFS = process.env.SHM_BRIDGE_TEST_TMPFS !== undefined;
+const SKIP_TMPFS = 'needs SHM_BRIDGE_TEST_TMPFS pointing at a small tmpfs (CI mounts one)';
 
 // Spawn a child that would live forever, record its pid + true start time,
 // then SIGKILL it and wait for it to be reaped. Returns a provably dead
@@ -186,11 +186,11 @@ test('E_NO_SPACE on a full small tmpfs', { skip: TMPFS ? false : SKIP_TMPFS }, (
   const name = makeTrackedNameLocal(t);
   // lift the default 256 MiB cap so the 512 MiB request reaches
   // posix_fallocate (the point of the test) instead of E_SIZE_INVALID
-  process.env.MEMBRIDGE_MAX_SEGMENT_BYTES = String(1024 * 1024 * 1024);
+  process.env.SHM_BRIDGE_MAX_SEGMENT_BYTES = String(1024 * 1024 * 1024);
   try {
     assertThrowsCode(() => open(name, 512 * 1024 * 1024), 'E_NO_SPACE');
   } finally {
-    delete process.env.MEMBRIDGE_MAX_SEGMENT_BYTES;
+    delete process.env.SHM_BRIDGE_MAX_SEGMENT_BYTES;
   }
 });
 

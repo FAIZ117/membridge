@@ -5,7 +5,7 @@
 // API basics.
 //
 // Multi-process tests re-enter this file via fork()/spawnSync() with
-// MEMBRIDGE_TEST_ROLE set; children run their role and never register tests.
+// SHM_BRIDGE_TEST_ROLE set; children run their role and never register tests.
 
 import { test } from 'node:test';
 import { fork, spawnSync } from 'node:child_process';
@@ -15,8 +15,8 @@ import * as sync from '../src/sync';
 import { assert, uniqueName, holdForTest, unlinkQuietly, assertThrowsCode } from './helpers';
 
 const PKG = require.resolve('../src/core');
-const ROLE = process.env.MEMBRIDGE_TEST_ROLE;
-const ARG = process.env.MEMBRIDGE_TEST_ARG ?? '';
+const ROLE = process.env.SHM_BRIDGE_TEST_ROLE;
+const ARG = process.env.SHM_BRIDGE_TEST_ARG ?? '';
 
 function unlinkLocal(name: string): void {
   try {
@@ -115,7 +115,7 @@ if (ROLE !== undefined) {
 
 function forkChild(role: string, arg: string): ReturnType<typeof fork> {
   return fork(__filename, {
-    env: { ...process.env, MEMBRIDGE_TEST_ROLE: role, MEMBRIDGE_TEST_ARG: arg },
+    env: { ...process.env, SHM_BRIDGE_TEST_ROLE: role, SHM_BRIDGE_TEST_ARG: arg },
     stdio: 'inherit',
   });
 }
@@ -197,7 +197,7 @@ function registerTests(): void {
     try {
       holdForTest(t, open(name, 4096));
       const r = spawnSync(process.execPath, ['--expose-gc', __filename], {
-        env: { ...process.env, MEMBRIDGE_TEST_ROLE: 'terminate-pin', MEMBRIDGE_TEST_ARG: name },
+        env: { ...process.env, SHM_BRIDGE_TEST_ROLE: 'terminate-pin', SHM_BRIDGE_TEST_ARG: name },
         encoding: 'utf8',
         timeout: 20000,
       });

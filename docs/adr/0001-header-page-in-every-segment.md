@@ -19,7 +19,7 @@ crash-state tests that craft headers by hand.
 
 ## Decision
 
-Every membridge segment starts with a one-page header (max(4096, page size),
+Every shm-bridge segment starts with a one-page header (max(4096, page size),
 page-aligned) containing magic + layout version, an init state machine
 (uninit → initializing → ready), authoritative sizes, kind flags, and a
 32-byte-per-row attach table (~126 rows at 4 KiB). The layout is a

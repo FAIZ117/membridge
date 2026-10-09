@@ -10,7 +10,7 @@ import { open } from '../src/core';
 import { Mutex, MUTEX_DATA_BYTES, SLOT_LAYOUT } from '../src/mutex';
 import { RingProducer, RingConsumer } from '../src/ringbuffer';
 import { list, reap, stat } from '../src/ops';
-import { MembridgeError } from '../src/errors';
+import { ShmBridgeError } from '../src/errors';
 import { assert, assertThrowsCode, uniqueName, holdForTest, unlinkQuietly } from './helpers';
 
 const CORE = require.resolve('../src/core');
@@ -61,7 +61,7 @@ test('E4-1: close() while lockAsync is pending rejects with E_CLOSED and never a
     const pending = m.lockAsync();
     await new Promise((r) => setTimeout(r, 50));
     m.close();
-    await assert.rejects(pending, (e: any) => e instanceof MembridgeError && e.code === 'E_CLOSED');
+    await assert.rejects(pending, (e: any) => e instanceof ShmBridgeError && e.code === 'E_CLOSED');
     await holderExit;
     // Not wedged, not double-held: another process acquires cleanly.
     const after = runNode(
@@ -163,7 +163,7 @@ test('E4-3: tryLock reports a holder\'s death and does not leave it for the next
 // ---- E4-4: creator reserving vs a racing joiner --------------------------------
 
 test('E4-4: a joiner never takes over a live creator that is reserving',
-  { skip: LINUX && process.env.MEMBRIDGE_TEST_TMPFS === undefined ? false
+  { skip: LINUX && process.env.SHM_BRIDGE_TEST_TMPFS === undefined ? false
         : LINUX ? 'needs a /dev/shm that can hold a 192 MiB reserve (the CI tmpfs cannot)'
         : 'Linux fallocate' }, async () => {
   // The race needs the joiner's 50 ms grace to expire while the creator is
@@ -395,7 +395,7 @@ test('E4-10: a raw open of a ring does not create a second producer on this thre
 
 // ---- S4-14: test hooks are inert in production -----------------------------------
 
-test('S4-14: the fault-injection hook is disabled without MEMBRIDGE_TEST_HOOKS=1', () => {
+test('S4-14: the fault-injection hook is disabled without SHM_BRIDGE_TEST_HOOKS=1', () => {
   const r = runNode(
     `try{require(${JSON.stringify(require.resolve('../src/native'))}).nativeOrThrow().debugFailAfterGrow();console.log('ENABLED')}catch(e){console.log(e.code)}`,
   );

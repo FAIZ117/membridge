@@ -8,28 +8,29 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { unlink } from '../src/core';
-import { MembridgeError } from '../src/errors';
+import { ShmBridgeError } from '../src/errors';
 import type { TestContext } from 'node:test';
 
 let nameCounter = 0;
 
 /**
- * /membridge-test-<unique> — caller (or makeTrackedName) unlinks it.
+ * /shm-bridge-test-<unique> — caller (or makeTrackedName) unlinks it.
  * darwin caps shm names at 31 bytes (PSHMNAMLEN, fact U2), so the suffix is
- * compressed there; the /membridge-test- prefix rule (AGENTS.md hygiene) and
+ * compressed there; the /shm-bridge-test- prefix rule (AGENTS.md hygiene) and
  * cross-process uniqueness (pid + counter + random) hold on every platform.
  */
 export function uniqueName(): string {
   nameCounter++;
   if (process.platform === 'darwin') {
-    // 16 (prefix) + up to 15 more: pid base36 (~5) + '-' + counter base36 (~2)
-    // + '-' + 6 random bytes base36 (~8) stays under 31.
+    // 17 (prefix) + pid base36 (~5) + '-' + counter base36 (1-2) + 6 random
+    // chars = 30-31. A longer counter only loses trailing random chars to the
+    // slice; the counter itself (the uniqueness within a process) survives.
     const pid = process.pid.toString(36);
     const ctr = nameCounter.toString(36);
     const rnd = randomBytes(6).toString('base64url').slice(0, 6);
-    return `/membridge-test-${pid}-${ctr}${rnd}`.slice(0, 31);
+    return `/shm-bridge-test-${pid}-${ctr}${rnd}`.slice(0, 31);
   }
-  return `/membridge-test-${process.pid}-${Date.now().toString(36)}-${nameCounter}-${randomBytes(4).toString('hex')}`;
+  return `/shm-bridge-test-${process.pid}-${Date.now().toString(36)}-${nameCounter}-${randomBytes(4).toString('hex')}`;
 }
 
 /** Name plus an auto-cleanup hook on the test context (runs on failure too). */
@@ -67,11 +68,11 @@ export function unlinkQuietly(name: string): void {
 export function assertThrowsCode(
   fn: () => unknown,
   code: string,
-  fieldChecks?: (err: MembridgeError) => void,
+  fieldChecks?: (err: ShmBridgeError) => void,
 ): void {
   assert.throws(fn, (err: unknown) => {
-    assert.ok(err instanceof MembridgeError, `expected MembridgeError, got ${String(err)}`);
-    const e = err as MembridgeError;
+    assert.ok(err instanceof ShmBridgeError, `expected ShmBridgeError, got ${String(err)}`);
+    const e = err as ShmBridgeError;
     assert.strictEqual(e.code, code, `expected ${code}, got ${e.code} (${e.message})`);
     if (fieldChecks !== undefined) fieldChecks(e);
     return true;
@@ -93,7 +94,7 @@ export function killHard(pid: number): void {
 
 // ---- §5.2 header byte contract (mirrors cc/header.h) ------------------------
 
-export const HEADER_MAGIC = 0x424d454d;
+export const HEADER_MAGIC = 0x424d4853; // "SHMB" little-endian
 export const LAYOUT_VERSION = 1;
 export const MIN_HEADER_BYTES = 4096;
 

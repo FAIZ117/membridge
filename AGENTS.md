@@ -1,4 +1,4 @@
-# AGENTS.md — membridge
+# AGENTS.md — shm-bridge
 
 Cross-process shared memory for Node.js: a `SharedArrayBuffer` over OS shared
 memory (Linux/macOS/Windows), plus a crash-safe Mutex, a zero-copy RingBuffer,
@@ -10,7 +10,7 @@ questions.**
 ## Layout
 
 ```
-membridge/
+shm-bridge/
 ├── AGENTS.md            # this file — agent context, commands, guardrails
 ├── PLAN.md              # the spec: design + reasoning; §11 is the change log
 ├── package.json         # "private": true is deliberate — see guardrails
@@ -53,13 +53,13 @@ The contract agents may rely on; each is verified from its milestone onward.
    owner publishes. Never remove that field or bump versions for release.
 2. **Never commit build output**: `prebuilds/`, `dist/`, `*.node` are gitignored.
 3. **`/dev/shm` hygiene**: every test/probe segment name starts with
-   `/membridge-test-` or `/membridge-probe-` plus a unique suffix, and is
+   `/shm-bridge-test-` or `/shm-bridge-probe-` plus a unique suffix, and is
    `unlink`ed in a `finally`/cleanup path. Segments survive crashes — leaked
    names are someone else's `/dev/shm` garbage.
 4. **Waitable words are `i32` only** (futex/`os_sync`/semaphore constraint, §6).
    The user-facing SAB covers the data region only; the header page is
    native-only memory.
-5. **Errors are `E_*` codes** on `MembridgeError`. A new code goes into PLAN §10
+5. **Errors are `E_*` codes** on `ShmBridgeError`. A new code goes into PLAN §10
    and `src/errors.ts` in the same change.
 6. **Platform truth lives in `docs/compat.md`**: Windows — no `grow`, no
    `capacity`/`list`; macOS — 31-char name limit if U2 holds, no `grow` (U2),

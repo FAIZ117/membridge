@@ -8,17 +8,17 @@ re-verified after Node/OS upgrades instead of trusted from memory.
 
 - One script per fact: `f1-cross-process-notify.js`, `u5-atomics-pairing.js`, …
 - Each script prints a `PASS`/`FAIL` line plus the measured values, exits 0/1.
-- Creates segments only under `/membridge-probe-<unique>` and always cleans up.
+- Creates segments only under `/shm-bridge-probe-<unique>` and always cleans up.
 - Probes may use platform-specific APIs freely; skip with a clear message when
   run on the wrong OS.
 
 ## Build prerequisite
 
-Probes drive the M1 spike addon (`spike/build/Release/membridge_spike.node`),
+Probes drive the M1 spike addon (`spike/build/Release/shm_bridge_spike.node`),
 which is ABI-bound (plain V8, not N-API). `probes/lib.js` rebuilds it
 automatically for the running Node via `npx node-gyp rebuild
 --target=<running version>` (headers come from the local cache or nodejs.org);
-set `MEMBRIDGE_SPIKE_ADDON` to point at a different build.
+set `SHM_BRIDGE_SPIKE_ADDON` to point at a different build.
 
 | Fact | Probe | Status |
 |------|-------|--------|

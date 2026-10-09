@@ -21,7 +21,7 @@ const bytes = 4096;
 // BackingStore over the same process-wide Mapping.
 const WORKER_CODE = `
   const { parentPort, workerData } = require('worker_threads');
-  const a = require(process.env.MEMBRIDGE_PROBE_ADDON);
+  const a = require(process.env.SHM_BRIDGE_PROBE_ADDON);
   const sab = a.open(workerData.name, workerData.bytes);
   const i32 = new Int32Array(sab);
   parentPort.postMessage({ type: 'ready' });
@@ -38,7 +38,7 @@ function spawnWaiter() {
   const w = new Worker(WORKER_CODE, {
     eval: true,
     workerData: { name, bytes, timeoutMs: 5000 },
-    env: { ...process.env, MEMBRIDGE_PROBE_ADDON: ADDON },
+    env: { ...process.env, SHM_BRIDGE_PROBE_ADDON: ADDON },
   });
   w.on('error', e => console.error('[worker error]', e.stack || e));
   let resolveReady, resolveResult;

@@ -81,10 +81,11 @@ passed on the rerun) — runner scheduling jitter, not reproduced.
   sanity-checked 18) → `npm publish --provenance` from Actions with
   `NPM_TOKEN` (set). Experimental platforms run in `test-experimental`,
   non-blocking.
-- The npm name is **shm-bridge** (`membridge` and `memfuse` were both 403'd
-  by the typosquat rule — vs `mem-bridge` and `memfs`). Internal codenames
-  (MembridgeError, `MEMBRIDGE_*` env, `/membridge-*` segment prefixes, the
-  repo's PLAN.md) intentionally stay "membridge".
-- v0.1.0 is published; the NEXT release needs a version bump (0.1.1) + the
-  private-guard is already down. Re-pointing `v0.1.0` re-runs the pipeline
-  but npm rejects re-publishing an existing version (E409) — expected.
+- The npm name is **shm-bridge** (the original codename and `memfuse` were
+  both 403'd by npm's typosquat rule). Since 0.2.0 everything — repo, error
+  class (`ShmBridgeError`), `SHM_BRIDGE_*` env, `/shm-bridge-*` segment
+  prefixes, Windows object names, the header magic ("SHMB") — carries the
+  shm-bridge name.
+- v0.1.0 is published; 0.2.0 is the next release (the rename is breaking).
+  Re-pointing an existing tag re-runs the pipeline but npm rejects
+  re-publishing an existing version (E409) — expected.

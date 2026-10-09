@@ -2,8 +2,8 @@
 // the native layer (defense in depth); the size is a JS number handled as a
 // double end to end, never Uint32Value (F5).
 
-import { MembridgeError } from './errors';
-import { isMembridgeErrorCode } from './errors';
+import { ShmBridgeError } from './errors';
+import { isShmBridgeErrorCode } from './errors';
 import { native, nativeOrThrow, nativeErrorCode } from './native';
 import { fallbackEnabled, fallbackOpen, fallbackUnlink } from './fallback';
 
@@ -35,7 +35,7 @@ export interface OpenOptions {
 export const DEFAULT_MAX_SEGMENT_BYTES = 256 * 1024 * 1024;
 
 function maxSegmentBytes(): number {
-  const raw = process.env.MEMBRIDGE_MAX_SEGMENT_BYTES;
+  const raw = process.env.SHM_BRIDGE_MAX_SEGMENT_BYTES;
   if (raw === undefined || raw === '') return DEFAULT_MAX_SEGMENT_BYTES;
   const v = Number(raw);
   if (!Number.isSafeInteger(v) || v <= 0) return DEFAULT_MAX_SEGMENT_BYTES;
@@ -45,16 +45,16 @@ function maxSegmentBytes(): number {
 export function validateSize(name: string, size: number | undefined): void {
   if (size === undefined) return;
   if (!Number.isSafeInteger(size) || size < 1 || size > 4 * 1024 * 1024 * 1024) {
-    throw new MembridgeError('E_SIZE_INVALID', `size must be a safe integer >= 1 (got ${size})`, {
+    throw new ShmBridgeError('E_SIZE_INVALID', `size must be a safe integer >= 1 (got ${size})`, {
       segmentName: name,
       requested: size,
     });
   }
   const cap = maxSegmentBytes();
   if (size > cap) {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_SIZE_INVALID',
-      `size ${size} exceeds MEMBRIDGE_MAX_SEGMENT_BYTES (${cap})`,
+      `size ${size} exceeds SHM_BRIDGE_MAX_SEGMENT_BYTES (${cap})`,
       { segmentName: name, requested: size },
     );
   }
@@ -71,7 +71,7 @@ export function validateName(name: string): void {
     name.indexOf('/', 1) !== -1 ||
     Buffer.byteLength(name, 'utf8') > maxLen
   ) {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_NAME_INVALID',
       `segment name must start with '/', contain no other '/', and be <= ${maxLen} bytes on ${platform}`,
       { segmentName: name },
@@ -156,7 +156,7 @@ export function close(name: string): void {
 /**
  * Remove the segment name (POSIX shm_unlink). On Windows the section
  * disappears with the last handle; unlink there only prevents new joins via
- * membridge (marks the header UNLINKED). Throws E_NOT_FOUND when missing.
+ * shm-bridge (marks the header UNLINKED). Throws E_NOT_FOUND when missing.
  */
 export function unlink(name: string): void {
   validateName(name);

@@ -4,7 +4,7 @@
 const path = require('path');
 const { randomBytes } = require('crypto');
 
-const ADDON = path.join(__dirname, 'build', 'Release', 'membridge_spike.node');
+const ADDON = path.join(__dirname, 'build', 'Release', 'shm_bridge_spike.node');
 
 function addon() {
   return require(ADDON);
@@ -12,10 +12,10 @@ function addon() {
 
 const runSuffix = randomBytes(5).toString('hex');
 
-// /dev/shm hygiene (AGENTS.md guardrail 3): /membridge-probe-<unique>, always
+// /dev/shm hygiene (AGENTS.md guardrail 3): /shm-bridge-probe-<unique>, always
 // unlinked by the caller's cleanup path.
 function probeName(tag) {
-  return `/membridge-probe-${tag}-${process.pid}-${runSuffix}-${Date.now().toString(36)}`;
+  return `/shm-bridge-probe-${tag}-${process.pid}-${runSuffix}-${Date.now().toString(36)}`;
 }
 
 function cleanupAll(a, names) {

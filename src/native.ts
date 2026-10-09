@@ -3,8 +3,8 @@
 // (node-gyp runs from the package root, which is why binding.gyp lives there).
 
 import path from 'node:path';
-import { MembridgeError } from './errors';
-import type { MembridgeErrorCode } from './errors';
+import { ShmBridgeError } from './errors';
+import type { ShmBridgeErrorCode } from './errors';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type NativeBinding = any;
@@ -57,7 +57,7 @@ export interface Native {
   };
   // Undocumented test/debug hooks (not re-exported from index.ts).
   debugRegistryHas(name: string): boolean;
-  /** Test-only (needs MEMBRIDGE_TEST_HOOKS=1, else E_UNSUPPORTED): the next
+  /** Test-only (needs SHM_BRIDGE_TEST_HOOKS=1, else E_UNSUPPORTED): the next
    * grow-policy open throws E_SYSTEM right after its grow re-maps. */
   debugFailAfterGrow(): void;
   selfIdentity(): { pid: number; threadId: number; startTime: number; pidNsInode: number };
@@ -91,8 +91,8 @@ function load(): NativeBinding | undefined {
   try {
     const loadAddon = require('node-gyp-build');
     binding = loadAddon(packageRoot()) as NativeBinding;
-    if (binding && typeof binding.setMembridgeErrorCtor === 'function') {
-      binding.setMembridgeErrorCtor(MembridgeError);
+    if (binding && typeof binding.setShmBridgeErrorCtor === 'function') {
+      binding.setShmBridgeErrorCtor(ShmBridgeError);
     }
   } catch {
     binding = undefined; // fallback path handles this (§5.6)
@@ -115,18 +115,18 @@ export function isNative(): boolean {
 export function nativeOrThrow(): Native {
   const b = load();
   if (!b) {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_NATIVE_UNAVAILABLE',
-      'the membridge native addon is not available; set MEMBRIDGE_ALLOW_FALLBACK=1 ' +
+      'the shm-bridge native addon is not available; set SHM_BRIDGE_ALLOW_FALLBACK=1 ' +
         'or pass allowFallback to opt into the in-process fallback',
     );
   }
   return b as Native;
 }
 
-export function nativeErrorCode(err: unknown): MembridgeErrorCode | undefined {
+export function nativeErrorCode(err: unknown): ShmBridgeErrorCode | undefined {
   if (err !== null && typeof err === 'object' && typeof (err as { code?: unknown }).code === 'string') {
-    return (err as { code: string }).code as MembridgeErrorCode;
+    return (err as { code: string }).code as ShmBridgeErrorCode;
   }
   return undefined;
 }

@@ -29,7 +29,7 @@
 #include <unistd.h>
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 namespace {
 std::mutex g_detach_mu;  // serializes Detach header updates
@@ -282,4 +282,4 @@ std::vector<std::shared_ptr<Mapping>> Registry::Live() {
   return out;
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

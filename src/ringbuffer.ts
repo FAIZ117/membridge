@@ -20,7 +20,7 @@
 // consumer that dies mid-peek leaves the message unreleased, so the next
 // consumer sees it again (at-least-once, §8.2).
 
-import { MembridgeError } from './errors';
+import { ShmBridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { open, type OpenOptions } from './core';
 import { waitAsync } from './sync';
@@ -53,14 +53,14 @@ const nowMs = (): number => performance.now();  // monotonic (review F35)
 const sliceOf = (deadline: number): number =>
   Math.max(1, Math.min(sleepSliceMs, deadline - nowMs()));
 
-// Same timeout contract as membridge/sync and Mutex (PLAN §7.3/§8.2), except
+// Same timeout contract as shm-bridge/sync and Mutex (PLAN §7.3/§8.2), except
 // that 0 is valid here and means "non-blocking". NaN used to wait forever
 // (round-3 C14).
 const MAX_TIMEOUT_MS = 2 ** 31;
 function checkTimeoutMs(timeoutMs: number | undefined, who: string): void {
   if (timeoutMs !== undefined &&
       (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMEOUT_MS)) {
-    throw new MembridgeError('E_NAME_INVALID',
+    throw new ShmBridgeError('E_NAME_INVALID',
       `${who}: timeoutMs must be a finite number in [0, ${MAX_TIMEOUT_MS}] (got ${timeoutMs})`);
   }
 }
@@ -90,7 +90,7 @@ function align8(n: number): number {
 function assertCapacity(name: string, capacity: number, maxMessage: number | undefined): number {
   if (!Number.isSafeInteger(capacity) || capacity < MIN_CAPACITY || capacity > MAX_CAPACITY ||
       (capacity & (capacity - 1)) !== 0) {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_SIZE_INVALID',
       `capacity must be a power of two between ${MIN_CAPACITY} and ${MAX_CAPACITY}`,
       { segmentName: name, requested: capacity },
@@ -98,7 +98,7 @@ function assertCapacity(name: string, capacity: number, maxMessage: number | und
   }
   const cap = maxMessage ?? Math.floor(capacity / 2) - 8;
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > Math.floor(capacity / 2) - 8) {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_SIZE_INVALID',
       `maxMessage must be <= capacity/2 - 8 (= ${Math.floor(capacity / 2) - 8})`,
       { segmentName: name, requested: cap },
@@ -154,7 +154,7 @@ export class RingProducer {
       capacity = opts.capacity;
       maxMessage = assertCapacity(name, capacity, opts.maxMessage);
       if (capacity > MAX_CAPACITY) {
-        throw new MembridgeError('E_SIZE_INVALID', 'capacity too large', { segmentName: name });
+        throw new ShmBridgeError('E_SIZE_INVALID', 'capacity too large', { segmentName: name });
       }
     }
     const sab =
@@ -167,7 +167,7 @@ export class RingProducer {
     // §8.2 init: a joiner's capacity/maxMessage must match the header —
     // validated BEFORE the role claim so a mismatch never steals the seat.
     if (cap < MIN_CAPACITY || cap > MAX_CAPACITY || (cap & (cap - 1)) !== 0) {
-      throw new MembridgeError(
+      throw new ShmBridgeError(
         'E_SIZE_INVALID',
         `ring capacity must be a power of two between ${MIN_CAPACITY} and ${MAX_CAPACITY}`,
         { segmentName: name, requested: cap },
@@ -175,14 +175,14 @@ export class RingProducer {
     }
     const hdrCap = Atomics.load(view, CAPACITY);
     if (hdrCap !== 0 && hdrCap !== cap) {
-      throw new MembridgeError('E_SIZE_MISMATCH',
+      throw new ShmBridgeError('E_SIZE_MISMATCH',
         `ring capacity ${cap} does not match the existing ${hdrCap}`, {
           segmentName: name, requested: cap, existing: hdrCap,
         });
     }
     const hdrMax = Atomics.load(view, MAX_MESSAGE);
     if (hdrMax !== 0 && hdrMax !== mm) {
-      throw new MembridgeError('E_SIZE_MISMATCH',
+      throw new ShmBridgeError('E_SIZE_MISMATCH',
         `ring maxMessage ${mm} does not match the existing ${hdrMax}`, {
           segmentName: name, requested: mm, existing: hdrMax,
         });
@@ -191,7 +191,7 @@ export class RingProducer {
     const live = liveProducers.get(name)?.deref();
     if (live !== undefined && !live.closed && b.sameMemory(live.view, view)) {
       if (live.capacity !== cap || live.maxMessage !== mm) {
-        throw new MembridgeError('E_SIZE_MISMATCH',
+        throw new ShmBridgeError('E_SIZE_MISMATCH',
           'ring capacity/maxMessage differ from the producer already open on this thread', {
             segmentName: name, requested: cap, existing: live.capacity,
           });
@@ -226,7 +226,7 @@ export class RingProducer {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new MembridgeError('E_CLOSED', 'ring producer is closed', { segmentName: this.name });
+      throw new ShmBridgeError('E_CLOSED', 'ring producer is closed', { segmentName: this.name });
     }
   }
 
@@ -266,7 +266,7 @@ export class RingProducer {
 
   private assertNoPending(): void {
     if (this.pending !== null) {
-      throw new MembridgeError('E_RING_STATE', 'previous reserve not committed', {
+      throw new ShmBridgeError('E_RING_STATE', 'previous reserve not committed', {
         segmentName: this.name,
       });
     }
@@ -277,12 +277,12 @@ export class RingProducer {
     checkTimeoutMs(timeoutMs, who);
     this.assertNoPending();
     if (!Number.isSafeInteger(n) || n < 0) {
-      throw new MembridgeError('E_SIZE_INVALID', 'message size must be a safe integer >= 0', {
+      throw new ShmBridgeError('E_SIZE_INVALID', 'message size must be a safe integer >= 0', {
         segmentName: this.name,
       });
     }
     if (n > this.maxMessage) {
-      throw new MembridgeError('E_MESSAGE_TOO_LARGE',
+      throw new ShmBridgeError('E_MESSAGE_TOO_LARGE',
         `message of ${n} bytes exceeds maxMessage of ${this.maxMessage}`, {
           segmentName: this.name,
           requested: n,
@@ -292,8 +292,8 @@ export class RingProducer {
     return align8(4 + n);
   }
 
-  private fullError(who: string): MembridgeError {
-    return new MembridgeError('E_TIMEOUT', `ring full: ${who} timed out`, { segmentName: this.name });
+  private fullError(who: string): ShmBridgeError {
+    return new ShmBridgeError('E_TIMEOUT', `ring full: ${who} timed out`, { segmentName: this.name });
   }
 
   // One non-blocking attempt (round-3 C19: no exception on the full path —
@@ -331,7 +331,7 @@ export class RingProducer {
   commit(): void {
     this.assertOpen();
     if (this.pending === null) {
-      throw new MembridgeError('E_RING_STATE', 'no reserve to commit', { segmentName: this.name });
+      throw new ShmBridgeError('E_RING_STATE', 'no reserve to commit', { segmentName: this.name });
     }
     const { headSnapshot, pos, framed, payload } = this.pending;
     this.pending = null;
@@ -439,7 +439,7 @@ export class RingConsumer {
     const sab = open(name, { kind: 'ring', winGlobal: opts?.winGlobal, initTimeoutMs: opts?.initTimeoutMs });
     const capacity = sab.byteLength - RING_HEADER_BYTES;
     if (capacity < MIN_CAPACITY || (capacity & (capacity - 1)) !== 0) {
-      throw new MembridgeError('E_INCOMPATIBLE', 'segment is not a membridge ring', {
+      throw new ShmBridgeError('E_INCOMPATIBLE', 'segment is not a shm-bridge ring', {
         segmentName: name,
       });
     }
@@ -448,7 +448,7 @@ export class RingConsumer {
     // ring kind whose size disagrees with its own header is not usable.
     const hdrCap = Atomics.load(view, CAPACITY);
     if (hdrCap !== 0 && hdrCap !== capacity) {
-      throw new MembridgeError('E_INCOMPATIBLE',
+      throw new ShmBridgeError('E_INCOMPATIBLE',
         `ring header capacity ${hdrCap} does not match the segment size (${capacity})`, {
           segmentName: name, requested: capacity, existing: hdrCap,
         });
@@ -474,7 +474,7 @@ export class RingConsumer {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new MembridgeError('E_CLOSED', 'ring consumer is closed', { segmentName: this.name });
+      throw new ShmBridgeError('E_CLOSED', 'ring consumer is closed', { segmentName: this.name });
     }
   }
 
@@ -491,7 +491,7 @@ export class RingConsumer {
     this.assertOpen();
     checkTimeoutMs(opts?.timeoutMs, 'peek');
     if (this.pending !== null) {
-      throw new MembridgeError('E_RING_STATE', 'previous peek not released', {
+      throw new ShmBridgeError('E_RING_STATE', 'previous peek not released', {
         segmentName: this.name,
       });
     }
@@ -553,7 +553,7 @@ export class RingConsumer {
   release(): void {
     this.assertOpen();
     if (this.pending === null) {
-      throw new MembridgeError('E_RING_STATE', 'no peek to release', { segmentName: this.name });
+      throw new ShmBridgeError('E_RING_STATE', 'no peek to release', { segmentName: this.name });
     }
     const { framed, tailSnapshot } = this.pending;
     this.pending = null;

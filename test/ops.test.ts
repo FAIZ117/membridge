@@ -28,15 +28,15 @@ test('list(): magic-filtered; foreign files ignored', () => {
   if (!LINUX) return; // list is Linux-only (§9)
   const a = uniqueName();
   const b = uniqueName();
-  const foreign = `/dev/shm/foreign-not-membridge-${process.pid}`;
+  const foreign = `/dev/shm/foreign-not-shm-bridge-${process.pid}`;
   try {
     open(a, 256);
     open(b, 256);
-    fs.writeFileSync(foreign, Buffer.from('not a membridge segment'));
+    fs.writeFileSync(foreign, Buffer.from('not a shm-bridge segment'));
     const names = list();
     assert.ok(names.includes(a), 'lists our segment');
     assert.ok(names.includes(b), 'lists the second segment');
-    assert.ok(!names.includes(`/foreign-not-membridge-${process.pid}`), 'foreign file filtered');
+    assert.ok(!names.includes(`/foreign-not-shm-bridge-${process.pid}`), 'foreign file filtered');
   } finally {
     unlinkQuietly(a);
     unlinkQuietly(b);
@@ -161,7 +161,7 @@ test('reap(): mixed live/dead rows block the reap', async () => {
 
 function runChild(script: string, name: string): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(process.execPath, ['--expose-gc', '-e', script], {
-    env: { ...process.env, MEMBRIDGE_TEST_PKG: PKG, MEMBRIDGE_TEST_NAME: name },
+    env: { ...process.env, SHM_BRIDGE_TEST_PKG: PKG, SHM_BRIDGE_TEST_NAME: name },
     encoding: 'utf8',
   });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
@@ -176,8 +176,8 @@ test('unlinkWhenUnused: the detaching process that empties the table unlinks', (
     holdForTest(t, open(parentName, 4096));
     const r = runChild(
       `
-      const { open } = require(process.env.MEMBRIDGE_TEST_PKG);
-      let sab = open(process.env.MEMBRIDGE_TEST_NAME, 4096, { unlinkWhenUnused: true });
+      const { open } = require(process.env.SHM_BRIDGE_TEST_PKG);
+      let sab = open(process.env.SHM_BRIDGE_TEST_NAME, 4096, { unlinkWhenUnused: true });
       new Int32Array(sab)[0] = 5;
       sab = null;
       for (let i = 0; i < 6; i++) global.gc();
@@ -190,14 +190,14 @@ test('unlinkWhenUnused: the detaching process that empties the table unlinks', (
     // sole attacher with the flag: its detach empties the table -> unlink
     const r2 = runChild(
       `
-      const { open } = require(process.env.MEMBRIDGE_TEST_PKG);
+      const { open } = require(process.env.SHM_BRIDGE_TEST_PKG);
       const { statSync } = require('node:fs');
-      let sab = open(process.env.MEMBRIDGE_TEST_NAME, 4096, { unlinkWhenUnused: true });
+      let sab = open(process.env.SHM_BRIDGE_TEST_NAME, 4096, { unlinkWhenUnused: true });
       new Int32Array(sab)[0] = 9;
       sab = null;
       for (let i = 0; i < 6; i++) global.gc();
       try {
-        statSync('/dev/shm' + process.env.MEMBRIDGE_TEST_NAME);
+        statSync('/dev/shm' + process.env.SHM_BRIDGE_TEST_NAME);
         console.log('STILL_THERE');
       } catch {
         console.log('GONE');

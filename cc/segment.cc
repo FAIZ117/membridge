@@ -24,7 +24,7 @@
 #include <unistd.h>
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 namespace {
 
@@ -88,9 +88,9 @@ std::string ObjectName(const std::string& name, bool winGlobal) {
     else if (c == '%') escaped += "%25";
     else escaped += c;
   }
-  // "Local\membridge" prefix + escaped name; NT object names are limited to
+  // "Local\shm-bridge" prefix + escaped name; NT object names are limited to
   // 255 UTF-16 chars — exceeding it is E_NAME_INVALID, never truncation.
-  const std::string prefix = winGlobal ? "Global\\membridge" : "Local\\membridge";
+  const std::string prefix = winGlobal ? "Global\\shm-bridge" : "Local\\shm-bridge";
   if (prefix.size() + escaped.size() > 255) {
     ThrowError(v8::Isolate::GetCurrent(), "E_NAME_INVALID",
                "escaped object name exceeds the 255-char kernel limit", name);
@@ -464,7 +464,7 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
   if (region < sizeof(Header)) {
     UnmapViewOfFile(base);
     CloseHandle(section);
-    ThrowError(isolate, "E_INCOMPATIBLE", "segment is smaller than a membridge header", name);
+    ThrowError(isolate, "E_INCOMPATIBLE", "segment is smaller than a shm-bridge header", name);
   }
   const Header* h = static_cast<const Header*>(base);
   out->magic = h->magic;
@@ -549,7 +549,7 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
     // objSize (from the fstat above, pre-close) vs bytes actually read: on
     // macOS this pair diagnosed a sized object whose reads return EOF.
     ThrowError(isolate, "E_INCOMPATIBLE",
-               "segment too small for a membridge header (" + std::to_string(total) +
+               "segment too small for a shm-bridge header (" + std::to_string(total) +
                    " bytes read, object size " + std::to_string(objSize) + ")",
                name);
   }
@@ -581,4 +581,4 @@ void ReadHeader(v8::Isolate* isolate, const std::string& name, uint32_t maxAttac
 #endif
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

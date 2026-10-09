@@ -8,7 +8,7 @@
 | Platform of evidence | Linux 7.2.9 (Fedora 43), x86_64, 18 cores, Node 24.18 |
 | Build | `npx node-gyp rebuild` clean (2 warnings: upstream `node.h` cast; unused `HubFor` at `cc/wait.cc:115`) |
 | Suite | `npm test`: 81 tests, 80 pass, 1 env-gated skip |
-| Mode | Read-only. Three re-verification passes (correctness, performance, security) plus independent repros. All segments used `/membridge-test-rv*-` / `/membridge-sec-rv-` names; `/dev/shm` clean afterwards. |
+| Mode | Read-only. Three re-verification passes (correctness, performance, security) plus independent repros. All segments used `/shm-bridge-test-rv*-` / `/shm-bridge-sec-rv-` names; `/dev/shm` clean afterwards. |
 
 macOS and Windows statements are from source reading only. The security
 pass was partly interrupted (exploit-style PoCs that write past a mapping
@@ -232,7 +232,7 @@ the documented model.
 | R7 | P2 | Multiple initializers after a dead initializer; creator stores state 1 without CAS | `cc/header.cc:174,253-259,298` |
 | R8 | P2 | Grace-path `ftruncate(headerBytes)` from a stale fstat can shrink a sized object; grower window before recording itself; grow error paths leave state 1 | `cc/segment.cc` joiner branch; `cc/header.cc:339-354` |
 | R9 | P1 | Creator sizing failure leaves the name stuck in state 1 for the creator's lifetime; on macOS (U2) every non-raw create may fail this way | `cc/header.cc:174-176`; `cc/segment.cc:255` |
-| R10 | P2 | Grow trusts header `dataBytes` as a size floor (bypasses `MEMBRIDGE_MAX_SEGMENT_BYTES` under a race) | `cc/header.cc:357-358` |
+| R10 | P2 | Grow trusts header `dataBytes` as a size floor (bypasses `SHM_BRIDGE_MAX_SEGMENT_BYTES` under a race) | `cc/header.cc:357-358` |
 | R11 | P1 | SIGSEGV at worker teardown walking unmapped `claimedData` (mutex claimed after unlink, instance GC'd) | `cc/mutex.cc:301-303` |
 | R12 | P1 | Claim-time pin keeps every claimed Mutex's mapping + fd for the isolate's lifetime | `cc/mutex.cc:232-233` |
 | R13 | P2 | Mutex waiter parks on a re-read word without HAS_WAITERS → 250–500 ms stalls | `src/mutex.ts:158-169` (+ `lockAsync`) |
@@ -346,7 +346,7 @@ size in one `ftruncate` on macOS.
 max(target, HeaderDataBytesOf(h))` (`cc/header.cc:357-358`) feeds
 `EnsureSized`/`ftruncate`. With a racing writer (the ready branch rejects a
 static hostile value), a victim's grow truncates to an attacker-chosen size,
-bypassing `MEMBRIDGE_MAX_SEGMENT_BYTES`; values ≥ 2^63 become a negative
+bypassing `SHM_BRIDGE_MAX_SEGMENT_BYTES`; values ≥ 2^63 become a negative
 `off_t` (`E_SYSTEM`). The window stays clamped. **Fix:** bound `existing` by
 `st_size - headerBytes` and the cap.
 

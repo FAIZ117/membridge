@@ -1,4 +1,4 @@
-// spike/addon.cc — membridge M1 spike addon (plain V8 via node.h, no N-API).
+// spike/addon.cc — shm-bridge M1 spike addon (plain V8 via node.h, no N-API).
 //
 // Proves the M1 exit criteria from a few dozen lines, mirroring the real §3
 // shape so the spike's conclusions transfer to M2:

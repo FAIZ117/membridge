@@ -1,7 +1,7 @@
 // ops.ts — §9 ops utilities with the per-platform matrix.
 //   capacity()         free/total of the shm backing store (Linux only)
 //   stat(name)         header contents: kind, sizes, attach table + liveness
-//   list()             Linux: readdir /dev/shm filtered by membridge magic
+//   list()             Linux: readdir /dev/shm filtered by shm-bridge magic
 //   reap({ dryRun })   unlink segments whose every attach row is dead
 //   open(..., { unlinkWhenUnused: true })  the last detacher unlinks (§9)
 //
@@ -10,7 +10,7 @@
 // counts as alive and is never reaped.
 
 import fs from 'node:fs';
-import { MembridgeError } from './errors';
+import { ShmBridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { unlink, validateName } from './core';
 import { nativeOrThrow as binding } from './native';
@@ -53,7 +53,7 @@ export interface ReapResult {
 const FLAG_ATTACH_OVERFLOW = 1;
 const FLAG_UNLINKED = 2;
 const KIND_MASK = 0xff << 8;
-const MAGIC = 0x424d454d;
+const MAGIC = 0x424d4853; // "SHMB" little-endian
 
 function kindOf(flags: number): 'plain' | 'mutex' | 'ring' {
   const k = flags & KIND_MASK;
@@ -65,7 +65,7 @@ function kindOf(flags: number): 'plain' | 'mutex' | 'ring' {
 /** Free/total of the shm backing store. Linux only (§9). */
 export function capacity(): Capacity {
   if (process.platform !== 'linux') {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_UNSUPPORTED',
       `capacity() is Linux-only: ${process.platform} has no bounded shm filesystem`,
     );
@@ -83,7 +83,7 @@ export function stat(name: string): SegmentStat {
   const b = nativeOrThrow();
   const h = b.readHeader(name);
   if (h.magic !== MAGIC) {
-    throw new MembridgeError('E_INCOMPATIBLE', `'${name}' is not a membridge segment`, {
+    throw new ShmBridgeError('E_INCOMPATIBLE', `'${name}' is not a shm-bridge segment`, {
       segmentName: name,
     });
   }
@@ -121,10 +121,10 @@ export function stat(name: string): SegmentStat {
   };
 }
 
-/** All membridge segments in /dev/shm (Linux only; magic-filtered, §9). */
+/** All shm-bridge segments in /dev/shm (Linux only; magic-filtered, §9). */
 export function list(): string[] {
   if (process.platform !== 'linux') {
-    throw new MembridgeError(
+    throw new ShmBridgeError(
       'E_UNSUPPORTED',
       `list() is Linux-only: POSIX shm cannot be enumerated on ${process.platform}`,
     );
@@ -132,7 +132,7 @@ export function list(): string[] {
   const out: string[] = [];
   for (const entry of fs.readdirSync('/dev/shm')) {
     // /dev/shm entries are bare object names; foreign files live there too,
-    // so the membridge magic — not a name prefix — decides (§9).
+    // so the shm-bridge magic — not a name prefix — decides (§9).
     const path = `/dev/shm/${entry}`;
     try {
       // Non-blocking, no symlinks, regular files only (round-4 S4-2/S4-7):
@@ -188,7 +188,7 @@ export function reap(opts?: ReapOptions): ReapResult[] {
       }
       results.push({ name, attachers: 0, reaped: true });
     } catch (e) {
-      if (e instanceof MembridgeError && (e.code === 'E_NOT_FOUND' || e.code === 'E_INCOMPATIBLE')) {
+      if (e instanceof ShmBridgeError && (e.code === 'E_NOT_FOUND' || e.code === 'E_INCOMPATIBLE')) {
         results.push({ name, attachers: 0, reaped: false });
         continue;
       }

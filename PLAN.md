@@ -1,15 +1,15 @@
-# membridge — Implementation Plan (rev 2)
+# shm-bridge — Implementation Plan (rev 2)
 
 > **Status: implemented (rev 2) — M1–M8 landed. §2 reflects the spike's
 > results; `probes/` holds the re-runnable evidence; lasting decisions carry
 > ADRs (docs/adr/0001–0004).**
-> Name `membridge` verified free on npm (registry 404, checked 2026-10-05).
+> Name `shm-bridge` verified free on npm (registry 404, checked 2026-10-05).
 > Every design decision below carries a **Why** so it can be challenged on its merits.
 > §11 lists what changed from rev 1 and the evidence behind each change.
 
 A new npm package with complete ownership that keeps the good parts of
 [`shmbuf`](https://www.npmjs.com/package/shmbuf) (MIT, by kedemd) while fixing its
-bugs and adding real cross-process synchronization. membridge supersedes shmbuf for our use.
+bugs and adding real cross-process synchronization. shm-bridge supersedes shmbuf for our use.
 
 **Scope (locked):** TypeScript · crash-safe Mutex · zero-copy RingBuffer · ops utilities.
 **Platforms:** Linux (primary), macOS and Windows (first-class, fully tested in CI — not "smoke").
@@ -18,7 +18,7 @@ bugs and adding real cross-process synchronization. membridge supersedes shmbuf 
 
 ## 1. Location & ownership
 
-- Standalone git repo at `/home/faiz/work/membridge/` (this repo).
+- Standalone git repo at `/home/faiz/work/shm-bridge/` (this repo).
 - MIT LICENSE, author "Faiz" (placeholder — edit before publishing).
 - README credits shmbuf (MIT) as the starting point.
 - Publishing to npm is done by the owner, not by the agent. `package.json` keeps
@@ -73,7 +73,7 @@ documented fallback for each in M3 regardless — a local spike cannot check the
                                                     liveness.cc  pid + start time + pid-ns identity
 ```
 
-Every membridge segment is **header page + data region**. The SAB handed to the
+Every shm-bridge segment is **header page + data region**. The SAB handed to the
 user covers only the data region, so user offsets start at 0 and stay page-aligned.
 
 **Mapping vs. BackingStore (explicit, to avoid an M2 mistake):** because a SAB's length
@@ -125,7 +125,7 @@ isNative(): boolean
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| magic, layoutVersion | u32, u32 | Reject non-membridge or incompatible segments (`E_INCOMPATIBLE`). |
+| magic, layoutVersion | u32, u32 | Reject non-shm-bridge or incompatible segments (`E_INCOMPATIBLE`). |
 | initState | i32 | 0 = uninit, 1 = initializing (+ initializer slot), 2 = ready. While INITIALIZING the word also carries the initializer's attach-row index in bits 8+ (`1 \| row<<8`) — the baton names its holder atomically, so a joiner can never read a stale row and hand the baton back while the real initializer is mid-publish (fix round 3, R7; a bare 1 from a hand-crafted crash state falls back to the `initializerSlot` field). Joiners wait on the CURRENT word value; every transition wakes the word. **Protocol (fix rounds 2026-10-06):** the creator sizes the WHOLE object in one `ftruncate` right after `O_EXCL` (two truncates break macOS U2; a failed sizing unlinks the name — R9), maps, claims its attach row, wins a 0→`1\|row<<8` CAS (the initializer baton), publishes `headerBytes` + `initializerSlot`, writes the full header, then stores 2 and wakes the word; a throw between the CAS and the ready store restores 0 so another opener can take over. A joiner arriving before the creator's header page exists grace-waits (250 ms, 50 µs backoff poll — R22); a creator that died before even that is taken over: the joiner truncates grow-only to `headerBytes` (R8), claims its row, and wins the 0→`1\|row<<8` CAS to initialize — so a joiner CAN ftruncate (grace/takeover path); only the size-less join never initializes (R6: it waits for a ready state instead). A dead initializer is handed back through a packed→0 CAS so exactly ONE joiner wins the 0→`1\|row<<8` CAS — no concurrent-WriteHeader war. **Round 4 (E4-4):** the creator reserves (`posix_fallocate`) only AFTER it holds the baton — reserving first let a joiner's grace expire mid-reserve and take over a live creator at the joiner's size; a takeover never writes a header smaller than the object a dead creator already sized (`dataBytes ≥ min(file − header, cap)`). **Round 3 (2026-10-07):** the word also carries an **epoch** (bits 20–30, never 0) bumped on every transition into INITIALIZING and preserved by READY and by a handback to UNINIT — a joiner's handback CAS names the whole word, so after the same row is reused by a newer takeover a stale handback fails instead of handing back a LIVE baton (C16 ABA). An opener that cannot claim an attach row (table full) never takes the baton (a row-less baton cannot name its holder). Every non-ready pass of the join loop checks the `initTimeoutMs` deadline (C11). A takeover reads any surviving header **once** first: when magic/version/`headerBytes` are valid (a crashed grow, or a creator that died mid-write) it keeps the prior **kind** (a plain opener never re-kinds a mutex/ring segment; a different specific kind → `E_INCOMPATIBLE`) and keeps `dataBytes = max(requested, min(prior, file − header, cap))` — the old takeover rewrote both to the joiner's values (C12). A failed takeover releases the row it claimed, and a creator that loses the baton CAS releases its fresh row (C17). A size-less join of a never-initialized object no longer truncates it: it waits out its own `initTimeoutMs` — one budget shared by the grace wait and the init wait — then throws `E_INIT_TIMEOUT` (C23). Takeover is idempotent and rewrites every field it does not keep. |
 | headerBytes, dataBytes | u32, u64 | Authoritative size — works the same on all OSes (Windows has no `fstat` for sections). |
 | flags | u32 | e.g. `ATTACH_OVERFLOW`, `KIND` (raw / mutex / ring). |
@@ -151,7 +151,7 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
 - **Validation first, in JS and native:** `Number.isSafeInteger(size) && size >= 1 && size <= maxSegmentBytes`.
   Native reads the size as `double`/`int64`, never `Uint32Value()` (F5).
 - **Policies on join** (compared against `header.dataBytes`):
-  - **The mapping is the single source of truth for geometry (fix round 2, review R1–R5).** Joins initially map `min(requested, st_size)` — never past EOF — and the header's geometry (magic, version, kind, `headerBytes`, `dataBytes`) is read **once into locals**, validated (including `dataBytes ≤ MEMBRIDGE_MAX_SEGMENT_BYTES` and `st_size ≥ header + dataBytes`), after which the handle is re-fstat'd and **re-mapped to cover `headerBytes + dataBytes`** before any window is issued. The caller never re-reads geometry from shared memory afterwards; the registry's reuse path refuses a cached mapping that cannot cover the window (falling back to a full open); a window that cannot cover `requested` throws `E_SIZE_MISMATCH` instead of being silently clamped; and native entry points that assume a layout (`mutexClaimSlot`, `ringClaimRole`) length-check the view first. This is what makes a hostile, stale, or mid-race header unable to size a `BackingStore` past mapped memory while ordinary prefix/smaller opens still succeed.
+  - **The mapping is the single source of truth for geometry (fix round 2, review R1–R5).** Joins initially map `min(requested, st_size)` — never past EOF — and the header's geometry (magic, version, kind, `headerBytes`, `dataBytes`) is read **once into locals**, validated (including `dataBytes ≤ SHM_BRIDGE_MAX_SEGMENT_BYTES` and `st_size ≥ header + dataBytes`), after which the handle is re-fstat'd and **re-mapped to cover `headerBytes + dataBytes`** before any window is issued. The caller never re-reads geometry from shared memory afterwards; the registry's reuse path refuses a cached mapping that cannot cover the window (falling back to a full open); a window that cannot cover `requested` throws `E_SIZE_MISMATCH` instead of being silently clamped; and native entry points that assume a layout (`mutexClaimSlot`, `ringClaimRole`) length-check the view first. This is what makes a hostile, stale, or mid-race header unable to size a `BackingStore` past mapped memory while ordinary prefix/smaller opens still succeed.
   - `exact` (default): mismatch → `E_SIZE_MISMATCH` naming both sizes.
   - `at-least`: requested ≤ existing → map the requested prefix; larger → `E_SIZE_MISMATCH`. **Why:** mapping a prefix can never SIGBUS, and lets a reader map only a known header.
   - `grow`: requested > existing → under the header's init lock `ftruncate` to `max(requested, file size − header)` (never shrink below a concurrent grower), update `dataBytes`, and re-map so the mapping covers the new size. A grower that loses the init-lock race retries the policy against the refreshed header. Processes already attached keep their smaller SAB (a SAB cannot be resized in place) — documented. On macOS → `E_GROW_UNSUPPORTED` (U2: an shm object cannot be resized after creation; the code refuses up front rather than failing inside a second `ftruncate` — round 3). **On Windows always `E_GROW_UNSUPPORTED`:** sections are fixed at `CreateFileMapping` time and cannot be resized, so `grow` is a POSIX-only policy; `docs/compat.md` states it.
@@ -161,7 +161,7 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   **Cost:** memory is committed up front; set `reserve: false` for sparse use.
 - **Windows:** pass the high DWORD to `CreateFileMappingW` (shmbuf hard-codes 0 → 4 GiB ceiling),
   check `ERROR_ALREADY_EXISTS` to tell create from join.
-- **Size cap:** default 256 MiB, overridable via `MEMBRIDGE_MAX_SEGMENT_BYTES`.
+- **Size cap:** default 256 MiB, overridable via `SHM_BRIDGE_MAX_SEGMENT_BYTES`.
   **Why** a cap at all: a typo (e.g. bytes vs. KB) should not silently commit gigabytes when `reserve` is on.
 
 ### 5.4 Lifecycle and registry
@@ -209,13 +209,13 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
   removed by `unlink()` or `unlinkWhenUnused`. Rev 1's "close becomes meaningful" is withdrawn.
 - `unlink(name)` removes the name (POSIX `shm_unlink`). On Windows the section
   disappears when the last handle closes; `unlink` there only prevents new joins
-  via membridge (marks the header `UNLINKED`).
+  via shm-bridge (marks the header `UNLINKED`).
 
 ### 5.5 Names
 
 - Validation per platform: POSIX names start with `/`, have no other `/`, and are
   ≤ 250 bytes on Linux. On macOS the limit is `PSHMNAMLEN` (31 if U2 holds).
-  On Windows the name is mapped to `Local\membridge<escaped-name>`, where each `/`
+  On Windows the name is mapped to `Local\shm-bridge<escaped-name>`, where each `/`
   becomes `%2F` and a literal `%` becomes `%25` (percent-encoding — a plain `_`
   replacement would collide `/a_b` with `/a/b`); a result exceeding the kernel's
   object-name limit is `E_NAME_INVALID`, not silently truncated. An opt-in `Global\`
@@ -225,7 +225,7 @@ exists for that case (no header, so no size check beyond `fstat`, no attach tabl
 
 ### 5.6 Fallback (no native addon)
 
-- Opt-in only: `MEMBRIDGE_ALLOW_FALLBACK=1` or `open(..., { allowFallback: true })`.
+- Opt-in only: `SHM_BRIDGE_ALLOW_FALLBACK=1` or `open(..., { allowFallback: true })`.
   Otherwise, a missing addon → `E_NATIVE_UNAVAILABLE`.
 - The name table is per ISOLATE (fix round 3, F36): a worker_threads isolate
   loads a fresh fallback module, and a plain JS Map cannot cross realms —
@@ -253,11 +253,11 @@ loop = up to 50 ms per contended handoff). This is the foundation for everything
 |----|-----------|-------|
 | Linux | `futex(FUTEX_WAIT / FUTEX_WAKE)` **without** `FUTEX_PRIVATE_FLAG` on the mapped address | Shared futexes are keyed by the underlying page, so they work across processes. 32-bit words only → every waitable word in our layouts is `i32`. |
 | macOS | `os_sync_wait_on_address` / `os_sync_wake_by_address_*` with the SHARED flag (14.4+) | U1. If the spike fails or the OS is older: bounded exponential back-off polling (50 µs → 2 ms), documented as higher latency. |
-| Windows | Per-word named semaphore `Local\membridge-<seg>-w<offset>`; the semaphore's permits are the waiter bookkeeping (no separate shm count) | U3. Notify releases `count` permits — more than waiters is fine: extra permits surface as the spurious wakeups this row already allows, and every waiter re-checks the word. |
+| Windows | Per-word named semaphore `Local\shm-bridge-<seg>-w<offset>`; the semaphore's permits are the waiter bookkeeping (no separate shm count) | U3. Notify releases `count` permits — more than waiters is fine: extra permits surface as the spurious wakeups this row already allows, and every waiter re-checks the word. |
 
 - **Sync waits** block the calling JS thread (same as `Atomics.wait`) — documented;
   use `waitAsync` on a server main thread.
-- **Async waits** run on a membridge-owned native waiter thread, **not the libuv
+- **Async waits** run on a shm-bridge-owned native waiter thread, **not the libuv
   threadpool**. **Why:** the default pool has 4 threads; a few pending lock waits would
   starve `fs`/`dns`/`crypto`. On Linux ≥ 5.16 one thread can multiplex up to 128
   waits via `futex_waitv`; elsewhere one thread per pending wait, capped
@@ -282,8 +282,8 @@ loop = up to 50 ms per contended handoff). This is the foundation for everything
   it as 449 (same value on x86_64 and asm-generic arches such as arm64). `ENOSYS` at runtime
   (kernel < 5.16) → one thread per wait. musl builds use the same raw-syscall path.
   The multiplexer is woken to change its wait set by a private control futex in its own wait vector.
-- Exposed publicly (`membridge/sync`) because users building their own lock-free
-  structures on a membridge SAB hit F1 just the same.
+- Exposed publicly (`shm-bridge/sync`) because users building their own lock-free
+  structures on a shm-bridge SAB hit F1 just the same.
 - **Async-wait capacity (fix round 2026-10-06):** one process-wide waiter
   budget — on Linux ≥ 5.16, 127 multiplexed `futex_waitv` entries + 64
   one-thread-per-wait fallbacks (191); on macOS, Windows and older Linux only
@@ -492,7 +492,7 @@ reads and missed a release landing in between).
   waitable (§6). That caps capacity at 1 GiB — rev 1's "~2 GB" needed `Uint32Array`, which
   `Atomics.wait` and futex helpers do not accept, and contradicted the 256 MiB segment cap anyway.
 - **Capacity vs. the segment cap:** a ring needs `headerBytes + capacity`, so any
-  capacity above the current `MEMBRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB)
+  capacity above the current `SHM_BRIDGE_MAX_SEGMENT_BYTES` (default 256 MiB)
   throws `E_SIZE_INVALID` until the env override is raised. **Why not clamp
   silently:** a producer configured for 512 MiB that silently gets 256 MiB has
   its backpressure behavior changed under it; refusing is honest.
@@ -549,7 +549,7 @@ c.read()                                  // convenience = peek + copy + release
 |-----|----------|-----------|
 | `capacity()` | free/total of the shm backing store (`fs.statfs('/dev/shm')`) | Linux. macOS/Windows: `E_UNSUPPORTED` (no bounded shm filesystem). |
 | `stat(name)` | header contents: kind, sizes, creator, attached identities + liveness, owner of mutex/ring roles | all |
-| `list()` | Linux: readdir `/dev/shm`, open each entry `O_NONBLOCK\|O_NOFOLLOW` and keep regular files whose header has membridge magic — a FIFO or symlink any local user plants in world-writable `/dev/shm` can neither hang nor abort `list()`/`stat()`/`reap()` (round 4 S4-2/S4-7); opens of a non-regular name fail `E_INCOMPATIBLE` without leaking the fd (S4-5) (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
+| `list()` | Linux: readdir `/dev/shm`, open each entry `O_NONBLOCK\|O_NOFOLLOW` and keep regular files whose header has shm-bridge magic — a FIFO or symlink any local user plants in world-writable `/dev/shm` can neither hang nor abort `list()`/`stat()`/`reap()` (round 4 S4-2/S4-7); opens of a non-regular name fail `E_INCOMPATIBLE` without leaking the fd (S4-5) (**Why** magic, not a name prefix: users choose names; the header is the reliable marker). macOS: `E_UNSUPPORTED` (POSIX shm cannot be enumerated). Windows: `E_UNSUPPORTED`. | Linux |
 | `reap({ dryRun })` | unlink segments whose every attach slot is dead and that have no `ATTACH_OVERFLOW` flag. Unknown liveness (foreign pid namespace) counts as alive. | Linux (needs `list`); `reap(name)` for a single segment on all OSes |
 | `open(..., { unlinkWhenUnused: true })` | the last process to detach (attach table becomes empty) unlinks the name | all |
 
@@ -569,7 +569,7 @@ different memory. Ref-counting in the attach table plus `reap()` covers both cas
 
 ## 10. Errors
 
-`MembridgeError extends Error` with `code`, plus structured fields (`segmentName`, `requested`, `existing`, `syscall`, `errno`; "segmentName" rather than `name` because `Error.name` already carries the error-class name):
+`ShmBridgeError extends Error` with `code`, plus structured fields (`segmentName`, `requested`, `existing`, `syscall`, `errno`; "segmentName" rather than `name` because `Error.name` already carries the error-class name):
 
 `E_NAME_INVALID` · `E_SIZE_INVALID` · `E_SIZE_MISMATCH` · `E_EXISTS` · `E_NOT_FOUND` ·
 `E_INCOMPATIBLE` · `E_INIT_TIMEOUT` · `E_NO_SPACE` · `E_GROW_UNSUPPORTED` · `E_NOT_OWNER` ·
@@ -616,10 +616,23 @@ per-platform waiter budget and EFAULT isolation; §7.2 pid-namespace-tagged Clai
 lock released across settle sleeps; §7.3 `tryLock` reports `ownerDied`, `close()` vs pending
 `lockAsync`; §8.2 one reservation per instance; §9 `/dev/shm` FIFO/symlink hygiene.
 
+**0.2.0 — the shm-bridge rename (2026-10-10).** The project carries one name everywhere: the
+error class is `ShmBridgeError` (§10; `isShmBridgeErrorCode`, `ShmBridgeErrorCode`,
+`ShmBridgeErrorFields`), env vars use the `SHM_BRIDGE_` prefix (`SHM_BRIDGE_MAX_SEGMENT_BYTES`,
+`SHM_BRIDGE_ALLOW_FALLBACK`), Windows section and semaphore names use `Local\shm-bridge…` (§5.5,
+§6), test/probe segments use `/shm-bridge-test-` / `/shm-bridge-probe-`, and the §5.2 header
+magic is the bytes "SHMB" (`0x424D4853`). **Why** a breaking minor: the old name could not
+survive anywhere, and a changed magic/object prefix means a 0.1.x process and a 0.2.0 process
+cannot share a live segment — a 0.2.0 opener rejects a 0.1.x header as `E_INCOMPATIBLE`, never
+misreads it. Same release, §6 Windows parity with the futex path: a value change seen after a
+park resolves `'ok'` (not `'not-equal'`), and `waitAsync` opens its word's semaphore before
+returning so an early store-less notify is never dropped; env is read through libuv so runtime
+`process.env` sets are seen natively on Windows.
+
 ## 12. Layout & build
 
 ```
-membridge/
+shm-bridge/
   package.json  tsconfig.json  LICENSE  README.md  .gitignore  PLAN.md
   .github/workflows/ci.yml  .github/workflows/prebuild.yml
   src/    index.ts core.ts sync.ts mutex.ts ringbuffer.ts ops.ts errors.ts fallback.ts native.ts
@@ -651,7 +664,7 @@ reports TypeScript line numbers, not transpiled ones. No test dependencies
 beyond the built-in `node:test`.
 
 **`test/helpers.ts`** carries the machinery every crash test needs, so no suite
-grows its own copy: the segment-name generator (`/membridge-test-<unique>`,
+grows its own copy: the segment-name generator (`/shm-bridge-test-<unique>`,
 AGENTS.md guardrail 3), a cleanup harness that unlinks in `finally` even when a
 test fails mid-way, a per-OS kill helper (POSIX `SIGKILL`; Windows `taskkill /F`
 — timing differs, so kill-based assertions are state-based, never timing-based),
@@ -686,7 +699,7 @@ consumer killed mid-peek (message redelivered); role takeover after death; `E_RO
 
 **New — ops:** `list/stat/reap` with live, dead and mixed attachers; `unlinkWhenUnused`.
 
-**Platform rules:** the `E_NO_SPACE` tmpfs test runs only when `MEMBRIDGE_TEST_TMPFS`
+**Platform rules:** the `E_NO_SPACE` tmpfs test runs only when `SHM_BRIDGE_TEST_TMPFS`
 points at a prepared small tmpfs and otherwise skips with that reason (the ubuntu CI
 job mounts one); ring capacities above the default cap assert `E_SIZE_INVALID`
 until the env override is raised.

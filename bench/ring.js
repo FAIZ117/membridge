@@ -7,7 +7,7 @@ const { Worker } = require('node:worker_threads');
 const { RingProducer, RingConsumer } = require('../dist/ringbuffer');
 const { unlink } = require('../dist/core');
 
-const NAME = `/membridge-bench-ring-${process.pid}`;
+const NAME = `/shm-bridge-bench-ring-${process.pid}`;
 
 async function run() {
   const rows = [];

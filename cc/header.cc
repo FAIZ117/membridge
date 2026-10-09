@@ -36,7 +36,7 @@
 #include <unistd.h>
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 int ClaimAttachRow(Header* h, const Identity& self, uint32_t nslots) {
   for (uint32_t i = 0; i < nslots; i++) {
@@ -194,7 +194,7 @@ uint64_t EnsureMappingCovers(v8::Isolate* isolate, SegmentHandle& handle, const 
   const uint64_t dataBytes = HeaderDataBytesOf(h);  // read ONCE
   if (dataBytes > maxSegmentBytes) {
     ThrowError(isolate, "E_INCOMPATIBLE",
-               "segment header declares more data than MEMBRIDGE_MAX_SEGMENT_BYTES allows", name);
+               "segment header declares more data than SHM_BRIDGE_MAX_SEGMENT_BYTES allows", name);
   }
 #if !defined(_WIN32)
   struct stat st{};
@@ -330,7 +330,7 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       const uint64_t hdrData = HeaderDataBytesOf(h);
       if (magic != kMagic || version != kLayoutVersion) {
         ThrowError(isolate, "E_INCOMPATIBLE",
-                   "segment is not a membridge segment or has an incompatible layout version",
+                   "segment is not a shm-bridge segment or has an incompatible layout version",
                    name);
       }
       if (hb != headerBytes) {
@@ -347,7 +347,7 @@ void InitOrJoin(v8::Isolate* isolate, SegmentHandle& handle, const std::string& 
       }
       if (hdrData > opts.maxSegmentBytes) {
         ThrowError(isolate, "E_INCOMPATIBLE",
-                   "segment header declares more data than MEMBRIDGE_MAX_SEGMENT_BYTES allows",
+                   "segment header declares more data than SHM_BRIDGE_MAX_SEGMENT_BYTES allows",
                    name);
       }
       // The FILE is the truth for a ready segment: re-fstat and re-map so the
@@ -598,4 +598,4 @@ uint64_t GrowSegment(v8::Isolate* isolate, SegmentHandle& handle, const std::str
 #endif
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

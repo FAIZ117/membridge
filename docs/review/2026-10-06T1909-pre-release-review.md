@@ -5,7 +5,7 @@
 | Commit reviewed | `e401d1c` (M8: full verification), clean working tree |
 | Platform of evidence | Linux 7.2.8 (Fedora 43), x86_64, 18 cores, Node 24.18 |
 | Reviews | 1. Edge-case & correctness · 2. Performance · 3. Security |
-| Mode | Read-only. No repo file was modified by the reviews. PoCs and microbenches ran from scratch directories against the committed build; all used `/membridge-test-review-*` or `/membridge-sec-*` names and `/dev/shm` was verified clean afterwards. |
+| Mode | Read-only. No repo file was modified by the reviews. PoCs and microbenches ran from scratch directories against the committed build; all used `/shm-bridge-test-review-*` or `/shm-bridge-sec-*` names and `/dev/shm` was verified clean afterwards. |
 
 **How to read this.** Each review was performed by a separate agent with a
 written brief; their reports are reproduced in §4–§6. "Verified" inside a
@@ -171,7 +171,7 @@ written.
 | F35 | P3 | Timeout input hygiene: initTimeoutMs int64 UB, wall-clock deadlines, NaN = infinite | cc/header.cc; src/mutex.ts:107, 185; src/ringbuffer.ts:163, 288 |
 | F36 | P3 | Fallback divergences that tests would not catch | src/fallback.ts:221-233 |
 | F37 | P3 | Contract nits: waitAsync never 'not-equal'; E_TIMEOUT for slot exhaustion; transient E_TOO_MANY_WAITERS | cc/wait.cc:366-374, 558; cc/mutex.cc:121 |
-| F38 | P3 | Second `setMembridgeErrorCtor` in one isolate may abort via duplicate cleanup hook (unproven) | cc/addon.cc:78 |
+| F38 | P3 | Second `setShmBridgeErrorCtor` in one isolate may abort via duplicate cleanup hook (unproven) | cc/addon.cc:78 |
 
 ### 4.3 Details
 
@@ -860,7 +860,7 @@ encode to a case-preserving object name.
 - **Windows percent-escaping:** injective (see F8).
 - **`WordAddrOf`/`DataAddrOf`:** validates `IsInt32Array` and index range
   before `base + ByteOffset/4 + index` (cc/addon.cc:530-542).
-- **Size validation:** `1 ≤ size ≤ 4 GiB` and `MEMBRIDGE_MAX_SEGMENT_BYTES`
+- **Size validation:** `1 ≤ size ≤ 4 GiB` and `SHM_BRIDGE_MAX_SEGMENT_BYTES`
   apply to requested sizes only, not header-declared `dataBytes` (that gap is
   F1).
 

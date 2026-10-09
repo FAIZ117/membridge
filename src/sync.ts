@@ -1,12 +1,12 @@
-// sync.ts — §6 cross-process wait/notify on i32 words of a membridge segment
-// (public: users building their own lock-free structures on a membridge SAB
+// sync.ts — §6 cross-process wait/notify on i32 words of a shm-bridge segment
+// (public: users building their own lock-free structures on a shm-bridge SAB
 // hit F1 — Atomics.notify cannot wake another process — just the same).
 //
 // Waitable words are i32 only (futex/os_sync/semaphore constraint, §6).
 // Sync waits block the calling JS thread like Atomics.wait; async waits run
-// on membridge-owned waiter threads, never the libuv pool.
+// on shm-bridge-owned waiter threads, never the libuv pool.
 
-import { MembridgeError } from './errors';
+import { ShmBridgeError } from './errors';
 import { nativeOrThrow } from './native';
 
 export type WaitResult = 'ok' | 'not-equal' | 'timed-out';
@@ -40,10 +40,10 @@ function pinLoopWhile(p: Promise<WaitResult>): Promise<WaitResult> {
 
 function wordAddrCheck(view: Int32Array, index: number): void {
   if (!(view instanceof Int32Array)) {
-    throw new MembridgeError('E_NAME_INVALID', 'wait/notify need an Int32Array (waitable words are i32 only)');
+    throw new ShmBridgeError('E_NAME_INVALID', 'wait/notify need an Int32Array (waitable words are i32 only)');
   }
   if (!Number.isSafeInteger(index) || index < 0 || index >= view.length) {
-    throw new MembridgeError('E_NAME_INVALID', `word index ${index} out of range`);
+    throw new ShmBridgeError('E_NAME_INVALID', `word index ${index} out of range`);
   }
 }
 
@@ -56,10 +56,10 @@ const MAX_TIMEOUT_MS = 2 ** 31;
 function timeoutCheck(timeoutMs: number | undefined): void {
   if (timeoutMs !== undefined) {
     if (Number.isNaN(timeoutMs) || timeoutMs <= 0) {
-      throw new MembridgeError('E_NAME_INVALID', 'timeoutMs must be a positive number');
+      throw new ShmBridgeError('E_NAME_INVALID', 'timeoutMs must be a positive number');
     }
     if (timeoutMs > MAX_TIMEOUT_MS) {
-      throw new MembridgeError(
+      throw new ShmBridgeError(
         'E_NAME_INVALID',
         `timeoutMs must be <= ${MAX_TIMEOUT_MS} (~24.8 days); use no timeout for longer waits`,
       );
@@ -81,7 +81,7 @@ export function wait(
   wordAddrCheck(view, index);
   timeoutCheck(timeoutMs);
   if (!Number.isSafeInteger(expected)) {
-    throw new MembridgeError('E_NAME_INVALID', 'expected must be an i32 value');
+    throw new ShmBridgeError('E_NAME_INVALID', 'expected must be an i32 value');
   }
   const b = nativeOrThrow();
   return b.syncWait(view, index, expected, timeoutMs === undefined ? -1 : timeoutMs) as WaitResult;
@@ -97,7 +97,7 @@ export function notify(view: Int32Array, index: number, count?: number): void {
 /**
  * Like {@link wait} but returns a Promise; resolves `'not-equal'` when the
  * word differs from `expected` before the wait parks (same contract as the
- * synchronous {@link wait}). The wait runs on a membridge-owned
+ * synchronous {@link wait}). The wait runs on a shm-bridge-owned
  * waiter thread (never the libuv pool threadpool). Isolate teardown (worker
  * exit or `.terminate()`) cancels the wait and resolves `'timed-out'`.
  */
@@ -110,7 +110,7 @@ export function waitAsync(
   wordAddrCheck(view, index);
   timeoutCheck(timeoutMs);
   if (!Number.isSafeInteger(expected)) {
-    throw new MembridgeError('E_NAME_INVALID', 'expected must be an i32 value');
+    throw new ShmBridgeError('E_NAME_INVALID', 'expected must be an i32 value');
   }
   const b = nativeOrThrow();
   return pinLoopWhile(

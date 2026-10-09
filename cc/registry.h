@@ -1,16 +1,16 @@
 // registry.h — process-wide name -> weak_ptr<Mapping> (§5.4).
 
-#ifndef MEMBRIDGE_REGISTRY_H_
-#define MEMBRIDGE_REGISTRY_H_
+#ifndef SHM_BRIDGE_REGISTRY_H_
+#define SHM_BRIDGE_REGISTRY_H_
 
-#include "membridge.h"
+#include "shm_bridge.h"
 
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
-namespace membridge {
+namespace shm_bridge {
 
 class Registry {
  public:
@@ -84,6 +84,6 @@ class Registry {
 bool NameRefersTo(const std::string& name, const Mapping& m);
 void RecordIdentity(Mapping& m);
 
-}  // namespace membridge
+}  // namespace shm_bridge
 
-#endif  // MEMBRIDGE_REGISTRY_H_
+#endif  // SHM_BRIDGE_REGISTRY_H_

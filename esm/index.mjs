@@ -14,6 +14,6 @@ export const {
   stat,
   list,
   reap,
-  MembridgeError,
+  ShmBridgeError,
 } = mb;
 export default mb;

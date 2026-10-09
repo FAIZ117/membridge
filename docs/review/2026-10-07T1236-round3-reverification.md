@@ -8,7 +8,7 @@
 | Platform of evidence | Linux 7.2.9 (Fedora 43), x86_64, 18 cores, Node 24.18 |
 | Build | `npx node-gyp rebuild` clean; 2 warnings (upstream `node.h` cast; unused `HeaderDataBytes(Header*)` in `cc/addon.cc` — dead because all four old call sites moved to the validated snapshot) |
 | Suite | `npm test`: 93 tests, 92 pass, 1 env-gated skip |
-| Mode | Read-only. Three re-verification passes plus independent repros. Regression attribution used scratch builds of `0f01571` and `da6a2bc`. All segments used `/membridge-test-rv3*-` names; `/dev/shm` clean afterwards. |
+| Mode | Read-only. Three re-verification passes plus independent repros. Regression attribution used scratch builds of `0f01571` and `da6a2bc`. All segments used `/shm-bridge-test-rv3*-` names; `/dev/shm` clean afterwards. |
 
 **Coverage limits.** The security pass was source-only, and a live
 header-flipping race check was not run; security conclusions rest on source
@@ -302,7 +302,7 @@ after a winning grow — `dataBytes` above our cap or `st_size` before
 `~RowGuard`, which stores into the unmapped old header: 3/60 SIGSEGV
 (backtrace `ReleaseAttachRow ← Open [clone .cold]`); if the address was
 reused, silent corruption. Legitimate trigger: a peer with a larger
-`MEMBRIDGE_MAX_SEGMENT_BYTES`; a same-uid writer can also force it. **Fix:**
+`SHM_BRIDGE_MAX_SEGMENT_BYTES`; a same-uid writer can also force it. **Fix:**
 the guard holds a reference to the handle and reads `handle.base` at unwind;
 add a test that throws after a grow.
 
@@ -323,7 +323,7 @@ thread call untimed `os_sync_wait_on_address` and re-check the deadline only
 after a wake, so timeouts, the 250 ms dead-holder slices and initializer-death
 checks never fire without a wake — a crashed holder hangs waiters forever.
 Every wake also sleeps 50 µs. The SDK header is included inside an anonymous
-namespace (`cc/wait.cc:208-219`) and `MEMBRIDGE_HAVE_OS_SYNC` never guards the
+namespace (`cc/wait.cc:208-219`) and `SHM_BRIDGE_HAVE_OS_SYNC` never guards the
 call sites, so pre-14.4 SDKs will not compile. `docs/compat.md` ("untimed
 parks in bounded slices") is wrong. **Fix:**
 `os_sync_wait_on_address_with_timeout` with a clockid (14.4+ SDK), or mark
@@ -381,7 +381,7 @@ geometry.
   underflow guard (reachable if Windows `VirtualQuery` fails);
   `DataAddrOf` ignores `ByteOffset`; `mutexRegisterPin` takes the pin SAB and
   slot as separate arguments. Internal bindings only — defense in depth.
-- **C19:** each failed `reserveAsync` attempt builds a `MembridgeError` with
+- **C19:** each failed `reserveAsync` attempt builds a `ShmBridgeError` with
   a stack (10.4–11.5 µs vs 0.09 µs for a failed `peek`), widening C6's window.
   Use an internal try-reserve that returns null.
 - **C20:** while the producer is parked on a full ring, the consumer wakes on

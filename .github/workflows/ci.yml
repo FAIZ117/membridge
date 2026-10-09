@@ -34,7 +34,7 @@ jobs:
       - name: Run the full suite
         run: npm test
         # Platform-specific tests skip themselves with stated reasons:
-        #   E_NO_SPACE tmpfs — needs MEMBRIDGE_TEST_TMPFS (only the ubuntu job
+        #   E_NO_SPACE tmpfs — needs SHM_BRIDGE_TEST_TMPFS (only the ubuntu job
         #     mounts one, below)
         #   capacity/list   — Linux-only; other OSes assert E_UNSUPPORTED
         #   /dev/shm byte-crafting — POSIX-only crash-state tests
@@ -55,7 +55,7 @@ jobs:
           sudo mount -t tmpfs -o size=64m tmpfs /mnt/shm-bridge-tmpfs
           # bind it as the segment source: shm-bridge uses /dev/shm, so run the
           # test in a mount namespace where /dev/shm IS the small tmpfs
-          echo "MEMBRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs" >> "$GITHUB_ENV"
+          echo "SHM_BRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs" >> "$GITHUB_ENV"
       - run: npm install
       - name: Run the suite inside the small-tmpfs namespace
         # PATH is preserved explicitly: sudo's secure_path resolves to the
@@ -68,7 +68,7 @@ jobs:
                    chmod 1777 /dev/shm &&
                    cd "$GITHUB_WORKSPACE" &&
                    echo "node: $(node -v), addon loads: $(node -p "require(process.argv[1]).isNative()" "$PWD/dist/index.js")" &&
-                   MEMBRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs npm test'
+                   SHM_BRIDGE_TEST_TMPFS=/mnt/shm-bridge-tmpfs npm test'
 
   sanitizers:
     # ASAN/UBSan (§12): LD_PRELOAD libasan into node with an instrumented
@@ -123,7 +123,7 @@ jobs:
           npm install "$OLDPWD"/shm-bridge-*.tgz --no-audit --no-fund
           node -e "
             const m = require('shm-bridge');
-            const name = '/membridge-smoke-' + process.pid;
+            const name = '/shm-bridge-smoke-' + process.pid;
             const sab = m.open(name, 4096);
             const v = new Int32Array(sab);
             v[3] = 42;

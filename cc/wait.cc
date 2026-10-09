@@ -5,7 +5,7 @@
 // page (F14, probes/f14-shared-futex.js). glibc exports no futex symbols, so
 // everything goes through raw syscalls.
 //
-// Async waits run on membridge-owned threads (never the libuv pool):
+// Async waits run on shm-bridge-owned threads (never the libuv pool):
 //  - Linux >= 5.16: ONE multiplexer thread parks in futex_waitv() with up to
 //    127 waiters (FUTEX2_SIZE_U32, no FUTEX2_PRIVATE) plus a process-private
 //    control word; the syscall returns the index of the woken entry (pinned
@@ -69,12 +69,12 @@
 #if __has_include(<os/os_sync_wait_on_address.h>)
 #include <os/clock.h>
 #include <os/os_sync_wait_on_address.h>
-#define MEMBRIDGE_HAVE_OS_SYNC 1
+#define SHM_BRIDGE_HAVE_OS_SYNC 1
 #endif
 #endif
 #endif
 
-namespace membridge {
+namespace shm_bridge {
 
 #if defined(__APPLE__)
 namespace {
@@ -85,7 +85,7 @@ namespace {
 // and deadline) and Unavailable (os_sync unusable — the caller back-offs).
 enum class ParkResult { kWoken, kParked, kUnavailable };
 ParkResult OsSyncPark(int32_t* addr, uint32_t expected, double sliceMs) {
-#if defined(MEMBRIDGE_HAVE_OS_SYNC)
+#if defined(SHM_BRIDGE_HAVE_OS_SYNC)
   if (__builtin_available(macOS 14.4, *)) {
     const uint64_t ns = sliceMs <= 0 ? 1000 : static_cast<uint64_t>(sliceMs * 1e6);
     const int r = os_sync_wait_on_address_with_timeout(
@@ -99,7 +99,7 @@ ParkResult OsSyncPark(int32_t* addr, uint32_t expected, double sliceMs) {
 }
 
 int OsSyncWakeAll(int32_t* addr) {
-#if defined(MEMBRIDGE_HAVE_OS_SYNC)
+#if defined(SHM_BRIDGE_HAVE_OS_SYNC)
   if (__builtin_available(macOS 14.4, *)) {
     const int r = os_sync_wake_by_address_all(addr, sizeof(int32_t),
                                               OS_SYNC_WAKE_BY_ADDRESS_SHARED);
@@ -279,10 +279,10 @@ static std::wstring WordSemaphoreName(int32_t* addr) {
     }
     const ptrdiff_t off = static_cast<int32_t*>(addr) - static_cast<int32_t*>(m->base) -
                           m->headerBytes / 4;
-    _snwprintf(buf, 255, L"Local\\membridge-%hs-w%td", escaped.c_str(),
+    _snwprintf(buf, 255, L"Local\\shm-bridge-%hs-w%td", escaped.c_str(),
                static_cast<ptrdiff_t>(off));
   } else {
-    _snwprintf(buf, 255, L"Local\\membridge-anon-%p", static_cast<void*>(addr));
+    _snwprintf(buf, 255, L"Local\\shm-bridge-anon-%p", static_cast<void*>(addr));
   }
   return std::wstring(buf);
 }
@@ -900,4 +900,4 @@ void CancelIsolateWaits(v8::Isolate* isolate) {
   }
 }
 
-}  // namespace membridge
+}  // namespace shm_bridge

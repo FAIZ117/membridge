@@ -10,7 +10,7 @@
 // No priority inheritance, no fairness guarantee (§7.3): a woken waiter
 // competes with newcomers for the CAS.
 
-import { MembridgeError } from './errors';
+import { ShmBridgeError } from './errors';
 import { nativeOrThrow } from './native';
 import { open, unlink } from './core';
 import { waitAsync } from './sync'; // pinned loop while async waits pend
@@ -40,13 +40,13 @@ const sliceOf = (deadline: number): number =>
 const sleepSliceMs = 250; // dead-owner detection cadence (§7.3)
 
 // R20: NaN/Infinity/negative timeouts used to slip through as an infinite
-// park with no liveness re-check. Same contract as membridge/sync (PLAN §7.3):
+// park with no liveness re-check. Same contract as shm-bridge/sync (PLAN §7.3):
 // finite, > 0 and <= 2^31 ms, else E_NAME_INVALID before any native call.
 const MAX_TIMEOUT_MS = 2 ** 31;
 function checkTimeoutMs(timeoutMs: number | undefined, who: string): void {
   if (timeoutMs !== undefined &&
       (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS)) {
-    throw new MembridgeError('E_NAME_INVALID',
+    throw new ShmBridgeError('E_NAME_INVALID',
       `${who}: timeoutMs must be a finite number in (0, ${MAX_TIMEOUT_MS}] (got ${timeoutMs})`);
   }
 }
@@ -139,7 +139,7 @@ export class Mutex {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new MembridgeError('E_CLOSED', 'mutex instance is closed', { segmentName: this.name });
+      throw new ShmBridgeError('E_CLOSED', 'mutex instance is closed', { segmentName: this.name });
     }
   }
 
@@ -197,7 +197,7 @@ export class Mutex {
         continue;
       }
       if (tokenBits === token) {
-        throw new MembridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
+        throw new ShmBridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
           segmentName: this.name,
         });
       }
@@ -231,7 +231,7 @@ export class Mutex {
         continue;
       }
       if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
+        throw new ShmBridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
       const wr = this.b.syncWait(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
       waited = true;
@@ -248,7 +248,7 @@ export class Mutex {
     const token = this.claim().token;
     const lw = this.lockWord();
     if ((lw & TOKEN_MASK) === token) {
-      throw new MembridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
+      throw new ShmBridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
         segmentName: this.name,
       });
     }
@@ -262,7 +262,7 @@ export class Mutex {
     return null;
   }
 
-  /** Acquire asynchronously; waits ride the membridge waiter threads (§6),
+  /** Acquire asynchronously; waits ride the shm-bridge waiter threads (§6),
    * never the libuv pool. Aborts with the signal between wait slices. */
   async lockAsync(opts?: LockOptions & { signal?: AbortSignal }): Promise<LockResult> {
     const signal = opts?.signal;
@@ -284,7 +284,7 @@ export class Mutex {
         continue;
       }
       if (tokenBits === token) {
-        throw new MembridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
+        throw new ShmBridgeError('E_DEADLOCK', 'mutex already locked by this thread', {
           segmentName: this.name,
         });
       }
@@ -303,15 +303,15 @@ export class Mutex {
         waited = true;
         continue;
       }
-      if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
+      if (signal?.aborted) throw signal.reason ?? new ShmBridgeError('E_TIMEOUT', 'aborted');
       if (opts?.timeoutMs !== undefined && nowMs() >= deadline) {
-        throw new MembridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
+        throw new ShmBridgeError('E_TIMEOUT', 'mutex lock timed out', { segmentName: this.name });
       }
       const waitP = waitAsync(this.view, LOCK_WORD, prev | HAS_WAITERS, sliceOf(deadline));
       const abortP =
         signal !== undefined
           ? new Promise<never>((_, rej) => {
-              const onAbort = () => rej(signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted'));
+              const onAbort = () => rej(signal.reason ?? new ShmBridgeError('E_TIMEOUT', 'aborted'));
               signal.addEventListener('abort', onAbort, { once: true });
               // two-armed: a .finally-derived promise would carry rejections
               // unhandled and kill the process (review F11)
@@ -326,7 +326,7 @@ export class Mutex {
       // would hold the lock with a token nobody can release — or one another
       // process may already treat as free.
       this.assertOpen();
-      if (signal?.aborted) throw signal.reason ?? new MembridgeError('E_TIMEOUT', 'aborted');
+      if (signal?.aborted) throw signal.reason ?? new ShmBridgeError('E_TIMEOUT', 'aborted');
       if (wr === 'timed-out') livenessCheckDue = true;  // R18: re-probe the holder
     }
   }
@@ -335,7 +335,7 @@ export class Mutex {
   unlock(): void {
     this.assertOpen();
     if (!this.hold.held || this.claimed === null) {
-      throw new MembridgeError('E_NOT_OWNER', 'mutex is not locked by this instance', {
+      throw new ShmBridgeError('E_NOT_OWNER', 'mutex is not locked by this instance', {
         segmentName: this.name,
       });
     }
@@ -345,7 +345,7 @@ export class Mutex {
       if ((lw & TOKEN_MASK) !== token) {
         // our unlock raced a steal: the stealer owns it now
         this.hold.held = false;
-        throw new MembridgeError('E_NOT_OWNER', 'mutex was stolen after owner death', {
+        throw new ShmBridgeError('E_NOT_OWNER', 'mutex was stolen after owner death', {
           segmentName: this.name,
         });
       }

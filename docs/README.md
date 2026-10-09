@@ -1,4 +1,4 @@
-# membridge — docs
+# shm-bridge — docs
 
 Documentation for humans and agents. The normative design spec is
 [PLAN.md](../PLAN.md) at the repo root; this directory holds the documents that

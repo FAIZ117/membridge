@@ -3,9 +3,9 @@
 Cross-process shared memory for Node.js: a `SharedArrayBuffer` over OS shared
 memory (Linux/macOS/Windows), plus a crash-safe Mutex, a zero-copy RingBuffer,
 and ops utilities. Plain-V8 native addon (`node.h`, no N-API) under a TypeScript
-layer. **Status: implemented through M7 (M8 = final verification) —
-[PLAN.md](./PLAN.md) is the spec and outranks this file on design
-questions.**
+layer. **Status: published — `shm-bridge@0.2.0` on npm, Linux/macOS/Windows
+all pass the full suite on CI (Linux gates releases). [PLAN.md](./PLAN.md) is
+the spec and outranks this file on design questions.**
 
 ## Layout
 
@@ -13,7 +13,7 @@ questions.**
 shm-bridge/
 ├── AGENTS.md            # this file — agent context, commands, guardrails
 ├── PLAN.md              # the spec: design + reasoning; §11 is the change log
-├── package.json         # "private": true is deliberate — see guardrails
+├── package.json         # published from CI on v* tags — see guardrails
 ├── binding.gyp          # stays at repo ROOT (node-gyp-build's source fallback runs node-gyp from the package root)
 ├── src/                 # TypeScript sources (CJS target). One file per concern.
 ├── esm/                 # thin ESM wrapper re-exporting the CJS build (single module registry per process)
@@ -27,7 +27,7 @@ shm-bridge/
 │   ├── README.md        # docs map + support matrix pointer
 │   ├── adr/             # Architecture Decision Records — one file per lasting "Why"
 │   ├── compat.md        # OS × Node × Electron support matrix
-│   └── release.md       # prebuild + publish runbook (owner runs publishes)
+│   └── release.md       # prebuild + publish runbook (tag → Actions → npm, provenance)
 └── .github/workflows/   # ci.yml (3 OS × Node 22/24/26), prebuild.yml
 ```
 
@@ -49,8 +49,11 @@ The contract agents may rely on; each is verified from its milestone onward.
 
 ## Guardrails
 
-1. **Never `npm publish`.** `package.json` has `"private": true` on purpose; the
-   owner publishes. Never remove that field or bump versions for release.
+1. **Publishing is tag-driven, never hand-run.** Pushing `vX.Y.Z` makes CI
+   test, assemble the prebuilds and `npm publish --provenance` (owner's
+   `NPM_TOKEN` secret). Agents never run `npm publish` and never bump versions
+   or remove `private` on their own initiative — that is a release-commit
+   decision by the owner.
 2. **Never commit build output**: `prebuilds/`, `dist/`, `*.node` are gitignored.
 3. **`/dev/shm` hygiene**: every test/probe segment name starts with
    `/shm-bridge-test-` or `/shm-bridge-probe-` plus a unique suffix, and is

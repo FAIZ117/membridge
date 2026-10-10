@@ -1,5 +1,11 @@
 # Handoff — remaining experimental-platform issues (2026-10-09, late)
 
+> **RESOLVED 2026-10-10** — everything below was fixed the same day; see
+> CHANGELOG 0.2.0 and compat.md. Windows went green on CI (22/24/26, run
+> `37977949293`: 91 pass / 0 fail / 32 POSIX-only skips); the root was test-
+> side section lifetime, not the library. Kept as the historical record of
+> the debugging trail.
+
 | | |
 |---|---|
 | State at handoff | `9ca9c50` (main; tag `v0.1.0` points here). **shm-bridge@0.1.0 is LIVE on npm** with verified SLSA provenance and 18 per-ABI prebuilds. |

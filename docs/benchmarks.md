@@ -12,19 +12,27 @@ spreads of ±25% on the ring rows as noise. The ring rows use a producer in a
 worker thread; cross-process figures are similar (64 B copying 1.95–2.51 M
 msgs/s, round-4 performance pass).
 
-## Results (2026-10-07, after the round-3 fixes)
+## Results (2026-10-10, v0.2.0)
 
 | Bench | Value |
 |-------|-------|
-| contention — same-process `Atomics.add` (5 M ops on a shm-bridge SAB) | 94–98 M ops/s this session (~119 M on an idle box, 2026-10-06) |
-| contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~155–170k/s) |
-| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **0.07–0.10 µs/op** in the bench; 49–51 ns in a 2M-iteration loop (same-session `248f731` baseline: 48–59 ns — no regression) |
-| mutex — 3-way contended handoff | not produced by `npm run bench`; the round-3 performance pass measured 0 waits ≥ 250 ms in 31 tight-loop runs (5 µs critical section, 0 think time, 3/6/8 processes) |
-| mutex — holder SIGKILLed → steal (SIGKILL → acquired) | ~0 ms (zombie-aware liveness) |
-| ring — 64 B messages (copying `write`/`read`) | **2.2–4.4 M msgs/s** (same-session `248f731` baseline 2.3–3.3 M) |
-| ring — 4 KiB messages | 279–388k msgs/s (1.1–1.6 GB/s) |
-| ring — 64 KiB messages | 24–38k msgs/s (1.6–2.5 GB/s) |
-| ring — async (`reserveAsync`/`peekAsync`) | wakes typically < 1 ms, worst ~4 ms (0.44–3.78 ms worst `reserveAsync` over 8 × 20k messages into a full 4 KiB ring, 0 of 24 rounds ≥ 250 ms); `test/round3.test.ts` fails any async round trip ≥ 150 ms |
+| contention — same-process `Atomics.add` (5 M ops on a shm-bridge SAB) | ~106 M ops/s |
+| contention — cross-process futex handoff (both sides parked, round trip) | ~0.006 ms/round-trip (~170k/s) |
+| mutex — uncontended `lock`+`unlock` (100k iters, same thread) | **~0.08 µs/op** |
+| mutex — holder SIGKILLed → steal (SIGKILL → acquired) | ~3 ms (zombie-aware liveness) |
+| ring — 64 B messages (copying `write`/`read`, worker-thread producer) | **~3.1 M msgs/s** (~198 MB/s) |
+| ring — 4 KiB messages | ~326k msgs/s (~1.3 GB/s) |
+| ring — 64 KiB messages | ~29.5k msgs/s (~1.9 GB/s) |
+| ring — async (`reserveAsync`/`peekAsync`) | wakes typically < 1 ms; `test/round3.test.ts` fails any async round trip ≥ 150 ms |
+
+Historical ranges from the 0.1.0-era runs (2026-10-06/07, same machine):
+Atomics.add 94–119 M ops/s; handoff ~155–180k/s round trips; uncontended
+lock 49–100 ns (bimodal across P/E cores); the round-3 performance pass
+measured 0 mutex waits ≥ 250 ms in 31 tight-loop runs (5 µs critical
+section, 0 think time, 3/6/8 processes); ring 64 B 2.2–4.4 M msgs/s;
+4 KiB 279–388k; 64 KiB 24–38k; async worst `reserveAsync` 0.44–3.78 ms over
+8 × 20k messages into a full 4 KiB ring. The v0.2.0 numbers sit inside all
+of those ranges — no regression from the cross-platform rounds.
 
 The handoff number changed meaning in the fix round: the bench's pong side
 now parks on the token instead of spinning, so it measures a true

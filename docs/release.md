@@ -8,17 +8,15 @@ per-ABI prebuilds (6 targets × Node 22/24/26) cannot be produced on one dev
 machine, so the release workflow builds them first and publishes the assembled
 tarball from the same run.
 
-## One-time, before the first public release
+## One-time setup — DONE (v0.1.0, 2026-10-08)
 
-1. Create the GitHub repo `FAIZ117/shm-bridge` and add the remote:
-   `git remote add origin https://github.com/FAIZ117/shm-bridge.git`
-2. Put the npm automation token in repo Secrets as `NPM_TOKEN`
-   (npmjs.com → Access Tokens → Generate New Token → type "Automation").
-3. Remove `"private": true` from `package.json` in the version-bump commit
-   (`expr-eval-nextgen` carries no `private` field; shm-bridge keeps it until
-   the first real release as an accident guard — the publish job also refuses
-   a still-private package).
-4. Confirm `npm whoami` → `fhjami`.
+Kept for reference; all of it is complete:
+
+1. Repo `FAIZ117/shm-bridge` exists; `origin` points at it.
+2. `NPM_TOKEN` (npm automation token for `fhjami`) is in the repo Secrets.
+3. `"private": true` came off `package.json` in the release commit (the
+   publish job still refuses a still-private package as a tripwire).
+4. `npm whoami` → `fhjami` ✓.
 
 ## Per release
 

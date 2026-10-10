@@ -82,7 +82,7 @@ and on timeout.
 | Runtime | Status |
 |---------|--------|
 | Node 22 / 24 / 26 (official builds, Linux) | ✓ verified locally on every fix round |
-| Node on macOS / Windows | **compiles and runs on CI (2026-10-08)**; mid-integration: CI runs these legs **non-blocking** while the issues below are fixed. Linux is the verified platform and gates the run |
+| Node on macOS / Windows | ✓ **full suite passes on CI (2026-10-10, Node 22/24/26)**; these legs run non-blocking (Linux still gates releases) while Windows-specific quirks are hardened — see the known-issues note above |
 | Electron | ✗ — the V8 sandbox rejects external backing stores (F13); unsupported by design |
 | Bun / Deno | untested — likely broken (plain-V8 addon, node.h ABI) |
 | worker_threads | ✓ — context-aware `NODE_MODULE_INIT`, process-wide native registry |

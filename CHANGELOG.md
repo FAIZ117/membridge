@@ -176,6 +176,7 @@ guide: [docs/review/2026-10-07T1753-round4-fixes.md].
 
 ### Release process
 
-Publishing follows the same manual pattern as `expr-eval-nextgen`: CI assembles
-the publish artifact (with all prebuilds), the owner runs `npm publish` — see
-[docs/release.md](./docs/release.md).
+Tag-driven, from GitHub Actions with npm provenance: push `vX.Y.Z` →
+test matrix → prebuilds (18, sanity-checked) → `npm publish --provenance`.
+The one-time setup (NPM_TOKEN secret, removing `private`) and the fallback
+manual route are in [docs/release.md](./docs/release.md).
